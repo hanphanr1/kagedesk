@@ -163,6 +163,43 @@ public static class ThemePackLoader
             }
         }
 
+        // 4. Optional scene palette validation
+        if (parsed.Scene != null)
+        {
+            var sceneColors = new (string Name, string? Value)[]
+            {
+                (nameof(parsed.Scene.WallTop), parsed.Scene.WallTop),
+                (nameof(parsed.Scene.WallBottom), parsed.Scene.WallBottom),
+                (nameof(parsed.Scene.FloorBase), parsed.Scene.FloorBase),
+                (nameof(parsed.Scene.FloorLine), parsed.Scene.FloorLine),
+                (nameof(parsed.Scene.RugOuter), parsed.Scene.RugOuter),
+                (nameof(parsed.Scene.RugInner), parsed.Scene.RugInner),
+                (nameof(parsed.Scene.DeskTop), parsed.Scene.DeskTop),
+                (nameof(parsed.Scene.DeskFront), parsed.Scene.DeskFront),
+                (nameof(parsed.Scene.WindowFrame), parsed.Scene.WindowFrame),
+                (nameof(parsed.Scene.BoardBg), parsed.Scene.BoardBg)
+            };
+
+            foreach (var (sName, sVal) in sceneColors)
+            {
+                if (sVal != null && !IsValidHexColor(sVal))
+                {
+                    warnings.Add($"Theme '{parsed.Id}' has invalid hex color for scene '{sName}': '{sVal}'. Must be #RRGGBB or #AARRGGBB.");
+                    return (null, warnings);
+                }
+            }
+
+            if (parsed.Scene.SkylineStyle != null)
+            {
+                var style = parsed.Scene.SkylineStyle.Trim().ToLowerInvariant();
+                if (style is not ("konoha" or "cyber" or "lofi"))
+                {
+                    warnings.Add($"Theme '{parsed.Id}' has invalid scene skylineStyle '{parsed.Scene.SkylineStyle}'. Expected 'konoha', 'cyber', or 'lofi'.");
+                    return (null, warnings);
+                }
+            }
+        }
+
         return (parsed, warnings);
     }
 
@@ -178,18 +215,18 @@ public static class ThemePackLoader
         Version: "1.0.0",
         Author: "KageDesk",
         Palette: new ThemePalette(
-            Background: "#1a1b26",
-            Surface: "#24283b",
-            Border: "#414868",
-            Accent: "#7aa2f7",
-            Text: "#c0caf5"
+            Background: "#121622",
+            Surface: "#1b2234",
+            Border: "#4c3d32",
+            Accent: "#f59e0b",
+            Text: "#f3ead8"
         ),
         Weather: new WeatherPalette(
-            Dawn: "#f6c177",
-            Day: "#7aa2f7",
-            Sunset: "#ff9e64",
-            MidnightRain: "#565f89",
-            StormAlert: "#f7768e"
+            Dawn: "#f6b879",
+            Day: "#60a5fa",
+            Sunset: "#f97316",
+            MidnightRain: "#1e293b",
+            StormAlert: "#991b1b"
         ),
         Layout: new DeskLayout(
             MaxSlots: 8,
@@ -205,6 +242,19 @@ public static class ThemePackLoader
             ["kakashi"] = new("kakashi.png", "idle", "read", "alert"),
             ["clone"] = new("clone.png", "idle", "work", "smoke"),
             ["generic"] = new("generic.png", "idle", "work", "alert")
-        }
+        },
+        Scene: new SceneColors(
+            WallTop: "#171b28",
+            WallBottom: "#121622",
+            FloorBase: "#2b1f17",
+            FloorLine: "#1e1510",
+            RugOuter: "#4a1d2f",
+            RugInner: "#642940",
+            DeskTop: "#6b4f35",
+            DeskFront: "#4b3523",
+            WindowFrame: "#513c2a",
+            BoardBg: "#1a2030",
+            SkylineStyle: "konoha"
+        )
     );
 }

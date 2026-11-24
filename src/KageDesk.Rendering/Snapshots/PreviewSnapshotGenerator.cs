@@ -1,0 +1,247 @@
+using System.Drawing.Imaging;
+using KageDesk.Core.Models;
+using KageDesk.Core.Themes;
+using KageDesk.Rendering.Canvas;
+using KageDesk.Rendering.Scenes;
+
+namespace KageDesk.Rendering.Snapshots;
+
+public static class PreviewSnapshotGenerator
+{
+    public static readonly string[] ExpectedFileNames =
+    {
+        "shinobi-hq-working.png",
+        "shinobi-hq-approve.png",
+        "shinobi-hq-done.png",
+        "shinobi-hq-fail.png",
+        "shinobi-hq-clone.png",
+        "cyber-bunker-working.png",
+        "cozy-lofi-idle.png",
+        "pet-overlay-approve.png",
+        "pet-overlay-working.png"
+    };
+
+    public static IReadOnlyList<string> GenerateAll(string outputDir, ThemeLoadResult themes)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(outputDir);
+        ArgumentNullException.ThrowIfNull(themes);
+
+        Directory.CreateDirectory(outputDir);
+
+        ThemePack shinobi = FindTheme(themes, "shinobi-hq");
+        ThemePack cyber = FindTheme(themes, "cyber-bunker");
+        ThemePack lofi = FindTheme(themes, "cozy-lofi");
+
+        var written = new List<string>(ExpectedFileNames.Length);
+        var fixedNow = new DateTimeOffset(2026, 11, 25, 14, 35, 0, TimeSpan.FromHours(7));
+
+        using var hqCanvas = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
+        using var hqScaled = new PixelBuffer(HqWallpaperRenderer.CanvasWidth * 2, HqWallpaperRenderer.CanvasHeight * 2);
+        var hqRenderer = new HqWallpaperRenderer();
+
+        using var petCanvas = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        using var petScaled = new PixelBuffer(TaskbarPetRenderer.CanvasWidth * 2, TaskbarPetRenderer.CanvasHeight * 2);
+        var petRenderer = new TaskbarPetRenderer();
+
+        var sampleAccounts = new List<AccountInfo>
+        {
+            new("claude", "hanphanr1", "hanphanr1@pro", true, QuotaPercent: 78),
+            new("codex", "dev-codex", "dev-codex", false, QuotaPercent: 92),
+            new("orca", "local", "orca-local", false)
+        };
+
+        var passingBuild = new List<BuildInfo>
+        {
+            new("ci-1", "kagedesk", "CI", "main", "Build #108", "completed", "success", UpdatedAt: fixedNow)
+        };
+
+        var failingBuild = new List<BuildInfo>
+        {
+            new("ci-fail", "kagedesk", "CI", "main", "Build #109", "completed", "failure", UpdatedAt: fixedNow)
+        };
+
+        // 1. shinobi-hq-working.png
+        var workingState = new HqState(
+            Agents: new List<AgentSnapshot>
+            {
+                new("a-shika", "Shikamaru (Leader)", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "execute", Repo: "kagedesk"),
+                new("a-minato", "Minato (Coder)", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", Repo: "kagedesk"),
+                new("a-tsunade", "Tsunade (Tester)", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test", Repo: "kagedesk"),
+                new("a-kakashi", "Kakashi (Reviewer)", AgentRole.Reviewer, "kakashi", AgentState.Idle, Repo: "kagedesk")
+            },
+            Accounts: sampleAccounts,
+            Builds: passingBuild,
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: Array.Empty<HqEvent>(),
+            Timestamp: fixedNow);
+        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, workingState, shinobi, outputDir, "shinobi-hq-working.png", warmupTicks: 10));
+
+        // 2. shinobi-hq-approve.png
+        var approveState = new HqState(
+            Agents: new List<AgentSnapshot>
+            {
+                new("a-shika", "Shikamaru (Leader)", AgentRole.Leader, "shikamaru", AgentState.NeedsApproval,
+                    QuestionPrompt: "Approve deploying KageDesk v1.2 to production release?", TaskTitle: "Release Gate", Repo: "kagedesk"),
+                new("a-minato", "Minato (Coder)", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", Repo: "kagedesk"),
+                new("a-tsunade", "Tsunade (Tester)", AgentRole.Tester, "tsunade", AgentState.Idle, Repo: "kagedesk"),
+                new("a-kakashi", "Kakashi (Reviewer)", AgentRole.Reviewer, "kakashi", AgentState.Idle, Repo: "kagedesk")
+            },
+            Accounts: sampleAccounts,
+            Builds: new List<BuildInfo>
+            {
+                new("ci-wait", "kagedesk", "DEPLOY", "release", "Gate #12", "in_progress", null, UpdatedAt: fixedNow)
+            },
+            Weather: EffectiveWeather.Sunset,
+            Mood: HqMood.Alert,
+            PendingVisualEvents: Array.Empty<HqEvent>(),
+            Timestamp: fixedNow);
+        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, approveState, shinobi, outputDir, "shinobi-hq-approve.png", warmupTicks: 8));
+
+        // 3. shinobi-hq-done.png
+        var doneState = new HqState(
+            Agents: new List<AgentSnapshot>
+            {
+                new("a-shika", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Done, TaskTitle: "Milestone 2 Complete!", Repo: "kagedesk"),
+                new("a-minato", "Minato", AgentRole.Coder, "minato", AgentState.Done, TaskTitle: "Pixel Engine Green", Repo: "kagedesk"),
+                new("a-tsunade", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Done, TaskTitle: "All 75 Tests Passed", Repo: "kagedesk"),
+                new("a-kakashi", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Done, TaskTitle: "LGTM Approved", Repo: "kagedesk")
+            },
+            Accounts: sampleAccounts,
+            Builds: passingBuild,
+            Weather: EffectiveWeather.Dawn,
+            Mood: HqMood.Celebrating,
+            PendingVisualEvents: Array.Empty<HqEvent>(),
+            Timestamp: fixedNow);
+        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, doneState, shinobi, outputDir, "shinobi-hq-done.png", warmupTicks: 12));
+
+        // 4. shinobi-hq-fail.png
+        var failState = new HqState(
+            Agents: new List<AgentSnapshot>
+            {
+                new("a-shika", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Failed, LastMessage: "Build pipeline error", Repo: "kagedesk"),
+                new("a-minato", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", Repo: "kagedesk"),
+                new("a-tsunade", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Failed, LastMessage: "3 tests failed", Repo: "kagedesk"),
+                new("a-kakashi", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Working, ToolName: "review", Repo: "kagedesk")
+            },
+            Accounts: new List<AccountInfo>
+            {
+                new("claude", "hanphanr1", "hanphanr1@pro", true, QuotaPercent: 14)
+            },
+            Builds: failingBuild,
+            Weather: EffectiveWeather.StormAlert,
+            Mood: HqMood.Failing,
+            PendingVisualEvents: Array.Empty<HqEvent>(),
+            Timestamp: fixedNow);
+        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, failState, shinobi, outputDir, "shinobi-hq-fail.png", warmupTicks: 10));
+
+        // 5. shinobi-hq-clone.png
+        var cloneState = new HqState(
+            Agents: new List<AgentSnapshot>
+            {
+                new("a-shika", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "execute", Repo: "kagedesk"),
+                new("a-minato", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", Repo: "kagedesk"),
+                new("a-tsunade", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test", Repo: "kagedesk"),
+                new("a-kakashi", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Working, ToolName: "review", Repo: "kagedesk"),
+                new("clone-1", "Clone #1", AgentRole.Clone, "clone", AgentState.Working, ToolName: "edit", WorktreeId: "wt-1"),
+                new("clone-2", "Clone #2", AgentRole.Clone, "clone", AgentState.Working, ToolName: "test", WorktreeId: "wt-2"),
+                new("ext-1", "Claude CLI", AgentRole.External, "generic", AgentState.Working, ToolName: "exec")
+            },
+            Accounts: sampleAccounts,
+            Builds: passingBuild,
+            Weather: EffectiveWeather.MidnightRain,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: new List<HqEvent>
+            {
+                new(1, "CloneSpawned", "Shadow clones deployed", fixedNow, "clone-1")
+            },
+            Timestamp: fixedNow);
+        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, cloneState, shinobi, outputDir, "shinobi-hq-clone.png", warmupTicks: 6));
+
+        // 6. cyber-bunker-working.png
+        var cyberWorkingState = workingState with { Weather = EffectiveWeather.MidnightRain };
+        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, cyberWorkingState, cyber, outputDir, "cyber-bunker-working.png", warmupTicks: 10));
+
+        // 7. cozy-lofi-idle.png
+        var lofiIdleState = new HqState(
+            Agents: Array.Empty<AgentSnapshot>(),
+            Accounts: new List<AccountInfo>
+            {
+                new("orca", "cozy", "lofi-studio", true)
+            },
+            Builds: passingBuild,
+            Weather: EffectiveWeather.Sunset,
+            Mood: HqMood.Calm,
+            PendingVisualEvents: Array.Empty<HqEvent>(),
+            Timestamp: fixedNow);
+        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, lofiIdleState, lofi, outputDir, "cozy-lofi-idle.png", warmupTicks: 8));
+
+        // 8. pet-overlay-approve.png
+        written.Add(RenderPetSnapshot(petRenderer, petCanvas, petScaled, approveState, shinobi, outputDir, "pet-overlay-approve.png", warmupTicks: 6));
+
+        // 9. pet-overlay-working.png
+        written.Add(RenderPetSnapshot(petRenderer, petCanvas, petScaled, workingState, cyber, outputDir, "pet-overlay-working.png", warmupTicks: 8));
+
+        return written;
+    }
+
+    private static string RenderWallpaperSnapshot(
+        HqWallpaperRenderer renderer,
+        PixelBuffer canvas,
+        PixelBuffer upscaled,
+        HqState state,
+        ThemePack theme,
+        string outputDir,
+        string fileName,
+        int warmupTicks)
+    {
+        renderer.ResetEffects();
+        float t = 0.25f;
+        for (int i = 0; i < warmupTicks; i++)
+        {
+            renderer.Render(canvas, state, theme, t);
+            t += 0.12f;
+        }
+
+        canvas.BlitNearestNeighborTo(upscaled, scale: 2);
+        string path = Path.Combine(outputDir, fileName);
+        upscaled.Bitmap.Save(path, ImageFormat.Png);
+        return path;
+    }
+
+    private static string RenderPetSnapshot(
+        TaskbarPetRenderer renderer,
+        PixelBuffer canvas,
+        PixelBuffer upscaled,
+        HqState state,
+        ThemePack theme,
+        string outputDir,
+        string fileName,
+        int warmupTicks)
+    {
+        renderer.ResetEffects();
+        float t = 0.25f;
+        for (int i = 0; i < warmupTicks; i++)
+        {
+            renderer.Render(canvas, state, theme, t);
+            t += 0.12f;
+        }
+
+        canvas.BlitNearestNeighborTo(upscaled, scale: 2);
+        string path = Path.Combine(outputDir, fileName);
+        upscaled.Bitmap.Save(path, ImageFormat.Png);
+        return path;
+    }
+
+    private static ThemePack FindTheme(ThemeLoadResult result, string id)
+    {
+        for (int i = 0; i < result.Themes.Count; i++)
+        {
+            if (string.Equals(result.Themes[i].Id, id, StringComparison.OrdinalIgnoreCase))
+            {
+                return result.Themes[i];
+            }
+        }
+        return result.FallbackTheme;
+    }
+}

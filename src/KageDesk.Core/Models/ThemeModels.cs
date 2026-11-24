@@ -30,6 +30,20 @@ public record CharacterStyle(
     string? AlertAnimation = null
 );
 
+public record SceneColors(
+    string? WallTop = null,
+    string? WallBottom = null,
+    string? FloorBase = null,
+    string? FloorLine = null,
+    string? RugOuter = null,
+    string? RugInner = null,
+    string? DeskTop = null,
+    string? DeskFront = null,
+    string? WindowFrame = null,
+    string? BoardBg = null,
+    string? SkylineStyle = null
+);
+
 public record ThemePack(
     string Id,
     string DisplayName,
@@ -38,5 +52,6 @@ public record ThemePack(
     ThemePalette Palette,
     WeatherPalette Weather,
     DeskLayout Layout,
-    IReadOnlyDictionary<string, CharacterStyle> Characters
+    IReadOnlyDictionary<string, CharacterStyle> Characters,
+    SceneColors? Scene = null
 );

@@ -135,4 +135,59 @@ public class ThemePackLoaderTests
     {
         Assert.Equal(expected, ThemePackLoader.IsValidHexColor(hex));
     }
+
+    [Fact]
+    public void ParseAndValidateTheme_ValidSceneColors_ParsesWithZeroWarnings()
+    {
+        var json = """
+        {
+          "id": "custom-scene",
+          "displayName": "Custom Scene",
+          "version": "1.0.0",
+          "author": "Test",
+          "palette": {
+            "background": "#111111", "surface": "#222222", "border": "#333333", "accent": "#444444", "text": "#555555"
+          },
+          "weather": {
+            "dawn": "#111111", "day": "#222222", "sunset": "#333333", "midnightRain": "#444444", "stormAlert": "#555555"
+          },
+          "scene": {
+            "wallTop": "#171b28",
+            "wallBottom": "#121622",
+            "floorBase": "#2b1f17",
+            "skylineStyle": "cyber"
+          }
+        }
+        """;
+
+        var (theme, warnings) = ThemePackLoader.ParseAndValidateTheme(json, "test_valid_scene");
+        Assert.NotNull(theme);
+        Assert.Empty(warnings);
+        Assert.Equal("#171b28", theme!.Scene?.WallTop);
+        Assert.Equal("cyber", theme.Scene?.SkylineStyle);
+    }
+
+    [Fact]
+    public void ParseAndValidateTheme_InvalidSceneHex_ReturnsNullAndWarning()
+    {
+        var json = """
+        {
+          "id": "bad-scene",
+          "displayName": "Bad Scene",
+          "palette": {
+            "background": "#111111", "surface": "#222222", "border": "#333333", "accent": "#444444", "text": "#555555"
+          },
+          "weather": {
+            "dawn": "#111111", "day": "#222222", "sunset": "#333333", "midnightRain": "#444444", "stormAlert": "#555555"
+          },
+          "scene": {
+            "wallTop": "not-a-hex"
+          }
+        }
+        """;
+
+        var (theme, warnings) = ThemePackLoader.ParseAndValidateTheme(json, "test_bad_scene");
+        Assert.Null(theme);
+        Assert.Contains(warnings, w => w.Contains("invalid hex color for scene"));
+    }
 }

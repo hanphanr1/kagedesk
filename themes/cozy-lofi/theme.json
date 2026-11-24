@@ -1,0 +1,77 @@
+{
+  "id": "cozy-lofi",
+  "displayName": "Cozy Lo-Fi",
+  "version": "1.0.0",
+  "author": "KageDesk",
+  "palette": {
+    "background": "#17131c",
+    "surface": "#251e2c",
+    "border": "#6d4c41",
+    "accent": "#fbbf24",
+    "text": "#fef3c7"
+  },
+  "weather": {
+    "dawn": "#fdba74",
+    "day": "#7dd3fc",
+    "sunset": "#fb7185",
+    "midnightRain": "#241e38",
+    "stormAlert": "#881337"
+  },
+  "layout": {
+    "maxSlots": 8,
+    "deskSpacing": 16,
+    "slotWidth": 64,
+    "slotHeight": 64
+  },
+  "characters": {
+    "shikamaru": {
+      "sprite": "shikamaru",
+      "idleAnimation": "coffee",
+      "workAnimation": "scroll",
+      "alertAnimation": "wave"
+    },
+    "minato": {
+      "sprite": "minato",
+      "idleAnimation": "idle",
+      "workAnimation": "flash",
+      "alertAnimation": "wave"
+    },
+    "tsunade": {
+      "sprite": "tsunade",
+      "idleAnimation": "idle",
+      "workAnimation": "flask",
+      "alertAnimation": "wave"
+    },
+    "kakashi": {
+      "sprite": "kakashi",
+      "idleAnimation": "book",
+      "workAnimation": "sharingan",
+      "alertAnimation": "wave"
+    },
+    "clone": {
+      "sprite": "clone",
+      "idleAnimation": "idle",
+      "workAnimation": "type",
+      "alertAnimation": "poof"
+    },
+    "generic": {
+      "sprite": "generic",
+      "idleAnimation": "idle",
+      "workAnimation": "type",
+      "alertAnimation": "wave"
+    }
+  },
+  "scene": {
+    "wallTop": "#1f1a24",
+    "wallBottom": "#17131c",
+    "floorBase": "#34251b",
+    "floorLine": "#241911",
+    "rugOuter": "#7c2d12",
+    "rugInner": "#9a3412",
+    "deskTop": "#7c5a3a",
+    "deskFront": "#563d26",
+    "windowFrame": "#5c4433",
+    "boardBg": "#241d2c",
+    "skylineStyle": "lofi"
+  }
+}

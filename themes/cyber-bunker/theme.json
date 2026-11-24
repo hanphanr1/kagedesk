@@ -1,0 +1,77 @@
+{
+  "id": "cyber-bunker",
+  "displayName": "Cyber Bunker",
+  "version": "1.0.0",
+  "author": "KageDesk",
+  "palette": {
+    "background": "#070a12",
+    "surface": "#101a2c",
+    "border": "#0891b2",
+    "accent": "#22d3ee",
+    "text": "#e0f2fe"
+  },
+  "weather": {
+    "dawn": "#9333ea",
+    "day": "#0284c7",
+    "sunset": "#db2777",
+    "midnightRain": "#0b132b",
+    "stormAlert": "#991b1b"
+  },
+  "layout": {
+    "maxSlots": 8,
+    "deskSpacing": 16,
+    "slotWidth": 64,
+    "slotHeight": 64
+  },
+  "characters": {
+    "shikamaru": {
+      "sprite": "shikamaru",
+      "idleAnimation": "coffee",
+      "workAnimation": "scroll",
+      "alertAnimation": "wave"
+    },
+    "minato": {
+      "sprite": "minato",
+      "idleAnimation": "idle",
+      "workAnimation": "flash",
+      "alertAnimation": "wave"
+    },
+    "tsunade": {
+      "sprite": "tsunade",
+      "idleAnimation": "idle",
+      "workAnimation": "flask",
+      "alertAnimation": "wave"
+    },
+    "kakashi": {
+      "sprite": "kakashi",
+      "idleAnimation": "book",
+      "workAnimation": "sharingan",
+      "alertAnimation": "wave"
+    },
+    "clone": {
+      "sprite": "clone",
+      "idleAnimation": "idle",
+      "workAnimation": "type",
+      "alertAnimation": "poof"
+    },
+    "generic": {
+      "sprite": "generic",
+      "idleAnimation": "idle",
+      "workAnimation": "type",
+      "alertAnimation": "wave"
+    }
+  },
+  "scene": {
+    "wallTop": "#0b0f1a",
+    "wallBottom": "#070a12",
+    "floorBase": "#0e1726",
+    "floorLine": "#133b5c",
+    "rugOuter": "#3b0f4f",
+    "rugInner": "#0e3a59",
+    "deskTop": "#1e293b",
+    "deskFront": "#0f172a",
+    "windowFrame": "#1e3a5f",
+    "boardBg": "#091120",
+    "skylineStyle": "cyber"
+  }
+}
