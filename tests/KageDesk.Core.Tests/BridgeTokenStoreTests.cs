@@ -7,6 +7,199 @@ namespace KageDesk.Core.Tests;
 public class BridgeTokenStoreTests
 {
     [Fact]
+    public void VerifyRawSecurityDescriptor_CallbackOrCustomAce_ReturnsFalse()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var currentUser = WindowsIdentity.GetCurrent().User!;
+
+        // 1. Callback ACE (AceType.AccessAllowedCallback)
+        var rawDaclCallback = new RawAcl(RawAcl.AclRevision, 2);
+        rawDaclCallback.InsertAce(0, new CommonAce(
+            AceFlags.None,
+            AceQualifier.AccessAllowed,
+            (int)FileSystemRights.FullControl,
+            currentUser,
+            isCallback: false,
+            opaque: null));
+        var callbackAce = new CommonAce(
+            AceFlags.None,
+            AceQualifier.AccessAllowed,
+            (int)FileSystemRights.Read,
+            currentUser,
+            isCallback: true,
+            opaque: new byte[] { 0x01, 0x02, 0x03, 0x04 });
+        Assert.Equal(AceType.AccessAllowedCallback, callbackAce.AceType);
+        rawDaclCallback.InsertAce(1, callbackAce);
+
+        var rawSdCallback = new RawSecurityDescriptor(
+            ControlFlags.DiscretionaryAclPresent | ControlFlags.DiscretionaryAclProtected,
+            currentUser,
+            currentUser,
+            systemAcl: null,
+            discretionaryAcl: rawDaclCallback);
+
+        byte[] callbackBytes = new byte[rawSdCallback.BinaryLength];
+        rawSdCallback.GetBinaryForm(callbackBytes, 0);
+        Assert.False(BridgeTokenStore.VerifyRawSecurityDescriptor(callbackBytes, currentUser));
+
+        // 2. CustomAce (user-defined ACE type)
+        var rawDaclCustom = new RawAcl(RawAcl.AclRevision, 2);
+        rawDaclCustom.InsertAce(0, new CommonAce(
+            AceFlags.None,
+            AceQualifier.AccessAllowed,
+            (int)FileSystemRights.FullControl,
+            currentUser,
+            isCallback: false,
+            opaque: null));
+        rawDaclCustom.InsertAce(1, new CustomAce(
+            (AceType)0xFF,
+            AceFlags.None,
+            new byte[] { 0x01, 0x02, 0x03, 0x04 }));
+
+        var rawSdCustom = new RawSecurityDescriptor(
+            ControlFlags.DiscretionaryAclPresent | ControlFlags.DiscretionaryAclProtected,
+            currentUser,
+            currentUser,
+            systemAcl: null,
+            discretionaryAcl: rawDaclCustom);
+
+        byte[] customBytes = new byte[rawSdCustom.BinaryLength];
+        rawSdCustom.GetBinaryForm(customBytes, 0);
+        Assert.False(BridgeTokenStore.VerifyRawSecurityDescriptor(customBytes, currentUser));
+    }
+
+    [Fact]
+    public void VerifyRawSecurityDescriptor_InheritedForeignAce_ReturnsFalse()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var currentUser = WindowsIdentity.GetCurrent().User!;
+        var foreignSid = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
+
+        var rawDacl = new RawAcl(RawAcl.AclRevision, 2);
+        rawDacl.InsertAce(0, new CommonAce(
+            AceFlags.None,
+            AceQualifier.AccessAllowed,
+            (int)FileSystemRights.FullControl,
+            currentUser,
+            isCallback: false,
+            opaque: null));
+        rawDacl.InsertAce(1, new CommonAce(
+            AceFlags.Inherited,
+            AceQualifier.AccessAllowed,
+            (int)FileSystemRights.Read,
+            foreignSid,
+            isCallback: false,
+            opaque: null));
+
+        var rawSd = new RawSecurityDescriptor(
+            ControlFlags.DiscretionaryAclPresent | ControlFlags.DiscretionaryAclProtected,
+            currentUser,
+            currentUser,
+            systemAcl: null,
+            discretionaryAcl: rawDacl);
+
+        byte[] bytes = new byte[rawSd.BinaryLength];
+        rawSd.GetBinaryForm(bytes, 0);
+
+        Assert.False(BridgeTokenStore.VerifyRawSecurityDescriptor(bytes, currentUser));
+    }
+
+    [Fact]
+    public void VerifyRawSecurityDescriptor_ForeignOwner_ReturnsFalse()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var currentUser = WindowsIdentity.GetCurrent().User!;
+        var foreignOwner = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+
+        var rawDacl = new RawAcl(RawAcl.AclRevision, 1);
+        rawDacl.InsertAce(0, new CommonAce(
+            AceFlags.None,
+            AceQualifier.AccessAllowed,
+            (int)FileSystemRights.FullControl,
+            currentUser,
+            isCallback: false,
+            opaque: null));
+
+        var rawSd = new RawSecurityDescriptor(
+            ControlFlags.DiscretionaryAclPresent | ControlFlags.DiscretionaryAclProtected,
+            foreignOwner,
+            foreignOwner,
+            systemAcl: null,
+            discretionaryAcl: rawDacl);
+
+        byte[] bytes = new byte[rawSd.BinaryLength];
+        rawSd.GetBinaryForm(bytes, 0);
+
+        Assert.False(BridgeTokenStore.VerifyRawSecurityDescriptor(bytes, currentUser));
+    }
+
+    [Fact]
+    public void VerifyRawSecurityDescriptor_ValidCurrentUserOnlyProtected_ReturnsTrue()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var currentUser = WindowsIdentity.GetCurrent().User!;
+
+        var rawDacl = new RawAcl(RawAcl.AclRevision, 1);
+        rawDacl.InsertAce(0, new CommonAce(
+            AceFlags.None,
+            AceQualifier.AccessAllowed,
+            (int)FileSystemRights.FullControl,
+            currentUser,
+            isCallback: false,
+            opaque: null));
+
+        var rawSd = new RawSecurityDescriptor(
+            ControlFlags.DiscretionaryAclPresent | ControlFlags.DiscretionaryAclProtected,
+            currentUser,
+            currentUser,
+            systemAcl: null,
+            discretionaryAcl: rawDacl);
+
+        byte[] bytes = new byte[rawSd.BinaryLength];
+        rawSd.GetBinaryForm(bytes, 0);
+
+        Assert.True(BridgeTokenStore.VerifyRawSecurityDescriptor(bytes, currentUser));
+    }
+
+    [Fact]
+    public void VerifyRawSecurityDescriptor_InvalidArguments_ReturnsFalse()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var currentUser = WindowsIdentity.GetCurrent().User!;
+        Assert.False(BridgeTokenStore.VerifyRawSecurityDescriptor(null, currentUser));
+        Assert.False(BridgeTokenStore.VerifyRawSecurityDescriptor(Array.Empty<byte>(), currentUser));
+        Assert.False(BridgeTokenStore.VerifyRawSecurityDescriptor(new byte[] { 0x01, 0x02, 0x03 }, currentUser));
+        Assert.False(BridgeTokenStore.VerifyRawSecurityDescriptor(new byte[100], null));
+    }
+
+    [Fact]
+    public void GetOrCreateToken_FreshlyCreatedFile_PassesValidationViaGetSecurityInfo()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        string tempPath = Path.Combine(Path.GetTempPath(), $"kagedesk_token_roundtrip_{Guid.NewGuid():N}.token");
+        try
+        {
+            string token1 = BridgeTokenStore.GetOrCreateToken(tempPath);
+            Assert.True(BridgeTokenStore.IsValidToken(token1));
+            Assert.True(BridgeTokenStore.HasStrictCurrentUserOnlyAcl(tempPath));
+
+            // Reading an existing valid token file uses GetSecurityInfo raw descriptor verification
+            string token2 = BridgeTokenStore.GetOrCreateToken(tempPath);
+            Assert.Equal(token1, token2);
+        }
+        finally
+        {
+            if (File.Exists(tempPath)) File.Delete(tempPath);
+        }
+    }
+
+    [Fact]
     public void VerifySecurity_ProtectedDaclWithRetainedForeignAce_FailsAndGetOrCreateReplacesCleanly()
     {
         if (!OperatingSystem.IsWindows()) return;

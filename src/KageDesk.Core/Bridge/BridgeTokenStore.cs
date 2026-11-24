@@ -1,14 +1,48 @@
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+[assembly: InternalsVisibleTo("KageDesk.Core.Tests")]
 
 namespace KageDesk.Core.Bridge;
 
 public static class BridgeTokenStore
 {
     private static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
+
+    private const uint SE_FILE_OBJECT = 1u;
+    private const uint OWNER_SECURITY_INFORMATION = 0x00000001u;
+    private const uint DACL_SECURITY_INFORMATION = 0x00000004u;
+
+    [SupportedOSPlatform("windows")]
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern uint GetSecurityInfo(
+        SafeFileHandle handle,
+        uint objectType,
+        uint securityInfo,
+        out IntPtr pSidOwner,
+        out IntPtr pSidGroup,
+        out IntPtr pDacl,
+        out IntPtr pSacl,
+        out IntPtr ppSecurityDescriptor);
+
+    [SupportedOSPlatform("windows")]
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsValidSecurityDescriptor(IntPtr pSecurityDescriptor);
+
+    [SupportedOSPlatform("windows")]
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern uint GetSecurityDescriptorLength(IntPtr pSecurityDescriptor);
+
+    [SupportedOSPlatform("windows")]
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr LocalFree(IntPtr hMem);
 
     public static string GetOrCreateToken(string? customPath = null)
     {
@@ -78,8 +112,7 @@ public static class BridgeTokenStore
             if (currentUser == null) return null;
 
             using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-            var security = FileSystemAclExtensions.GetAccessControl(fs);
-            if (!VerifySecurity(security, currentUser))
+            if (!VerifyFileHandleSecurity(fs.SafeFileHandle, currentUser))
             {
                 return null;
             }
@@ -98,6 +131,50 @@ public static class BridgeTokenStore
         }
 
         return null;
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static bool VerifyFileHandleSecurity(SafeFileHandle handle, SecurityIdentifier currentUser)
+    {
+        IntPtr pSd = IntPtr.Zero;
+        try
+        {
+            uint result = GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                out _,
+                out _,
+                out _,
+                out _,
+                out pSd);
+
+            if (result != 0 || pSd == IntPtr.Zero || !IsValidSecurityDescriptor(pSd))
+            {
+                return false;
+            }
+
+            uint length = GetSecurityDescriptorLength(pSd);
+            if (length == 0 || length > int.MaxValue)
+            {
+                return false;
+            }
+
+            byte[] rawBytes = new byte[(int)length];
+            Marshal.Copy(pSd, rawBytes, 0, rawBytes.Length);
+            return VerifyRawSecurityDescriptor(rawBytes, currentUser);
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            if (pSd != IntPtr.Zero)
+            {
+                LocalFree(pSd);
+            }
+        }
     }
 
     public static string GetDefaultTokenPath()
@@ -131,9 +208,8 @@ public static class BridgeTokenStore
             var currentUser = WindowsIdentity.GetCurrent().User;
             if (currentUser == null) return false;
 
-            var fileInfo = new FileInfo(filePath);
-            var fileSecurity = fileInfo.GetAccessControl();
-            return VerifySecurity(fileSecurity, currentUser);
+            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return VerifyFileHandleSecurity(fs.SafeFileHandle, currentUser);
         }
         catch
         {
@@ -150,12 +226,26 @@ public static class BridgeTokenStore
         }
 
         byte[] rawBytes = security.GetSecurityDescriptorBinaryForm();
-        if (rawBytes == null || rawBytes.Length == 0)
+        return VerifyRawSecurityDescriptor(rawBytes, currentUser);
+    }
+
+    [SupportedOSPlatform("windows")]
+    internal static bool VerifyRawSecurityDescriptor(byte[]? rawDescriptorBytes, SecurityIdentifier? currentUser)
+    {
+        if (rawDescriptorBytes == null || rawDescriptorBytes.Length == 0 || currentUser == null)
         {
             return false;
         }
 
-        var rawSd = new RawSecurityDescriptor(rawBytes, 0);
+        RawSecurityDescriptor rawSd;
+        try
+        {
+            rawSd = new RawSecurityDescriptor(rawDescriptorBytes, 0);
+        }
+        catch (Exception ex) when (ex is ArgumentException or ArgumentOutOfRangeException)
+        {
+            return false;
+        }
 
         // 1. Owner SID must match current user
         if (rawSd.Owner == null || !currentUser.Equals(rawSd.Owner))
@@ -179,6 +269,11 @@ public static class BridgeTokenStore
         foreach (GenericAce ace in rawSd.DiscretionaryAcl)
         {
             if (ace is not CommonAce commonAce || commonAce.AceType != AceType.AccessAllowed)
+            {
+                return false;
+            }
+
+            if (commonAce.IsInherited)
             {
                 return false;
             }

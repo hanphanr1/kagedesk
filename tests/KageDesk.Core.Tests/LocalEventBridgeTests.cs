@@ -495,30 +495,10 @@ public class LocalEventBridgeTests
             sw.Stop();
             Assert.Fail($"Server did not abort stalled request within outer watchdog deadline ({outerWatchdogTimeout.TotalMilliseconds:F0}ms)");
         }
-        catch (IOException ex) when (ex.InnerException is SocketException sockEx)
+        catch (IOException ex) when (ex.InnerException is SocketException se && se.SocketErrorCode == SocketError.ConnectionReset)
         {
             sw.Stop();
-            if (!IsExpectedAbortSocketError(sockEx.SocketErrorCode))
-            {
-                Assert.Fail($"Unexpected SocketErrorCode on stalled request abort: {sockEx.SocketErrorCode} ({ex.Message})");
-            }
-
-            aborted = true; // Verified connection reset/abort by server
-        }
-        catch (IOException ex)
-        {
-            sw.Stop();
-            Assert.Fail($"Unexpected IOException without verified abort SocketException: {ex}");
-        }
-        catch (SocketException sockEx)
-        {
-            sw.Stop();
-            if (!IsExpectedAbortSocketError(sockEx.SocketErrorCode))
-            {
-                Assert.Fail($"Unexpected SocketErrorCode on stalled request abort: {sockEx.SocketErrorCode} ({sockEx.Message})");
-            }
-
-            aborted = true; // Verified connection reset/abort by server
+            aborted = true; // Verified connection reset by server
         }
 
         Assert.True(aborted, "Stalled request was not aborted by server within read timeout");
@@ -526,12 +506,6 @@ public class LocalEventBridgeTests
             sw.Elapsed >= TimeSpan.FromMilliseconds(150) && sw.Elapsed <= maxExpectedAbortWindow,
             $"Expected server abort inside [150ms, {maxExpectedAbortWindow.TotalMilliseconds:F0}ms] for {readTimeout.TotalMilliseconds:F0}ms timeout, actual elapsed: {sw.Elapsed.TotalMilliseconds:F1}ms");
     }
-
-    private static bool IsExpectedAbortSocketError(SocketError error) =>
-        error is SocketError.ConnectionReset
-            or SocketError.ConnectionAborted
-            or SocketError.Shutdown
-            or SocketError.OperationAborted;
 
     [Fact]
     public async Task CleanShutdownUnderLoad_NoObjectDisposedException()
