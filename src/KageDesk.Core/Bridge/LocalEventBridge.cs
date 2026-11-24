@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -16,8 +18,13 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
     private readonly HttpListener _listener;
     private readonly HqStateAggregator _aggregator;
     private readonly AppConfig _config;
+    private readonly string? _requiredToken;
+    private readonly Func<string>? _getActiveThemeId;
     private readonly DateTimeOffset _startedAt;
     private readonly CancellationTokenSource _cts = new();
+    private readonly SemaphoreSlim _concurrencySemaphore = new(16, 16);
+    private readonly ConcurrentDictionary<Task, byte> _activeRequests = new();
+
     private Task? _listenTask;
     private bool _disposed;
 
@@ -33,10 +40,17 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
         Converters = { new JsonStringEnumConverter() }
     };
 
-    public LocalEventBridge(HqStateAggregator aggregator, int port = DefaultPort, AppConfig? config = null)
+    public LocalEventBridge(
+        HqStateAggregator aggregator,
+        int port = DefaultPort,
+        AppConfig? config = null,
+        string? requiredToken = null,
+        Func<string>? getActiveThemeId = null)
     {
         _aggregator = aggregator ?? throw new ArgumentNullException(nameof(aggregator));
         _config = config ?? new AppConfig();
+        _requiredToken = requiredToken;
+        _getActiveThemeId = getActiveThemeId;
         Port = port;
         _startedAt = DateTimeOffset.UtcNow;
 
@@ -60,7 +74,24 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
             try
             {
                 var context = await _listener.GetContextAsync().ConfigureAwait(false);
-                _ = Task.Run(() => HandleRequestSafeAsync(context));
+
+                // Bounded concurrency check: max 16 concurrent requests
+                if (!_concurrencySemaphore.Wait(0))
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await WriteJsonAsync(context.Response, 503, new { ok = false, error = "Service Unavailable: concurrency limit reached" }).ConfigureAwait(false);
+                        }
+                        catch { }
+                    });
+                    continue;
+                }
+
+                var requestTask = ProcessTrackedRequestAsync(context);
+                _activeRequests.TryAdd(requestTask, 0);
+                _ = requestTask.ContinueWith(t => _activeRequests.TryRemove(t, out _));
             }
             catch (HttpListenerException) when (_cts.IsCancellationRequested || !_listener.IsListening)
             {
@@ -77,17 +108,30 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
         }
     }
 
+    private async Task ProcessTrackedRequestAsync(HttpListenerContext context)
+    {
+        try
+        {
+            await HandleRequestSafeAsync(context).ConfigureAwait(false);
+        }
+        finally
+        {
+            _concurrencySemaphore.Release();
+        }
+    }
+
     private async Task HandleRequestSafeAsync(HttpListenerContext context)
     {
         try
         {
             await ProcessRequestAsync(context).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        catch (Exception)
         {
             try
             {
-                await WriteJsonAsync(context.Response, 500, new { ok = false, error = ex.Message }).ConfigureAwait(false);
+                // Never leak internal exception details to client
+                await WriteJsonAsync(context.Response, 500, new { ok = false, error = "Internal server error" }).ConfigureAwait(false);
             }
             catch { }
         }
@@ -109,12 +153,13 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
         var path = request.Url?.AbsolutePath ?? "/";
         var method = request.HttpMethod.ToUpperInvariant();
 
-        // 1. GET /api/health
+        // 1. GET /api/health (Non-sensitive: no token required)
         if (method == "GET" && string.Equals(path, "/api/health", StringComparison.OrdinalIgnoreCase))
         {
             var workingSet = Process.GetCurrentProcess().WorkingSet64 / (1024.0 * 1024.0);
             var uptime = (DateTimeOffset.UtcNow - _startedAt).TotalSeconds;
             var state = _aggregator.GetState();
+            string activeTheme = _getActiveThemeId?.Invoke() ?? _config.ActiveThemeId;
 
             await WriteJsonAsync(response, 200, new
             {
@@ -122,17 +167,36 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
                 version = "1.0.0",
                 workingSetMb = Math.Round(workingSet, 2),
                 uptimeSec = Math.Round(uptime, 1),
-                activeTheme = _config.ActiveThemeId,
+                activeTheme = activeTheme,
                 agentCount = state.Agents.Count
             }).ConfigureAwait(false);
             return;
         }
 
-        // 2. GET /api/state
+        // Token authentication check for all other endpoints
+        if (!IsAuthorized(request))
+        {
+            await WriteJsonAsync(response, 401, new { ok = false, error = "Unauthorized: missing or invalid X-KageDesk-Token header" }).ConfigureAwait(false);
+            return;
+        }
+
+        // 2. GET /api/state (Omit raw free-text prompt/lastMessage)
         if (method == "GET" && string.Equals(path, "/api/state", StringComparison.OrdinalIgnoreCase))
         {
             var state = _aggregator.GetState();
-            await WriteJsonAsync(response, 200, state).ConfigureAwait(false);
+
+            // Sanitize sensitive fields (remove LastMessage from external HTTP response)
+            var sanitizedAgents = new List<AgentSnapshot>(state.Agents.Count);
+            foreach (var a in state.Agents)
+            {
+                sanitizedAgents.Add(a with
+                {
+                    LastMessage = null
+                });
+            }
+
+            var safeState = state with { Agents = sanitizedAgents };
+            await WriteJsonAsync(response, 200, safeState).ConfigureAwait(false);
             return;
         }
 
@@ -194,33 +258,57 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
         await WriteJsonAsync(response, 404, new { ok = false, error = "Not found" }).ConfigureAwait(false);
     }
 
-    private static async Task<(string? Body, bool IsTooLarge)> ReadBodySafeAsync(HttpListenerRequest request)
+    private bool IsAuthorized(HttpListenerRequest request)
+    {
+        if (string.IsNullOrEmpty(_requiredToken)) return true;
+
+        string? tokenHeader = request.Headers["X-KageDesk-Token"];
+        if (string.IsNullOrEmpty(tokenHeader)) return false;
+
+        byte[] expectedBytes = Encoding.UTF8.GetBytes(_requiredToken);
+        byte[] actualBytes = Encoding.UTF8.GetBytes(tokenHeader);
+
+        if (expectedBytes.Length != actualBytes.Length) return false;
+        return CryptographicOperations.FixedTimeEquals(expectedBytes, actualBytes);
+    }
+
+    private async Task<(string? Body, bool IsTooLarge)> ReadBodySafeAsync(HttpListenerRequest request)
     {
         if (request.ContentLength64 > MaxBodyBytes)
         {
             return (null, true);
         }
 
-        using var ms = new MemoryStream();
-        var buffer = new byte[4096];
-        int totalRead = 0;
+        using var readCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        readCts.CancelAfter(TimeSpan.FromSeconds(5));
 
-        while (true)
+        try
         {
-            int read = await request.InputStream.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
-            if (read == 0) break;
+            using var ms = new MemoryStream();
+            var buffer = new byte[4096];
+            int totalRead = 0;
 
-            totalRead += read;
-            if (totalRead > MaxBodyBytes)
+            while (true)
             {
-                return (null, true);
+                int read = await request.InputStream.ReadAsync(buffer, 0, buffer.Length, readCts.Token).ConfigureAwait(false);
+                if (read == 0) break;
+
+                totalRead += read;
+                if (totalRead > MaxBodyBytes)
+                {
+                    return (null, true);
+                }
+
+                ms.Write(buffer, 0, read);
             }
 
-            ms.Write(buffer, 0, read);
+            var encoding = request.ContentEncoding ?? Encoding.UTF8;
+            return (encoding.GetString(ms.ToArray()), false);
         }
-
-        var encoding = request.ContentEncoding ?? Encoding.UTF8;
-        return (encoding.GetString(ms.ToArray()), false);
+        catch (OperationCanceledException)
+        {
+            return (null, false);
+        }
     }
 
     private static async Task WriteJsonAsync(HttpListenerResponse response, int statusCode, object data)
@@ -242,6 +330,19 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
         }
     }
 
+    public async Task DrainActiveRequestsAsync(TimeSpan timeout)
+    {
+        var tasks = _activeRequests.Keys.ToArray();
+        if (tasks.Length > 0)
+        {
+            try
+            {
+                await Task.WhenAny(Task.WhenAll(tasks), Task.Delay(timeout)).ConfigureAwait(false);
+            }
+            catch { }
+        }
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
@@ -257,10 +358,16 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
         catch { }
 
         _cts.Dispose();
+        _concurrencySemaphore.Dispose();
     }
 
     public async ValueTask DisposeAsync()
     {
+        if (_disposed) return;
+
+        // Drain in-flight requests with bounded timeout
+        await DrainActiveRequestsAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+
         Dispose();
         if (_listenTask != null)
         {

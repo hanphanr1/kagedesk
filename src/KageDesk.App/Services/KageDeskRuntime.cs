@@ -11,11 +11,13 @@ namespace KageDesk.App.Services;
 
 public class KageDeskRuntime : IDisposable
 {
+    private readonly object _configLock = new();
     private readonly ConfigStore _configStore;
     private readonly AppConfig _config;
     private readonly string _themesDir;
     private ThemeLoadResult _themeResult;
     private ThemePack _activeTheme;
+    private readonly string _bridgeToken;
 
     private readonly HqStateAggregator _aggregator;
     private readonly OrcaCliCollector _orcaCollector;
@@ -31,8 +33,11 @@ public class KageDeskRuntime : IDisposable
 
     private readonly CancellationTokenSource _cts = new();
     private Task? _pollingLoopTask;
+    private volatile bool _stopping;
     private bool _disposed;
     private readonly bool _noWallpaperMode;
+
+    private record RenderPacket(HqState State, ThemePack Theme, bool WallpaperPaused, bool PetPaused);
 
     public AppConfig Config => _config;
     public HqStateAggregator Aggregator => _aggregator;
@@ -42,14 +47,18 @@ public class KageDeskRuntime : IDisposable
     public PetOverlayForm? PetForm => _petForm;
     public TrayController? Tray => _trayController;
     public DesktopOcclusionMonitor OcclusionMonitor => _occlusionMonitor;
+    public bool WallpaperAttached => _wallpaperBridge.IsAttached;
+    public string WallpaperStatusReason => _wallpaperBridge.StatusReason;
+    public string BridgeToken => _bridgeToken;
 
     public KageDeskRuntime(ConfigStore? configStore = null, bool noWallpaper = false)
     {
         _noWallpaperMode = noWallpaper;
         _configStore = configStore ?? new ConfigStore();
         _config = _configStore.Load();
+        _bridgeToken = BridgeTokenStore.GetOrCreateToken();
 
-        // Locate themes directory (search base directory, current directory, parent directory)
+        // Locate themes directory
         _themesDir = FindThemesDirectory();
         _themeResult = ThemePackLoader.LoadThemes(_themesDir);
         _activeTheme = FindActiveTheme(_config.ActiveThemeId);
@@ -66,6 +75,19 @@ public class KageDeskRuntime : IDisposable
 
         _occlusionMonitor.OcclusionStateChanged += OnOcclusionStateChanged;
         _aggregator.StateChanged += OnHqStateChanged;
+
+        // Register SessionSwitch strictly after WinForms UI initialization
+        _occlusionMonitor.SubscribeSessionSwitch();
+    }
+
+    public void UpdateConfig(Action<AppConfig> updater)
+    {
+        ArgumentNullException.ThrowIfNull(updater);
+        lock (_configLock)
+        {
+            updater(_config);
+            _configStore.Save(_config);
+        }
     }
 
     public void Start()
@@ -82,6 +104,7 @@ public class KageDeskRuntime : IDisposable
         if (!_noWallpaperMode && _config.WallpaperEnabled && _wallpaperForm != null)
         {
             _wallpaperBridge.AttachWallpaper(_wallpaperForm);
+            _wallpaperForm.IsAttached = _wallpaperBridge.IsAttached;
         }
 
         // Start adaptive polling loop
@@ -102,7 +125,12 @@ public class KageDeskRuntime : IDisposable
 
         try
         {
-            _localBridge = new LocalEventBridge(_aggregator, _config.LocalBridgePort);
+            _localBridge = new LocalEventBridge(
+                _aggregator,
+                _config.LocalBridgePort,
+                _config,
+                requiredToken: _bridgeToken,
+                getActiveThemeId: () => _config.ActiveThemeId);
             _localBridge.Start();
         }
         catch
@@ -117,6 +145,7 @@ public class KageDeskRuntime : IDisposable
         if (!_noWallpaperMode)
         {
             _wallpaperForm = new WallpaperHostForm(_activeTheme, _config.TargetFps);
+            _wallpaperForm.TaskbarRecreated += OnExplorerRestarted;
         }
 
         // 2. Pet Overlay Form
@@ -125,8 +154,7 @@ public class KageDeskRuntime : IDisposable
             _petForm = new PetOverlayForm(_activeTheme, _config.PetScale, _config.PetX, _config.PetIdleMode, _config.TargetFps);
             _petForm.PetPositionChanged += newX =>
             {
-                _config.PetX = newX;
-                _configStore.Save(_config);
+                UpdateConfig(c => c.PetX = newX);
             };
             _petForm.AgentClicked += agent =>
             {
@@ -135,16 +163,20 @@ public class KageDeskRuntime : IDisposable
         }
 
         // 3. Tray Controller
-        _trayController = new TrayController(_configStore, ExitApplication)
+        _trayController = new TrayController(ExitApplication)
         {
+            GetConfig = () => _config,
+            UpdateConfig = UpdateConfig,
             GetCurrentState = () => _aggregator.CurrentState,
             GetCurrentTheme = () => _activeTheme,
             GetLoadedThemes = () => _themeResult.Themes,
+            IsWallpaperAttached = () => _wallpaperBridge.IsAttached,
+            GetWallpaperStatus = () => _wallpaperBridge.StatusReason,
             OnThemeChanged = SwitchTheme,
             OnReloadThemes = ReloadThemes,
             OnWeatherChanged = mode =>
             {
-                _config.WeatherMode = mode;
+                UpdateConfig(c => c.WeatherMode = mode);
                 _aggregator.SetWeatherMode(mode);
             },
             OnWallpaperToggled = enabled =>
@@ -154,67 +186,89 @@ public class KageDeskRuntime : IDisposable
                     if (_wallpaperForm == null && !_noWallpaperMode)
                     {
                         _wallpaperForm = new WallpaperHostForm(_activeTheme, _config.TargetFps);
+                        _wallpaperForm.TaskbarRecreated += OnExplorerRestarted;
                     }
                     if (_wallpaperForm != null)
                     {
                         _wallpaperBridge.AttachWallpaper(_wallpaperForm);
+                        _wallpaperForm.IsAttached = _wallpaperBridge.IsAttached;
                     }
                 }
                 else
                 {
                     _wallpaperBridge.RestoreDesktopWallpaper();
+                    if (_wallpaperForm != null)
+                    {
+                        _wallpaperForm.IsAttached = false;
+                    }
                 }
             },
             OnPetModeChanged = mode =>
             {
-                _config.PetIdleMode = mode;
+                UpdateConfig(c => c.PetIdleMode = mode);
                 _petForm?.SetIdleMode(mode);
             },
             OnPetScaleChanged = scale =>
             {
-                _config.PetScale = scale;
+                UpdateConfig(c => c.PetScale = scale);
                 _petForm?.SetScale(scale);
             },
             OnResetPetPosition = () =>
             {
-                _config.PetX = null;
+                UpdateConfig(c => c.PetX = null);
                 _petForm?.SetPetX(null);
             },
             OnAutoPauseToggled = enabled =>
             {
-                _config.AutoPauseWallpaperWhenCovered = enabled;
-                UpdateOcclusionPause();
+                UpdateConfig(c => c.AutoPauseWallpaperWhenCovered = enabled);
+                PostRenderPacket();
             },
             OnGameDndToggled = enabled =>
             {
-                _config.HidePetsInFullscreenGame = enabled;
-                UpdateOcclusionPause();
+                UpdateConfig(c => c.HidePetsInFullscreenGame = enabled);
+                PostRenderPacket();
             },
             OnProcessAgentCollectorToggled = enabled =>
             {
-                _config.EnableProcessAgentCollector = enabled;
-                if (enabled && _procCollector == null)
+                UpdateConfig(c => c.EnableProcessAgentCollector = enabled);
+                if (enabled)
                 {
-                    _procCollector = new ProcessAgentCollector(_aggregator, true);
+                    if (_procCollector == null)
+                    {
+                        _procCollector = new ProcessAgentCollector(_aggregator, true);
+                    }
+                    else
+                    {
+                        _procCollector.Enabled = true;
+                    }
                 }
-                else if (_procCollector != null)
+                else
                 {
-                    _procCollector.Enabled = enabled;
+                    if (_procCollector != null) _procCollector.Enabled = false;
+                    _aggregator.ClearProcessAgentEntries();
                 }
             },
             OnGitHubCiCollectorToggled = enabled =>
             {
-                _config.EnableGitHubCiCollector = enabled;
-                if (enabled && _gitHubCollector == null && _config.GitHubRepos.Count > 0)
+                UpdateConfig(c => c.EnableGitHubCiCollector = enabled);
+                if (enabled)
                 {
-                    _gitHubCollector = new GitHubCiCollector(_aggregator, true, _config.GitHubRepos);
+                    if (_gitHubCollector == null && _config.GitHubRepos.Count > 0)
+                    {
+                        _gitHubCollector = new GitHubCiCollector(_aggregator, true, _config.GitHubRepos);
+                    }
+                    else if (_gitHubCollector != null)
+                    {
+                        _gitHubCollector.Enabled = true;
+                    }
                 }
-                else if (_gitHubCollector != null)
+                else
                 {
-                    _gitHubCollector.Enabled = enabled;
+                    if (_gitHubCollector != null) _gitHubCollector.Enabled = false;
+                    _aggregator.ClearCiBuildEntries();
                 }
             },
-            OnDemoTrigger = TriggerDemoState
+            OnDemoTrigger = scenario => _aggregator.SetDemoScenario(scenario)
         };
 
         if (_petForm != null)
@@ -223,29 +277,49 @@ public class KageDeskRuntime : IDisposable
         }
     }
 
-    private async Task PollingLoopAsync()
+    private void OnExplorerRestarted()
     {
-        while (!_cts.Token.IsCancellationRequested)
+        if (_stopping || _disposed) return;
+
+        Control? dispatcher = _wallpaperForm ?? (_petForm as Control);
+        if (dispatcher != null && dispatcher.IsHandleCreated)
         {
             try
             {
-                // If session is locked, wait until unlocked
+                dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (_stopping || _disposed) return;
+                    _wallpaperBridge.RestoreDesktopWallpaper();
+                    if (_config.WallpaperEnabled && !_noWallpaperMode && _wallpaperForm != null)
+                    {
+                        _wallpaperBridge.AttachWallpaper(_wallpaperForm);
+                        _wallpaperForm.IsAttached = _wallpaperBridge.IsAttached;
+                    }
+                }));
+            }
+            catch { }
+        }
+    }
+
+    private async Task PollingLoopAsync()
+    {
+        while (!_cts.Token.IsCancellationRequested && !_stopping)
+        {
+            try
+            {
                 if (_occlusionMonitor.IsSessionLocked)
                 {
                     await Task.Delay(2000, _cts.Token).ConfigureAwait(false);
                     continue;
                 }
 
-                // Collect Orca CLI
                 await _orcaCollector.CollectOnceAsync(_cts.Token).ConfigureAwait(false);
 
-                // Collect Process Agents if enabled
                 if (_procCollector != null && _config.EnableProcessAgentCollector)
                 {
                     _procCollector.CollectOnce();
                 }
 
-                // Collect GitHub CI if enabled
                 if (_gitHubCollector != null && _config.EnableGitHubCiCollector)
                 {
                     await _gitHubCollector.CollectOnceAsync(_cts.Token).ConfigureAwait(false);
@@ -260,9 +334,6 @@ public class KageDeskRuntime : IDisposable
                 // Silently continue polling loop
             }
 
-            // Adaptive back-off:
-            // When any agent is Working or NeedsApproval: poll at Config.PollingIntervalMs (min 2000ms)
-            // When all agents are Idle: back off to 6000ms
             int delayMs = 6000;
             var currentAgents = _aggregator.CurrentState.Agents;
             for (int i = 0; i < currentAgents.Count; i++)
@@ -287,37 +358,61 @@ public class KageDeskRuntime : IDisposable
 
     private void OnHqStateChanged(object? sender, HqState state)
     {
-        _wallpaperForm?.UpdateData(state, _activeTheme);
-        _petForm?.UpdateData(state, _activeTheme);
+        PostRenderPacket();
     }
 
     private void OnOcclusionStateChanged(object? sender, EventArgs e)
     {
-        UpdateOcclusionPause();
+        PostRenderPacket();
     }
 
-    private void UpdateOcclusionPause()
+    private void PostRenderPacket()
     {
+        if (_stopping || _disposed) return;
+
         bool sessionLocked = _occlusionMonitor.IsSessionLocked;
-        bool wallpaperOccluded = _occlusionMonitor.IsWallpaperOccluded && _config.AutoPauseWallpaperWhenCovered;
+        bool wpOccluded = _occlusionMonitor.IsWallpaperOccluded && _config.AutoPauseWallpaperWhenCovered;
         bool gameDnd = _occlusionMonitor.IsFullscreenGame && _config.HidePetsInFullscreenGame;
 
-        if (_wallpaperForm != null)
-        {
-            _wallpaperForm.IsPaused = sessionLocked || wallpaperOccluded;
-        }
+        bool wpPaused = sessionLocked || wpOccluded;
+        bool petPaused = sessionLocked || gameDnd;
 
-        if (_petForm != null)
+        var packet = new RenderPacket(_aggregator.CurrentState, _activeTheme, wpPaused, petPaused);
+
+        Control? dispatcher = (_wallpaperForm != null && _wallpaperForm.IsHandleCreated)
+            ? _wallpaperForm
+            : ((_petForm != null && _petForm.IsHandleCreated) ? _petForm : null);
+
+        if (dispatcher != null && dispatcher.IsHandleCreated && !_stopping && !_disposed)
         {
-            _petForm.IsPaused = sessionLocked || gameDnd;
+            try
+            {
+                dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (_stopping || _disposed) return;
+
+                    if (_wallpaperForm != null && !_wallpaperForm.IsDisposed)
+                    {
+                        _wallpaperForm.UpdateData(packet.State, packet.Theme);
+                        _wallpaperForm.IsPaused = packet.WallpaperPaused;
+                    }
+
+                    if (_petForm != null && !_petForm.IsDisposed)
+                    {
+                        _petForm.UpdateData(packet.State, packet.Theme);
+                        _petForm.IsPaused = packet.PetPaused;
+                    }
+                }));
+            }
+            catch { }
         }
     }
 
     public void SwitchTheme(string themeId)
     {
         _activeTheme = FindActiveTheme(themeId);
-        _wallpaperForm?.UpdateData(_aggregator.CurrentState, _activeTheme);
-        _petForm?.UpdateData(_aggregator.CurrentState, _activeTheme);
+        UpdateConfig(c => c.ActiveThemeId = _activeTheme.Id);
+        PostRenderPacket();
     }
 
     public void ReloadThemes()
@@ -336,67 +431,6 @@ public class KageDeskRuntime : IDisposable
             }
         }
         return _themeResult.Themes.Count > 0 ? _themeResult.Themes[0] : ThemePackLoader.BuiltInFallback;
-    }
-
-    private void TriggerDemoState(string action)
-    {
-        var now = DateTimeOffset.UtcNow;
-        var accounts = _aggregator.CurrentState.Accounts;
-        var builds = _aggregator.CurrentState.Builds;
-
-        switch (action)
-        {
-            case "approval":
-                var approvalAgents = new List<AgentSnapshot>
-                {
-                    new("demo-leader", "Shikamaru (Leader)", AgentRole.Leader, "shikamaru", AgentState.NeedsApproval,
-                        QuestionPrompt: "Approve deploy KageDesk v1.2 to production?", TaskTitle: "Release Gate", Repo: "kagedesk"),
-                    new("demo-coder", "Minato (Coder)", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", Repo: "kagedesk"),
-                    new("demo-tester", "Tsunade (Tester)", AgentRole.Tester, "tsunade", AgentState.Idle, Repo: "kagedesk")
-                };
-                _aggregator.UpdateOrcaSnapshot(approvalAgents, accounts);
-                break;
-
-            case "done":
-                var doneAgents = new List<AgentSnapshot>
-                {
-                    new("demo-leader", "Shikamaru (Leader)", AgentRole.Leader, "shikamaru", AgentState.Done, TaskTitle: "All tests passing!", Repo: "kagedesk"),
-                    new("demo-coder", "Minato (Coder)", AgentRole.Coder, "minato", AgentState.Idle, Repo: "kagedesk"),
-                    new("demo-tester", "Tsunade (Tester)", AgentRole.Tester, "tsunade", AgentState.Idle, Repo: "kagedesk")
-                };
-                _aggregator.UpdateOrcaSnapshot(doneAgents, accounts);
-                break;
-
-            case "failed":
-                var failAgents = new List<AgentSnapshot>
-                {
-                    new("demo-coder", "Minato (Coder)", AgentRole.Coder, "minato", AgentState.Failed,
-                        QuestionPrompt: "Build failed on main with exit code 1", TaskTitle: "Compilation Error", Repo: "kagedesk"),
-                    new("demo-leader", "Shikamaru (Leader)", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "diagnose", Repo: "kagedesk")
-                };
-                _aggregator.UpdateOrcaSnapshot(failAgents, accounts);
-                break;
-
-            case "clones":
-                var cloneAgents = new List<AgentSnapshot>
-                {
-                    new("ag-1", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "plan", Repo: "kagedesk"),
-                    new("ag-2", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "compile", Repo: "kagedesk"),
-                    new("ag-3", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test", Repo: "kagedesk"),
-                    new("ag-4", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Working, ToolName: "review", Repo: "kagedesk"),
-                    new("ag-5", "Clone 1", AgentRole.Coder, "minato", AgentState.Working, ToolName: "worker_done", Repo: "kagedesk"),
-                    new("ag-6", "Clone 2", AgentRole.Coder, "minato", AgentState.Working, ToolName: "benchmark", Repo: "kagedesk")
-                };
-                _aggregator.UpdateOrcaSnapshot(cloneAgents, accounts);
-                break;
-
-            case "reset":
-                _ = Task.Run(async () =>
-                {
-                    await _orcaCollector.CollectOnceAsync().ConfigureAwait(false);
-                });
-                break;
-        }
     }
 
     private static string FindThemesDirectory()
@@ -430,6 +464,7 @@ public class KageDeskRuntime : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        _stopping = true;
 
         _cts.Cancel();
 
@@ -440,13 +475,37 @@ public class KageDeskRuntime : IDisposable
         }
         catch { }
 
+        // Bounded task drain (~2s)
+        if (_pollingLoopTask != null)
+        {
+            try
+            {
+                _pollingLoopTask.Wait(TimeSpan.FromSeconds(2));
+            }
+            catch { }
+        }
+
+        if (_localBridge != null)
+        {
+            try
+            {
+                _localBridge.DrainActiveRequestsAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+            }
+            catch { }
+            _localBridge.Dispose();
+        }
+
         _wallpaperBridge.RestoreDesktopWallpaper();
 
-        _wallpaperForm?.Dispose();
+        if (_wallpaperForm != null)
+        {
+            try { _wallpaperForm.TaskbarRecreated -= OnExplorerRestarted; } catch { }
+            _wallpaperForm.Dispose();
+        }
+
         _petForm?.Dispose();
         _trayController?.Dispose();
         _occlusionMonitor.Dispose();
-        _localBridge?.Dispose();
         _cts.Dispose();
     }
 }

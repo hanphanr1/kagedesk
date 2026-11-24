@@ -9,6 +9,7 @@ public record PushedEventPayload(
     AgentRole? Role = null,
     string? Provider = null,
     AgentState? State = null,
+    string? Type = null,
     string? ToolName = null,
     string? Message = null,
     string? Repo = null,
@@ -21,6 +22,8 @@ public record PushedEventPayload(
 
 public class HqStateAggregator
 {
+    private const int MaxCappedItems = 32;
+
     private readonly object _lock = new();
     private readonly Func<DateTimeOffset> _timeProvider;
     private readonly AppConfig _config;
@@ -31,9 +34,11 @@ public class HqStateAggregator
     private readonly Dictionary<string, (AgentSnapshot Agent, DateTimeOffset ExpiresAt)> _pushedAgents = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, AgentSnapshot> _processAgents = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, AccountInfo> _accounts = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, BuildInfo> _builds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, (BuildInfo Build, DateTimeOffset ExpiresAt)> _pushedBuilds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, BuildInfo> _collectorBuilds = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly List<HqEvent> _visualEvents = new();
+    private readonly Dictionary<string, (AgentSnapshot LastSnapshot, DateTimeOffset EnteredAt)> _departedDoneAgents = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _doneStateEnteredAt = new(StringComparer.OrdinalIgnoreCase);
 
     private string? _demoScenario;
@@ -70,15 +75,22 @@ public class HqStateAggregator
 
     public void SetWeatherMode(WeatherMode mode)
     {
+        HqState? toEmit = null;
         lock (_lock)
         {
             _config.WeatherMode = mode;
-            RecalculateState();
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
         }
     }
 
     public void SetDemoScenario(string? scenario)
     {
+        HqState? toEmit = null;
         lock (_lock)
         {
             if (string.IsNullOrWhiteSpace(scenario) || string.Equals(scenario, "clear", StringComparison.OrdinalIgnoreCase))
@@ -95,23 +107,47 @@ public class HqStateAggregator
                 _demoScenario = lower;
             }
 
-            RecalculateState();
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
         }
     }
 
     public void UpdateOrcaSnapshot(IReadOnlyList<AgentSnapshot> agents, IReadOnlyList<AccountInfo> accounts)
     {
+        HqState? toEmit = null;
         lock (_lock)
         {
+            var now = _timeProvider();
+
+            // Check previous orca agents for departures in Done state
+            foreach (var (prevId, prevAgent) in _orcaAgents)
+            {
+                bool stillPresent = agents.Any(a => string.Equals(a.Id, prevId, StringComparison.OrdinalIgnoreCase));
+                if (!stillPresent && prevAgent.State == AgentState.Done)
+                {
+                    DateTimeOffset enteredAt = _doneStateEnteredAt.TryGetValue(prevId, out var dt) ? dt : now;
+                    _departedDoneAgents[prevId] = (prevAgent, enteredAt);
+                }
+            }
+
             _orcaAgents.Clear();
             foreach (var a in agents)
             {
                 _orcaAgents[a.Id] = a;
+                // If now in live agents, remove from departed
+                _departedDoneAgents.Remove(a.Id);
             }
 
+            // Prune deleted Orca accounts while preserving other providers
+            var orcaAccountKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var acc in accounts)
             {
                 var key = $"{acc.Provider}:{acc.AccountId}";
+                orcaAccountKeys.Add(key);
                 if (_accounts.TryGetValue(key, out var existing))
                 {
                     _accounts[key] = acc with
@@ -126,12 +162,52 @@ public class HqStateAggregator
                 }
             }
 
-            RecalculateState();
+            // Remove any Orca account that is no longer returned in the snapshot
+            var staleOrcaAccounts = _accounts
+                .Where(kv => string.Equals(kv.Value.Provider, "orca", StringComparison.OrdinalIgnoreCase) && !orcaAccountKeys.Contains(kv.Key))
+                .Select(kv => kv.Key)
+                .ToList();
+
+            foreach (var k in staleOrcaAccounts)
+            {
+                _accounts.Remove(k);
+            }
+
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
+        }
+    }
+
+    public void ClearOrcaEntries()
+    {
+        HqState? toEmit = null;
+        lock (_lock)
+        {
+            _orcaAgents.Clear();
+            var orcaAccounts = _accounts
+                .Where(kv => string.Equals(kv.Value.Provider, "orca", StringComparison.OrdinalIgnoreCase))
+                .Select(kv => kv.Key)
+                .ToList();
+            foreach (var k in orcaAccounts)
+            {
+                _accounts.Remove(k);
+            }
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
         }
     }
 
     public void UpdateProcessAgents(IReadOnlyList<AgentSnapshot> agents)
     {
+        HqState? toEmit = null;
         lock (_lock)
         {
             _processAgents.Clear();
@@ -140,25 +216,79 @@ public class HqStateAggregator
                 _processAgents[a.Id] = a;
             }
 
-            RecalculateState();
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
+        }
+    }
+
+    public void ClearProcessAgentEntries()
+    {
+        HqState? toEmit = null;
+        lock (_lock)
+        {
+            _processAgents.Clear();
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
         }
     }
 
     public void UpdateCiBuilds(IReadOnlyList<BuildInfo> builds)
     {
+        HqState? toEmit = null;
         lock (_lock)
         {
-            foreach (var b in builds)
+            // Replace collector builds per repo to avoid stale runs accumulating
+            var updatedRepos = builds.Select(b => b.Repo).Distinct(StringComparer.OrdinalIgnoreCase).ToHashSet();
+            var staleKeys = _collectorBuilds
+                .Where(kv => updatedRepos.Contains(kv.Value.Repo))
+                .Select(kv => kv.Key)
+                .ToList();
+
+            foreach (var k in staleKeys)
             {
-                _builds[b.Id] = b;
+                _collectorBuilds.Remove(k);
             }
 
-            RecalculateState();
+            foreach (var b in builds)
+            {
+                _collectorBuilds[b.Id] = b;
+            }
+
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
+        }
+    }
+
+    public void ClearCiBuildEntries()
+    {
+        HqState? toEmit = null;
+        lock (_lock)
+        {
+            _collectorBuilds.Clear();
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
         }
     }
 
     public void UpdatePushedEvent(PushedEventPayload payload)
     {
+        HqState? toEmit = null;
         lock (_lock)
         {
             var now = _timeProvider();
@@ -169,7 +299,10 @@ public class HqStateAggregator
                 var id = payload.AgentId ?? payload.Name!;
                 var name = payload.Name ?? payload.AgentId!;
                 var role = payload.Role ?? AgentRole.External;
-                var state = payload.State ?? AgentState.Working;
+
+                // Resolve AgentState: explicit State wins, otherwise map from Type
+                AgentState state = payload.State ?? ResolveStateFromType(payload.Type);
+
                 var ttl = payload.TtlSeconds ?? 30.0;
                 var expiresAt = now.AddSeconds(ttl);
 
@@ -203,7 +336,10 @@ public class HqStateAggregator
             if (!string.IsNullOrEmpty(payload.Repo) && !string.IsNullOrEmpty(payload.BuildStatus))
             {
                 var buildId = $"{payload.Repo}:latest";
-                _builds[buildId] = new BuildInfo(
+                var ttl = payload.TtlSeconds ?? 120.0;
+                var expiresAt = now.AddSeconds(ttl);
+
+                _pushedBuilds[buildId] = (new BuildInfo(
                     Id: buildId,
                     Repo: payload.Repo,
                     WorkflowName: "CI",
@@ -212,7 +348,14 @@ public class HqStateAggregator
                     Status: "completed",
                     Conclusion: payload.BuildStatus,
                     UpdatedAt: now
-                );
+                ), expiresAt);
+
+                // Cap pushed builds at MaxCappedItems
+                if (_pushedBuilds.Count > MaxCappedItems)
+                {
+                    var oldest = _pushedBuilds.OrderBy(kv => kv.Value.ExpiresAt).First().Key;
+                    _pushedBuilds.Remove(oldest);
+                }
             }
 
             // 3. Account quota event
@@ -236,50 +379,94 @@ public class HqStateAggregator
                         QuotaPercent: payload.QuotaPercent
                     );
                 }
+
+                // Cap accounts at MaxCappedItems
+                if (_accounts.Count > MaxCappedItems)
+                {
+                    var oldest = _accounts.Keys.First();
+                    _accounts.Remove(oldest);
+                }
             }
 
-            RecalculateState();
+            toEmit = RecalculateStateLocked();
         }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
+        }
+    }
+
+    public static AgentState ResolveStateFromType(string? type)
+    {
+        if (string.IsNullOrWhiteSpace(type)) return AgentState.Working;
+
+        return type.Trim().ToLowerInvariant() switch
+        {
+            "tool_start" or "working" or "start" or "running" => AgentState.Working,
+            "tool_done" or "done" or "pass" or "build_pass" or "success" => AgentState.Done,
+            "notification" or "approval" or "needs_approval" or "waiting_input" => AgentState.NeedsApproval,
+            "fail" or "failed" or "error" or "build_fail" => AgentState.Failed,
+            "idle" or "stop" or "clear" => AgentState.Idle,
+            _ => AgentState.Working
+        };
     }
 
     public void Reevaluate()
     {
+        HqState? toEmit = null;
         lock (_lock)
         {
-            RecalculateState();
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
         }
     }
 
     public void AddVisualEvent(string type, string message, string? agentId = null, double ttlSeconds = 10.0)
     {
+        HqState? toEmit = null;
         lock (_lock)
         {
             var seq = Interlocked.Increment(ref _sequenceCounter);
             var now = _timeProvider();
             _visualEvents.Add(new HqEvent(seq, type, message, now, agentId, ttlSeconds));
-            RecalculateState();
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
         }
     }
 
-    private void RecalculateState()
+    private HqState? RecalculateStateLocked()
     {
         var now = _timeProvider();
 
         // 1. Expire old visual events
         _visualEvents.RemoveAll(e => (now - e.Timestamp).TotalSeconds > e.TtlSeconds);
 
-        // 2. Expire old pushed agents
-        var expiredPushed = _pushedAgents.Where(kv => now > kv.Value.ExpiresAt).Select(kv => kv.Key).ToList();
-        foreach (var k in expiredPushed)
+        // 2. Expire old pushed agents and pushed builds
+        var expiredPushedAgents = _pushedAgents.Where(kv => now > kv.Value.ExpiresAt).Select(kv => kv.Key).ToList();
+        foreach (var k in expiredPushedAgents)
         {
             _pushedAgents.Remove(k);
+        }
+
+        var expiredPushedBuilds = _pushedBuilds.Where(kv => now > kv.Value.ExpiresAt).Select(kv => kv.Key).ToList();
+        foreach (var k in expiredPushedBuilds)
+        {
+            _pushedBuilds.Remove(k);
         }
 
         // If Demo scenario active, construct demo state
         if (!string.IsNullOrEmpty(_demoScenario))
         {
-            ApplyDemoScenario(_demoScenario, now);
-            return;
+            return ApplyDemoScenarioLocked(_demoScenario, now);
         }
 
         // 3. Merge agents: live orca agents + active pushed agents + process agents
@@ -297,8 +484,8 @@ public class HqStateAggregator
                 mergedAgents[a.Id] = a;
         }
 
-        // 4. Celebration window & relaxation to Idle
-        var finalAgents = new List<AgentSnapshot>(mergedAgents.Count);
+        // 4. Celebration window & relaxation / pruning
+        var finalAgents = new List<AgentSnapshot>(mergedAgents.Count + _departedDoneAgents.Count);
         var celebrationSeconds = _config.CelebrationDurationSeconds;
 
         foreach (var a in mergedAgents.Values)
@@ -313,7 +500,7 @@ public class HqStateAggregator
 
                 if ((now - enteredAt).TotalSeconds > celebrationSeconds)
                 {
-                    // Relax to Idle
+                    // Live agent celebration expired: relax to Idle
                     finalAgents.Add(a with { State = AgentState.Idle });
                 }
                 else
@@ -328,11 +515,43 @@ public class HqStateAggregator
             }
         }
 
+        // Handle departed Done agents (no longer in live mergedAgents)
+        var expiredDeparted = new List<string>();
+        foreach (var (depId, (depAgent, enteredAt)) in _departedDoneAgents)
+        {
+            if (mergedAgents.ContainsKey(depId))
+            {
+                expiredDeparted.Add(depId);
+                continue;
+            }
+
+            if ((now - enteredAt).TotalSeconds <= celebrationSeconds)
+            {
+                // Still in celebration window
+                finalAgents.Add(depAgent);
+            }
+            else
+            {
+                // Celebration expired: PRUNE departed agent completely!
+                expiredDeparted.Add(depId);
+            }
+        }
+
+        foreach (var exp in expiredDeparted)
+        {
+            _departedDoneAgents.Remove(exp);
+            _doneStateEnteredAt.Remove(exp);
+        }
+
         // 5. Detect transitions for visual events
-        DetectTransitions(finalAgents, _builds.Values.ToList(), now);
+        var allBuildsMap = new Dictionary<string, BuildInfo>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (k, v) in _collectorBuilds) allBuildsMap[k] = v;
+        foreach (var (k, v) in _pushedBuilds) allBuildsMap[k] = v.Build;
+        var buildsList = allBuildsMap.Values.ToList();
+
+        DetectTransitions(finalAgents, buildsList, now);
 
         // 6. Compute Effective Weather and HQ Mood
-        var buildsList = _builds.Values.ToList();
         var weather = ComputeEffectiveWeather(_config.WeatherMode, buildsList, now);
         var mood = ComputeHqMood(finalAgents, buildsList, _visualEvents);
 
@@ -342,12 +561,18 @@ public class HqStateAggregator
             Builds: buildsList.OrderByDescending(b => b.UpdatedAt ?? DateTimeOffset.MinValue).ToList(),
             Weather: weather,
             Mood: mood,
-            PendingVisualEvents: _visualEvents.OrderBy(e => e.SequenceId).ToList(),
+            PendingVisualEvents: _visualEvents.OrderBy(e => e.SequenceId).ToArray(),
             DemoScenario: null,
             Timestamp: now
         );
 
-        EmitIfChanged(newState);
+        if (newState.Equals(_currentState))
+        {
+            return null; // Suppress no-op
+        }
+
+        _currentState = newState;
+        return _currentState;
     }
 
     private void DetectTransitions(IReadOnlyList<AgentSnapshot> currentAgents, IReadOnlyList<BuildInfo> currentBuilds, DateTimeOffset now)
@@ -411,7 +636,7 @@ public class HqStateAggregator
         }
     }
 
-    private void ApplyDemoScenario(string scenario, DateTimeOffset now)
+    private HqState? ApplyDemoScenarioLocked(string scenario, DateTimeOffset now)
     {
         var agents = new List<AgentSnapshot>();
         var builds = new List<BuildInfo>();
@@ -452,32 +677,33 @@ public class HqStateAggregator
             Builds: builds,
             Weather: weather,
             Mood: mood,
-            PendingVisualEvents: _visualEvents,
+            PendingVisualEvents: _visualEvents.ToArray(),
             DemoScenario: scenario,
             Timestamp: now
         );
 
-        EmitIfChanged(demoState);
-    }
-
-    private void EmitIfChanged(HqState newState)
-    {
-        if (newState.Equals(_currentState))
+        if (demoState.Equals(_currentState))
         {
-            return; // Suppress no-op updates
+            return null;
         }
 
-        _currentState = newState;
-        StateChanged?.Invoke(this, newState);
+        _currentState = demoState;
+        return _currentState;
     }
 
     public static EffectiveWeather ComputeEffectiveWeather(WeatherMode mode, IReadOnlyList<BuildInfo> builds, DateTimeOffset now)
     {
-        var anyBuildFailing = builds.Any(b => b.IsFailing);
+        // Fresh CI storm logic: compute failure based ONLY on latest build per repo
+        var latestPerRepo = builds
+            .GroupBy(b => b.Repo, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.OrderByDescending(b => b.UpdatedAt ?? DateTimeOffset.MinValue).First())
+            .ToList();
+
+        bool anyLatestFailing = latestPerRepo.Any(b => b.IsFailing);
 
         if (mode == WeatherMode.Auto)
         {
-            if (anyBuildFailing)
+            if (anyLatestFailing)
             {
                 return EffectiveWeather.StormAlert;
             }
@@ -517,8 +743,13 @@ public class HqStateAggregator
             return HqMood.Alert;
         }
 
-        // 2. Failing (Build fail or agent fail)
-        if (builds.Any(b => b.IsFailing) ||
+        // 2. Failing (Build fail or agent fail) - check latest build per repo
+        var latestPerRepo = builds
+            .GroupBy(b => b.Repo, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.OrderByDescending(b => b.UpdatedAt ?? DateTimeOffset.MinValue).First())
+            .ToList();
+
+        if (latestPerRepo.Any(b => b.IsFailing) ||
             agents.Any(a => a.State == AgentState.Failed) ||
             visualEvents.Any(e => string.Equals(e.Type, "BuildFailed", StringComparison.OrdinalIgnoreCase)))
         {

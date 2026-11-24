@@ -24,7 +24,7 @@ public class GitHubCiCollector
         _aggregator = aggregator ?? throw new ArgumentNullException(nameof(aggregator));
         Enabled = enabled;
         if (repositories != null) Repositories.AddRange(repositories);
-        _commandRunner = commandRunner ?? ExecuteGhProcessAsync;
+        _commandRunner = commandRunner ?? ((args, t, ct) => SafeProcessRunner.ExecuteAsync("gh", args, t, ct));
     }
 
     public async Task<IReadOnlyList<BuildInfo>> CollectOnceAsync(CancellationToken cancellationToken = default)
@@ -36,7 +36,7 @@ public class GitHubCiCollector
 
         foreach (var repo in Repositories)
         {
-            if (string.IsNullOrWhiteSpace(repo)) continue;
+            if (string.IsNullOrWhiteSpace(repo) || !SafeProcessRunner.IsValidGitHubRepo(repo)) continue;
 
             var args = new[]
             {

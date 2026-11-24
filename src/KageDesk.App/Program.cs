@@ -64,25 +64,39 @@ internal static class Program
             return 0;
         }
 
-        // 3. Exception Handling & WinForms Bootstrap
-        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
-        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        try
         {
-            // Safe logging without crashing desktop
-        };
-        Application.ThreadException += (_, e) =>
+            // 3. Exception Handling & WinForms Bootstrap
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            {
+                // Safe logging without crashing desktop
+            };
+            Application.ThreadException += (_, e) =>
+            {
+                // Safe logging without crashing desktop
+            };
+
+            ApplicationConfiguration.Initialize();
+
+            bool noWallpaper = args.Any(a => string.Equals(a, "--no-wallpaper", StringComparison.OrdinalIgnoreCase));
+            using var runtime = new KageDeskRuntime(noWallpaper: noWallpaper);
+            runtime.Start();
+
+            Application.Run();
+            return 0;
+        }
+        finally
         {
-            // Safe logging without crashing desktop
-        };
-
-        ApplicationConfiguration.Initialize();
-
-        bool noWallpaper = args.Any(a => string.Equals(a, "--no-wallpaper", StringComparison.OrdinalIgnoreCase));
-        using var runtime = new KageDeskRuntime(noWallpaper: noWallpaper);
-        runtime.Start();
-
-        Application.Run();
-        return 0;
+            if (isNewInstance)
+            {
+                try
+                {
+                    mutex.ReleaseMutex();
+                }
+                catch { }
+            }
+        }
     }
 
     private static string FindThemesDirectory()

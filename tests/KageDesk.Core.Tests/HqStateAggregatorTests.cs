@@ -280,4 +280,144 @@ public class HqStateAggregatorTests
         // Forced weather mode preserves setting
         Assert.Equal(EffectiveWeather.Sunset, HqStateAggregator.ComputeEffectiveWeather(WeatherMode.Sunset, failingBuilds, dayTime));
     }
+
+    [Fact]
+    public void FreshCiStormLogic_NewerSuccessClearsOlderFailure_ForSameRepo()
+    {
+        var localOffset = TimeZoneInfo.Local.GetUtcOffset(DateTime.Now);
+        var baseDate = new DateTimeOffset(2026, 11, 25, 12, 0, 0, localOffset);
+
+        // Older failing build (10:00) and newer successful build (10:05) for same repo
+        var builds = new[]
+        {
+            new BuildInfo("b-old", "kagedesk", "CI", "main", "Older Run", "completed", "failure", UpdatedAt: baseDate.AddMinutes(-5)),
+            new BuildInfo("b-new", "kagedesk", "CI", "main", "Newer Run", "completed", "success", UpdatedAt: baseDate)
+        };
+
+        // StormAlert should NOT be triggered because the latest run is green
+        var weather = HqStateAggregator.ComputeEffectiveWeather(WeatherMode.Auto, builds, baseDate);
+        Assert.Equal(EffectiveWeather.Day, weather);
+
+        // Mood should be Celebrating or Calm, definitely NOT Failing
+        var mood = HqStateAggregator.ComputeHqMood(Array.Empty<AgentSnapshot>(), builds, Array.Empty<HqEvent>());
+        Assert.NotEqual(HqMood.Failing, mood);
+    }
+
+    [Fact]
+    public void OrcaAccountPruning_RemovedAccountsArePrunedOnReplacement()
+    {
+        var aggregator = new HqStateAggregator();
+
+        var initialAccounts = new[]
+        {
+            new AccountInfo("orca", "acc-1", "Account 1", true),
+            new AccountInfo("orca", "acc-2", "Account 2", true)
+        };
+        aggregator.UpdateOrcaSnapshot(Array.Empty<AgentSnapshot>(), initialAccounts);
+        Assert.Equal(2, aggregator.GetState().Accounts.Count);
+
+        // Next snapshot: acc-2 was deleted/logged out
+        var updatedAccounts = new[]
+        {
+            new AccountInfo("orca", "acc-1", "Account 1", true)
+        };
+        aggregator.UpdateOrcaSnapshot(Array.Empty<AgentSnapshot>(), updatedAccounts);
+
+        var accounts = aggregator.GetState().Accounts;
+        Assert.Single(accounts);
+        Assert.Equal("acc-1", accounts[0].AccountId);
+    }
+
+    [Fact]
+    public void DepartedDoneAgent_CelebratedDuringWindow_ThenPrunedCompletely()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var currentTime = now;
+        var config = new AppConfig { CelebrationDurationSeconds = 10 };
+        var aggregator = new HqStateAggregator(config, () => currentTime);
+
+        // Step 1: Agent reports Done in live Orca snapshot
+        var doneAgent = new AgentSnapshot("done-ag", "Done Worker", AgentRole.Coder, "minato", AgentState.Done, UpdatedAt: currentTime);
+        aggregator.UpdateOrcaSnapshot(new[] { doneAgent }, Array.Empty<AccountInfo>());
+        Assert.Single(aggregator.GetState().Agents);
+        Assert.Equal(AgentState.Done, aggregator.GetState().Agents[0].State);
+
+        // Step 2: In next poll, agent has departed (no longer in live snapshot)
+        // Time is +4s (within 10s celebration window)
+        currentTime = now.AddSeconds(4);
+        aggregator.UpdateOrcaSnapshot(Array.Empty<AgentSnapshot>(), Array.Empty<AccountInfo>());
+
+        var midState = aggregator.GetState();
+        Assert.Single(midState.Agents);
+        Assert.Equal("done-ag", midState.Agents[0].Id);
+        Assert.Equal(AgentState.Done, midState.Agents[0].State);
+
+        // Step 3: Time advances beyond celebration window (+12s)
+        currentTime = now.AddSeconds(12);
+        aggregator.Reevaluate();
+
+        var postState = aggregator.GetState();
+        // Agent must be completely PRUNED (not relaxed to Idle!)
+        Assert.Empty(postState.Agents);
+    }
+
+    [Fact]
+    public void CollectorDisable_ClearsCollectorOwnedEntries()
+    {
+        var aggregator = new HqStateAggregator();
+
+        aggregator.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("orca-1", "Orca Agent", AgentRole.Leader, "shikamaru", AgentState.Working)
+        }, new[]
+        {
+            new AccountInfo("orca", "acc-orca", "Orca Acc", true)
+        });
+
+        aggregator.UpdateProcessAgents(new[]
+        {
+            new AgentSnapshot("proc-1", "Proc Agent", AgentRole.Coder, "minato", AgentState.Working)
+        });
+
+        aggregator.UpdateCiBuilds(new[]
+        {
+            new BuildInfo("ci-1", "kagedesk", "CI", "main", "Build", "completed", "success")
+        });
+
+        Assert.Equal(2, aggregator.GetState().Agents.Count);
+        Assert.Single(aggregator.GetState().Accounts);
+        Assert.Single(aggregator.GetState().Builds);
+
+        // Clear Orca
+        aggregator.ClearOrcaEntries();
+        Assert.Single(aggregator.GetState().Agents);
+        Assert.Equal("proc-1", aggregator.GetState().Agents[0].Id);
+        Assert.Empty(aggregator.GetState().Accounts);
+
+        // Clear Proc
+        aggregator.ClearProcessAgentEntries();
+        Assert.Empty(aggregator.GetState().Agents);
+
+        // Clear CI
+        aggregator.ClearCiBuildEntries();
+        Assert.Empty(aggregator.GetState().Builds);
+    }
+
+    [Fact]
+    public void StateChanged_FiredOutsideLock_CanSafelyQueryStateWithoutDeadlock()
+    {
+        var aggregator = new HqStateAggregator();
+        bool received = false;
+
+        aggregator.StateChanged += (sender, state) =>
+        {
+            // Querying aggregator inside event handler must not deadlock
+            var queried = aggregator.GetState();
+            Assert.NotNull(queried);
+            received = true;
+        };
+
+        aggregator.SetDemoScenario("working");
+        Assert.True(received);
+    }
 }

@@ -23,7 +23,7 @@ public class OrcaCliCollector
     {
         _aggregator = aggregator ?? throw new ArgumentNullException(nameof(aggregator));
         _timeProvider = timeProvider ?? (() => DateTimeOffset.UtcNow);
-        _commandRunner = commandRunner ?? ExecuteProcessAsync;
+        _commandRunner = commandRunner ?? ((args, t, ct) => SafeProcessRunner.ExecuteAsync("orca", args, t, ct));
     }
 
     public async Task<bool> CollectOnceAsync(CancellationToken cancellationToken = default)

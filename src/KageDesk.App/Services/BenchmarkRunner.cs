@@ -65,10 +65,10 @@ public static class BenchmarkRunner
         // 4. Setup Occlusion Monitor
         using var occlusionMonitor = new DesktopOcclusionMonitor(500);
 
-        // 5. Setup Rendering Buffers
+        // 5. Setup Rendering Buffers & Persistent Layered DIB Surface
         using var wpBuf = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
         using var petBuf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
-        using var scaledPetBuf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth * 2, TaskbarPetRenderer.CanvasHeight * 2);
+        using var dibSurface = new LayeredDibSurface(TaskbarPetRenderer.CanvasWidth * 2, TaskbarPetRenderer.CanvasHeight * 2);
 
         var wpRenderer = new HqWallpaperRenderer();
         var petRenderer = new TaskbarPetRenderer();
@@ -80,8 +80,7 @@ public static class BenchmarkRunner
             var curState = aggregator.CurrentState;
             wpRenderer.Render(wpBuf, curState, theme, t);
             petRenderer.Render(petBuf, curState, theme, t);
-            petBuf.BlitNearestNeighborTo(scaledPetBuf, 2);
-            ExecuteGdiCycle(scaledPetBuf.Bitmap);
+            dibSurface.BlitNearestNeighborFrom(petBuf, 2);
             occlusionMonitor.CheckOcclusion();
         }
 
@@ -112,12 +111,9 @@ public static class BenchmarkRunner
             // Render wallpaper
             wpRenderer.Render(wpBuf, curState, theme, t);
 
-            // Render pet
+            // Render pet & blit to persistent DIB surface (zero per-frame alloc)
             petRenderer.Render(petBuf, curState, theme, t);
-            petBuf.BlitNearestNeighborTo(scaledPetBuf, 2);
-
-            // Real layered bitmap GDI cycle
-            ExecuteGdiCycle(scaledPetBuf.Bitmap);
+            dibSurface.BlitNearestNeighborFrom(petBuf, 2);
 
             // Monitor check and natural Working Set sampling (~once per second / 15 frames)
             if (frames % 15 == 0)
@@ -196,29 +192,6 @@ public static class BenchmarkRunner
         }
 
         return 0;
-    }
-
-    private static void ExecuteGdiCycle(Bitmap bmp)
-    {
-        IntPtr screenDc = IntPtr.Zero;
-        IntPtr memDc = IntPtr.Zero;
-        IntPtr hBitmap = IntPtr.Zero;
-        IntPtr oldBitmap = IntPtr.Zero;
-
-        try
-        {
-            screenDc = Win32Interop.GetDC(IntPtr.Zero);
-            memDc = Win32Interop.CreateCompatibleDC(screenDc);
-            hBitmap = bmp.GetHbitmap(Color.FromArgb(0));
-            oldBitmap = Win32Interop.SelectObject(memDc, hBitmap);
-        }
-        finally
-        {
-            if (oldBitmap != IntPtr.Zero) Win32Interop.SelectObject(memDc, oldBitmap);
-            if (hBitmap != IntPtr.Zero) Win32Interop.DeleteObject(hBitmap);
-            if (memDc != IntPtr.Zero) Win32Interop.DeleteDC(memDc);
-            if (screenDc != IntPtr.Zero) Win32Interop.ReleaseDC(IntPtr.Zero, screenDc);
-        }
     }
 
     private static int GetFreeTcpPort()

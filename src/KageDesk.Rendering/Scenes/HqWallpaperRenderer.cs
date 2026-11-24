@@ -48,6 +48,9 @@ public sealed class HqWallpaperRenderer
     private float _lastTime = -1f;
     private float _emitAccum;
     private int _lastCloneCount;
+    private string? _cachedPrimaryBranch;
+    private string? _cachedPrimaryWorkflow;
+    private string? _cachedBranchText;
 
     public void ResetEffects()
     {
@@ -764,7 +767,21 @@ public sealed class HqWallpaperRenderer
 
         // Active repo & branch
         string repo = primary?.Repo ?? FindFirstAgentRepo(state) ?? "KAGEDESK";
-        string branch = primary != null ? $"{primary.Branch} · {primary.WorkflowName}" : "STANDBY · READY";
+        string branch;
+        if (primary != null)
+        {
+            if (_cachedBranchText == null || _cachedPrimaryBranch != primary.Branch || _cachedPrimaryWorkflow != primary.WorkflowName)
+            {
+                _cachedPrimaryBranch = primary.Branch;
+                _cachedPrimaryWorkflow = primary.WorkflowName;
+                _cachedBranchText = $"{primary.Branch} \u2022 {primary.WorkflowName}";
+            }
+            branch = _cachedBranchText;
+        }
+        else
+        {
+            branch = "STANDBY \u2022 READY";
+        }
         PixelFont.DrawTextTruncated(buf, bx + 4, by + 32, bw - 8, repo, _palette.Text, PixelFontSize.Small);
         PixelFont.DrawTextTruncated(buf, bx + 4, by + 41, bw - 8, branch, ColorSlate, PixelFontSize.Small);
     }

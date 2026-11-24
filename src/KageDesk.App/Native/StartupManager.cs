@@ -31,12 +31,13 @@ public static class StartupManager
             if (enable)
             {
                 string path = exePath ?? Process.GetCurrentProcess().MainModule?.FileName ?? string.Empty;
-                if (!string.IsNullOrEmpty(path))
+                if (string.IsNullOrWhiteSpace(path) || !path.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) || !File.Exists(path))
                 {
-                    key.SetValue(AppName, $"\"{path}\"");
-                    return true;
+                    return false;
                 }
-                return false;
+
+                key.SetValue(AppName, $"\"{path}\"");
+                return true;
             }
             else
             {

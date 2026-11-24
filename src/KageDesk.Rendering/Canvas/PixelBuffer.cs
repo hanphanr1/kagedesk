@@ -36,7 +36,18 @@ public sealed class PixelBuffer : IDisposable
         Height = height;
         _pixels = new int[width * height];
         _handle = GCHandle.Alloc(_pixels, GCHandleType.Pinned);
-        _bitmap = new Bitmap(width, height, width * 4, PixelFormat.Format32bppPArgb, _handle.AddrOfPinnedObject());
+        try
+        {
+            _bitmap = new Bitmap(width, height, width * 4, PixelFormat.Format32bppPArgb, _handle.AddrOfPinnedObject());
+        }
+        catch
+        {
+            if (_handle.IsAllocated)
+            {
+                _handle.Free();
+            }
+            throw;
+        }
     }
 
     public void Clear(int argb)

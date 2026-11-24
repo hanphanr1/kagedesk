@@ -9,6 +9,8 @@ public class AgentDetailToast : Form
     private readonly System.Windows.Forms.Timer _dismissTimer;
     private readonly AgentSnapshot _agent;
 
+    protected override bool ShowWithoutActivation => true;
+
     public AgentDetailToast(AgentSnapshot agent)
     {
         _agent = agent ?? throw new ArgumentNullException(nameof(agent));
@@ -25,7 +27,6 @@ public class AgentDetailToast : Form
             Interval = 4000
         };
         _dismissTimer.Tick += (_, _) => Close();
-        _dismissTimer.Start();
 
         // Position above taskbar near center-right
         Rectangle workArea = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1920, 1040);
@@ -34,6 +35,11 @@ public class AgentDetailToast : Form
             Math.Max(workArea.Top + 20, workArea.Bottom - Height - 140));
 
         Click += (_, _) => Close();
+    }
+
+    public void StartDismissTimer()
+    {
+        _dismissTimer.Start();
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -68,7 +74,7 @@ public class AgentDetailToast : Form
         // Close mark [x]
         using var closeFont = new Font("Segoe UI", 8f, FontStyle.Bold);
         using var closeBrush = new SolidBrush(Color.FromArgb(156, 163, 175));
-        g.DrawString("×", closeFont, closeBrush, Width - 16, 4);
+        g.DrawString("\u00D7", closeFont, closeBrush, Width - 16, 4);
 
         // Body info
         using var bodyFont = new Font("Segoe UI", 8.5f, FontStyle.Regular);
@@ -99,14 +105,16 @@ public class AgentDetailToast : Form
 
     public static void ShowToast(AgentSnapshot agent)
     {
+        AgentDetailToast? toast = null;
         try
         {
-            var toast = new AgentDetailToast(agent);
+            toast = new AgentDetailToast(agent);
             toast.Show();
+            toast.StartDismissTimer();
         }
         catch
         {
-            // Ignore UI errors
+            toast?.Dispose();
         }
     }
 

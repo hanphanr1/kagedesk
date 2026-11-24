@@ -241,8 +241,15 @@ public sealed class TaskbarPetRenderer
         buf.FillRect(cardX + cardW - 1, cardY + 35, 3, 3, ColorCrimsonCardBg);
 
         string shortName = ShortenName(agent.Name);
-        PixelFont.DrawTextTruncated(buf, cardX + 8, cardY + 7, cardW - 16, $"FAIL · {shortName}", ColorCrimson, PixelFontSize.Regular);
-        PixelFont.DrawTextTruncated(buf, cardX + 8, cardY + 20, cardW - 16, "FAIL · CLICK DETAILS", ColorUtil.FromRgb(254, 202, 202), PixelFontSize.Small);
+        int written = 0;
+        "FAIL \u2022 ".AsSpan().CopyTo(_textScratch.AsSpan());
+        written += 7;
+        ReadOnlySpan<char> snSpan = shortName.AsSpan();
+        int toCopy = Math.Min(snSpan.Length, _textScratch.Length - written);
+        snSpan.Slice(0, toCopy).CopyTo(_textScratch.AsSpan(written));
+        written += toCopy;
+        PixelFont.DrawTextTruncated(buf, cardX + 8, cardY + 7, cardW - 16, _textScratch.AsSpan(0, written), ColorCrimson, PixelFontSize.Regular);
+        PixelFont.DrawTextTruncated(buf, cardX + 8, cardY + 20, cardW - 16, "FAIL \u2022 CLICK DETAILS", ColorUtil.FromRgb(254, 202, 202), PixelFontSize.Small);
 
         // Buttons
         const int btnY = cardY + 32;
@@ -317,7 +324,21 @@ public sealed class TaskbarPetRenderer
             AgentSnapshot a = _workingScratch[0];
             string shortName = ShortenName(a.Name);
             string tool = NormalizeShortTool(a.ToolName);
-            pillText = $"{shortName} · {tool}".AsSpan();
+            int written = 0;
+            ReadOnlySpan<char> sn = shortName.AsSpan();
+            int c1 = Math.Min(sn.Length, _textScratch.Length);
+            sn.Slice(0, c1).CopyTo(_textScratch.AsSpan());
+            written += c1;
+            if (written + 3 <= _textScratch.Length)
+            {
+                " \u2022 ".AsSpan().CopyTo(_textScratch.AsSpan(written));
+                written += 3;
+            }
+            ReadOnlySpan<char> t = tool.AsSpan();
+            int c2 = Math.Min(t.Length, _textScratch.Length - written);
+            t.Slice(0, c2).CopyTo(_textScratch.AsSpan(written));
+            written += c2;
+            pillText = _textScratch.AsSpan(0, written);
         }
         else
         {

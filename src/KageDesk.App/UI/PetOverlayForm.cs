@@ -13,10 +13,11 @@ public class PetOverlayForm : Form
     private readonly System.Windows.Forms.Timer _renderTimer;
     private readonly Stopwatch _stopwatch;
 
-    private PixelBuffer _petBuffer;
-    private PixelBuffer _scaledBuffer;
+    private readonly PixelBuffer _petBuffer;
+    private readonly LayeredDibSurface _dibSurface;
 
     private HqState _currentState;
+    private HqState _cachedRenderState;
     private ThemePack _currentTheme;
     private int _scale = 2;
     private string _idleMode = "chill"; // "chill" | "auto-hide" | "off"
@@ -37,6 +38,8 @@ public class PetOverlayForm : Form
     public event Action<AgentSnapshot>? AgentClicked;
     public ContextMenuStrip? StudioContextMenu { get; set; }
 
+    protected override bool ShowWithoutActivation => true;
+
     public bool IsPaused
     {
         get => _isPaused;
@@ -44,14 +47,7 @@ public class PetOverlayForm : Form
         {
             if (_isPaused == value) return;
             _isPaused = value;
-            if (_isPaused)
-            {
-                _renderTimer.Stop();
-            }
-            else if (!_disposed && _idleMode != "off")
-            {
-                _renderTimer.Start();
-            }
+            ApplyEffectiveVisibility();
         }
     }
 
@@ -70,16 +66,17 @@ public class PetOverlayForm : Form
             Mood: HqMood.Calm,
             PendingVisualEvents: Array.Empty<HqEvent>(),
             Timestamp: DateTimeOffset.UtcNow);
+        _cachedRenderState = _currentState;
 
         _petBuffer = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
-        _scaledBuffer = new PixelBuffer(TaskbarPetRenderer.CanvasWidth * _scale, TaskbarPetRenderer.CanvasHeight * _scale);
+        _dibSurface = new LayeredDibSurface(TaskbarPetRenderer.CanvasWidth * _scale, TaskbarPetRenderer.CanvasHeight * _scale);
         _renderer = new TaskbarPetRenderer();
         _stopwatch = Stopwatch.StartNew();
 
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
-        DoubleBuffered = false; // Layered windows handle own painting via UpdateLayeredWindow
+        DoubleBuffered = false; // Layered windows handle painting via UpdateLayeredWindow
 
         int fps = Math.Clamp(targetFps, 5, 30);
         _renderTimer = new System.Windows.Forms.Timer
@@ -107,11 +104,7 @@ public class PetOverlayForm : Form
     public void Start()
     {
         UpdateWindowBounds();
-        Show();
-        if (_idleMode != "off" && !_isPaused)
-        {
-            _renderTimer.Start();
-        }
+        ApplyEffectiveVisibility();
     }
 
     public void SetScale(int scale)
@@ -120,29 +113,19 @@ public class PetOverlayForm : Form
         if (_scale == newScale) return;
 
         _scale = newScale;
-        _scaledBuffer.Dispose();
-        _scaledBuffer = new PixelBuffer(TaskbarPetRenderer.CanvasWidth * _scale, TaskbarPetRenderer.CanvasHeight * _scale);
+        _dibSurface.Resize(TaskbarPetRenderer.CanvasWidth * _scale, TaskbarPetRenderer.CanvasHeight * _scale);
 
         UpdateWindowBounds();
-        RenderAndPresent();
+        if (Visible && !_isPaused)
+        {
+            RenderAndPresent();
+        }
     }
 
     public void SetIdleMode(string idleMode)
     {
         _idleMode = idleMode;
-        if (_idleMode == "off")
-        {
-            _renderTimer.Stop();
-            Hide();
-        }
-        else
-        {
-            if (!_isPaused)
-            {
-                _renderTimer.Start();
-                Show();
-            }
-        }
+        ApplyEffectiveVisibility();
     }
 
     public void SetPetX(int? x)
@@ -155,59 +138,13 @@ public class PetOverlayForm : Form
     {
         _currentState = state ?? _currentState;
         _currentTheme = theme ?? _currentTheme;
+        RecomputeCachedRenderState();
+        ApplyEffectiveVisibility();
     }
 
-    private void UpdateWindowBounds()
+    private void RecomputeCachedRenderState()
     {
-        int w = TaskbarPetRenderer.CanvasWidth * _scale;
-        int h = TaskbarPetRenderer.CanvasHeight * _scale;
-        Rectangle workArea = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1920, 1040);
-
-        int top = workArea.Bottom - h;
-        int maxLeft = Math.Max(workArea.Left, workArea.Right - w);
-        int left = _petX ?? (workArea.Right - w - 16);
-        left = Math.Clamp(left, workArea.Left, maxLeft);
-
-        SetBounds(left, top, w, h);
-    }
-
-    private void OnRenderTick(object? sender, EventArgs e)
-    {
-        if (_disposed || _isPaused) return;
-
-        if (_idleMode == "off")
-        {
-            if (Visible) Hide();
-            return;
-        }
-
-        // Check if all agents are idle
-        bool hasActiveAgent = false;
-        var agents = _currentState.Agents;
-        for (int i = 0; i < agents.Count; i++)
-        {
-            if (agents[i].State != AgentState.Idle)
-            {
-                hasActiveAgent = true;
-                break;
-            }
-        }
-
-        if (_idleMode == "auto-hide" && !hasActiveAgent)
-        {
-            if (Visible) Hide();
-            return;
-        }
-
-        if (!Visible) Show();
-        RenderAndPresent();
-    }
-
-    public void RenderAndPresent()
-    {
-        if (_disposed) return;
-
-        // Reset dismissed agent if state changed
+        // Check if dismissed agent is still in that dismissed state
         if (_dismissedAgentId != null)
         {
             bool stillDismissed = false;
@@ -226,87 +163,133 @@ public class PetOverlayForm : Form
             }
         }
 
-        HqState stateToRender = _currentState;
-        if (_dismissedAgentId != null)
+        if (_dismissedAgentId == null)
         {
-            var filtered = new List<AgentSnapshot>(_currentState.Agents.Count);
-            foreach (var ag in _currentState.Agents)
+            _cachedRenderState = _currentState;
+            return;
+        }
+
+        // Cache filtered agent state
+        var filtered = new List<AgentSnapshot>(_currentState.Agents.Count);
+        foreach (var ag in _currentState.Agents)
+        {
+            if (ag.Id == _dismissedAgentId)
             {
-                if (ag.Id == _dismissedAgentId)
+                filtered.Add(ag with { State = AgentState.Idle, QuestionPrompt = null });
+            }
+            else
+            {
+                filtered.Add(ag);
+            }
+        }
+        _cachedRenderState = _currentState with { Agents = filtered };
+    }
+
+    public void ApplyEffectiveVisibility()
+    {
+        if (_disposed) return;
+
+        if (_isPaused || _idleMode == "off")
+        {
+            _renderTimer.Stop();
+            if (Visible) Hide();
+            return;
+        }
+
+        if (_idleMode == "auto-hide")
+        {
+            bool hasActiveAgent = false;
+            var agents = _currentState.Agents;
+            for (int i = 0; i < agents.Count; i++)
+            {
+                if (agents[i].State != AgentState.Idle)
                 {
-                    // Downgrade to Idle for rendering only
-                    filtered.Add(ag with { State = AgentState.Idle, QuestionPrompt = null });
-                }
-                else
-                {
-                    filtered.Add(ag);
+                    hasActiveAgent = true;
+                    break;
                 }
             }
-            stateToRender = _currentState with { Agents = filtered };
+
+            if (!hasActiveAgent)
+            {
+                _renderTimer.Stop();
+                if (Visible) Hide();
+                return;
+            }
         }
+
+        if (!Visible)
+        {
+            Show();
+        }
+        if (!_renderTimer.Enabled)
+        {
+            _renderTimer.Start();
+        }
+        RenderAndPresent();
+    }
+
+    private void UpdateWindowBounds()
+    {
+        int w = TaskbarPetRenderer.CanvasWidth * _scale;
+        int h = TaskbarPetRenderer.CanvasHeight * _scale;
+        Rectangle workArea = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1920, 1040);
+
+        int top = workArea.Bottom - h;
+        int maxLeft = Math.Max(workArea.Left, workArea.Right - w);
+        int left = _petX ?? (workArea.Right - w - 16);
+        left = Math.Clamp(left, workArea.Left, maxLeft);
+
+        SetBounds(left, top, w, h);
+    }
+
+    private void OnRenderTick(object? sender, EventArgs e)
+    {
+        if (_disposed || _isPaused || _idleMode == "off") return;
+
+        if (_idleMode == "auto-hide")
+        {
+            bool hasActiveAgent = false;
+            var agents = _currentState.Agents;
+            for (int i = 0; i < agents.Count; i++)
+            {
+                if (agents[i].State != AgentState.Idle)
+                {
+                    hasActiveAgent = true;
+                    break;
+                }
+            }
+
+            if (!hasActiveAgent)
+            {
+                _renderTimer.Stop();
+                if (Visible) Hide();
+                return;
+            }
+        }
+
+        if (!Visible) Show();
+        RenderAndPresent();
+    }
+
+    public void RenderAndPresent()
+    {
+        if (_disposed || !IsHandleCreated) return;
 
         float timeSeconds = (float)_stopwatch.Elapsed.TotalSeconds;
         bool showIdle = _idleMode != "off";
 
-        _renderer.Render(_petBuffer, stateToRender, _currentTheme, timeSeconds, showIdle);
+        _renderer.Render(_petBuffer, _cachedRenderState, _currentTheme, timeSeconds, showIdle);
 
         if (_scale == 1)
         {
-            PresentLayeredBitmap(_petBuffer.Bitmap);
+            _dibSurface.CopyFrom(_petBuffer);
         }
         else
         {
-            _petBuffer.BlitNearestNeighborTo(_scaledBuffer, _scale);
-            PresentLayeredBitmap(_scaledBuffer.Bitmap);
+            _dibSurface.BlitNearestNeighborFrom(_petBuffer, _scale);
         }
-    }
 
-    public void PresentLayeredBitmap(Bitmap bmp)
-    {
-        if (_disposed || !IsHandleCreated) return;
-
-        IntPtr screenDc = IntPtr.Zero;
-        IntPtr memDc = IntPtr.Zero;
-        IntPtr hBitmap = IntPtr.Zero;
-        IntPtr oldBitmap = IntPtr.Zero;
-
-        try
-        {
-            screenDc = Win32Interop.GetDC(IntPtr.Zero);
-            memDc = Win32Interop.CreateCompatibleDC(screenDc);
-            hBitmap = bmp.GetHbitmap(Color.FromArgb(0));
-            oldBitmap = Win32Interop.SelectObject(memDc, hBitmap);
-
-            var blend = new Win32Interop.BLENDFUNCTION
-            {
-                BlendOp = Win32Interop.AC_SRC_OVER,
-                BlendFlags = 0,
-                SourceConstantAlpha = 255,
-                AlphaFormat = Win32Interop.AC_SRC_ALPHA
-            };
-
-            var ptSrc = new Win32Interop.POINT(0, 0);
-            var ptDst = new Win32Interop.POINT(Left, Top);
-            var szDst = new Win32Interop.SIZE(bmp.Width, bmp.Height);
-
-            Win32Interop.UpdateLayeredWindow(
-                Handle,
-                screenDc,
-                ref ptDst,
-                ref szDst,
-                memDc,
-                ref ptSrc,
-                0,
-                ref blend,
-                Win32Interop.ULW_ALPHA);
-        }
-        finally
-        {
-            if (oldBitmap != IntPtr.Zero) Win32Interop.SelectObject(memDc, oldBitmap);
-            if (hBitmap != IntPtr.Zero) Win32Interop.DeleteObject(hBitmap);
-            if (memDc != IntPtr.Zero) Win32Interop.DeleteDC(memDc);
-            if (screenDc != IntPtr.Zero) Win32Interop.ReleaseDC(IntPtr.Zero, screenDc);
-        }
+        _dibSurface.UpdateLayeredWindow(Handle, Left, Top);
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
@@ -371,8 +354,7 @@ public class PetOverlayForm : Form
             if (newLeft != Left)
             {
                 Left = newLeft;
-                // Move layered window
-                PresentLayeredBitmap(_scale == 1 ? _petBuffer.Bitmap : _scaledBuffer.Bitmap);
+                _dibSurface.UpdateLayeredWindow(Handle, Left, Top);
             }
         }
         else
@@ -417,6 +399,7 @@ public class PetOverlayForm : Form
             {
                 _dismissedAgentId = ag.Id;
                 _dismissedAgentState = ag.State;
+                RecomputeCachedRenderState();
                 RenderAndPresent();
                 break;
             }
@@ -433,7 +416,7 @@ public class PetOverlayForm : Form
             _renderTimer.Stop();
             _renderTimer.Dispose();
             _petBuffer.Dispose();
-            _scaledBuffer.Dispose();
+            _dibSurface.Dispose();
         }
 
         base.Dispose(disposing);

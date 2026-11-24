@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Text;
 
 namespace KageDesk.App.Native;
 
@@ -30,18 +29,26 @@ public static class WindowFocuser
 
             if (fgThread != curThread && fgThread != 0)
             {
-                Win32Interop.AttachThreadInput(curThread, fgThread, true);
-                Win32Interop.BringWindowToTop(targetHwnd);
-                Win32Interop.SetForegroundWindow(targetHwnd);
-                Win32Interop.AttachThreadInput(curThread, fgThread, false);
+                bool attached = false;
+                try
+                {
+                    attached = Win32Interop.AttachThreadInput(curThread, fgThread, true);
+                    Win32Interop.BringWindowToTop(targetHwnd);
+                    return Win32Interop.SetForegroundWindow(targetHwnd);
+                }
+                finally
+                {
+                    if (attached)
+                    {
+                        Win32Interop.AttachThreadInput(curThread, fgThread, false);
+                    }
+                }
             }
             else
             {
                 Win32Interop.BringWindowToTop(targetHwnd);
-                Win32Interop.SetForegroundWindow(targetHwnd);
+                return Win32Interop.SetForegroundWindow(targetHwnd);
             }
-
-            return true;
         }
         catch
         {
@@ -52,43 +59,55 @@ public static class WindowFocuser
     private static IntPtr FindOrcaWindow()
     {
         // 1. Check current processes named orca
-        var processes = Process.GetProcessesByName("orca");
-        foreach (var p in processes)
+        Process[] processes = Process.GetProcessesByName("orca");
+        try
         {
-            try
+            foreach (var p in processes)
             {
-                if (p.MainWindowHandle != IntPtr.Zero)
+                try
                 {
-                    return p.MainWindowHandle;
+                    if (p.MainWindowHandle != IntPtr.Zero && Win32Interop.IsWindow(p.MainWindowHandle))
+                    {
+                        return p.MainWindowHandle;
+                    }
+                }
+                catch
+                {
+                    // Ignore process access issues
                 }
             }
-            catch
-            {
-                // Ignore process access issues
-            }
-            finally
+        }
+        finally
+        {
+            foreach (var p in processes)
             {
                 p.Dispose();
             }
         }
 
-        // 2. Iterate top-level windows for titles matching "Orca"
+        // 2. Iterate top-level windows; verify window belongs to an "orca" process via PID
         IntPtr foundHwnd = IntPtr.Zero;
-        var sb = new StringBuilder(512);
-
         Win32Interop.EnumWindows((hwnd, _) =>
         {
-            sb.Clear();
-            int len = Win32Interop.GetWindowText(hwnd, sb, sb.Capacity);
-            if (len > 0)
+            if (hwnd == IntPtr.Zero || !Win32Interop.IsWindowVisible(hwnd)) return true;
+
+            Win32Interop.GetWindowThreadProcessId(hwnd, out uint pid);
+            if (pid == 0) return true;
+
+            try
             {
-                string title = sb.ToString();
-                if (title.Contains("Orca", StringComparison.OrdinalIgnoreCase))
+                using var proc = Process.GetProcessById((int)pid);
+                if (string.Equals(proc.ProcessName, "orca", StringComparison.OrdinalIgnoreCase))
                 {
                     foundHwnd = hwnd;
                     return false;
                 }
             }
+            catch
+            {
+                // Access denied or process exited
+            }
+
             return true;
         }, IntPtr.Zero);
 

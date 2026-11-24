@@ -9,6 +9,8 @@ namespace KageDesk.App.UI;
 
 public class WallpaperHostForm : Form
 {
+    private static readonly uint WmTaskbarCreated = Win32Interop.RegisterWindowMessage("TaskbarCreated");
+
     private readonly PixelBuffer _buffer;
     private readonly HqWallpaperRenderer _renderer;
     private readonly System.Windows.Forms.Timer _renderTimer;
@@ -16,8 +18,22 @@ public class WallpaperHostForm : Form
 
     private HqState _currentState;
     private ThemePack _currentTheme;
+    private bool _isAttached;
     private bool _isPaused;
     private bool _disposed;
+
+    public bool IsAttached
+    {
+        get => _isAttached;
+        set
+        {
+            _isAttached = value;
+            if (_isAttached && !_isPaused && !_disposed)
+            {
+                _renderTimer.Start();
+            }
+        }
+    }
 
     public bool IsPaused
     {
@@ -30,12 +46,16 @@ public class WallpaperHostForm : Form
             {
                 _renderTimer.Stop();
             }
-            else if (Visible && !_disposed)
+            else if ((Visible || _isAttached) && !_disposed)
             {
                 _renderTimer.Start();
             }
         }
     }
+
+    public event Action? TaskbarRecreated;
+
+    protected override bool ShowWithoutActivation => true;
 
     public WallpaperHostForm(ThemePack initialTheme, int targetFps = 15)
     {
@@ -97,7 +117,7 @@ public class WallpaperHostForm : Form
 
     private void OnRenderTick(object? sender, EventArgs e)
     {
-        if (_isPaused || _disposed || !Visible) return;
+        if (_isPaused || _disposed || (!Visible && !_isAttached)) return;
 
         float timeSeconds = (float)_stopwatch.Elapsed.TotalSeconds;
         _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds);
@@ -118,6 +138,15 @@ public class WallpaperHostForm : Form
             HqWallpaperRenderer.CanvasWidth,
             HqWallpaperRenderer.CanvasHeight,
             GraphicsUnit.Pixel);
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == (int)WmTaskbarCreated && WmTaskbarCreated != 0)
+        {
+            TaskbarRecreated?.Invoke();
+        }
+        base.WndProc(ref m);
     }
 
     protected override void Dispose(bool disposing)

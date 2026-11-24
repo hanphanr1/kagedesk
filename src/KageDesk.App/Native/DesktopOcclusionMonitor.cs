@@ -1,15 +1,30 @@
 using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Win32;
 
 namespace KageDesk.App.Native;
 
+public record WindowSnapshot(
+    IntPtr Hwnd,
+    uint ProcessId,
+    string ClassName,
+    bool IsVisible,
+    bool IsIconic,
+    bool IsCloaked,
+    int ExStyle,
+    Rectangle Bounds
+);
+
 public class DesktopOcclusionMonitor : IDisposable
 {
     private readonly System.Windows.Forms.Timer _timer;
+    private readonly uint _ownPid;
     private bool _isWallpaperOccluded;
     private bool _isFullscreenGame;
     private bool _isSessionLocked;
     private bool _disposed;
+    private bool _systemEventsSubscribed;
 
     public bool IsWallpaperOccluded => _isWallpaperOccluded;
     public bool IsFullscreenGame => _isFullscreenGame;
@@ -19,15 +34,21 @@ public class DesktopOcclusionMonitor : IDisposable
 
     public DesktopOcclusionMonitor(int intervalMs = 500)
     {
+        _ownPid = (uint)Environment.ProcessId;
         _timer = new System.Windows.Forms.Timer
         {
             Interval = Math.Max(200, intervalMs)
         };
         _timer.Tick += OnTimerTick;
+    }
 
+    public void SubscribeSessionSwitch()
+    {
+        if (_systemEventsSubscribed) return;
         try
         {
             SystemEvents.SessionSwitch += OnSessionSwitch;
+            _systemEventsSubscribed = true;
         }
         catch
         {
@@ -58,26 +79,24 @@ public class DesktopOcclusionMonitor : IDisposable
 
         try
         {
-            // 1. Check fullscreen / DND state
-            int hr = Win32Interop.SHQueryUserNotificationState(out var state);
-            if (hr == 0)
-            {
-                gameDnd = IsGameOrPresentationState(state);
-            }
+            Screen primaryScreen = Screen.PrimaryScreen ?? Screen.AllScreens[0];
+            Rectangle workArea = primaryScreen.WorkingArea;
+            Rectangle fullBounds = primaryScreen.Bounds;
 
-            // 2. Check foreground window covering desktop
-            IntPtr fgHwnd = Win32Interop.GetForegroundWindow();
-            if (fgHwnd != IntPtr.Zero)
+            // 1. Query User Notification State
+            var quns = Win32Interop.QUERY_USER_NOTIFICATION_STATE.QUNS_ACCEPTS_NOTIFICATIONS;
+            int hr = Win32Interop.SHQueryUserNotificationState(out quns);
+
+            // 2. Collect top-level windows
+            var windows = CaptureTopLevelWindows();
+
+            // 3. Compute wallpaper occlusion against primary working area
+            occluded = IsOccludedByWindows(windows, workArea, _ownPid);
+
+            // 4. Compute game DND (notification state AND fullscreen coverage of monitor bounds)
+            if (hr == 0 && IsGameOrPresentationState(quns))
             {
-                Rectangle screen = Screen.PrimaryScreen?.Bounds ?? new Rectangle(0, 0, 1920, 1080);
-                if (Win32Interop.IsZoomed(fgHwnd))
-                {
-                    occluded = true;
-                }
-                else if (Win32Interop.GetWindowRect(fgHwnd, out var rect))
-                {
-                    occluded = IsCoveringScreen(rect, screen);
-                }
+                gameDnd = IsFullscreenGameActive(quns, windows, fullBounds, _ownPid);
             }
         }
         catch
@@ -95,21 +114,126 @@ public class DesktopOcclusionMonitor : IDisposable
         }
     }
 
+    public static List<WindowSnapshot> CaptureTopLevelWindows()
+    {
+        var list = new List<WindowSnapshot>(64);
+        var sbClass = new StringBuilder(256);
+
+        Win32Interop.EnumWindows((hwnd, _) =>
+        {
+            if (hwnd == IntPtr.Zero) return true;
+
+            Win32Interop.GetWindowThreadProcessId(hwnd, out uint pid);
+            bool isVisible = Win32Interop.IsWindowVisible(hwnd);
+            bool isIconic = Win32Interop.IsIconic(hwnd);
+
+            sbClass.Clear();
+            Win32Interop.GetClassName(hwnd, sbClass, sbClass.Capacity);
+            string className = sbClass.ToString();
+
+            int exStyle = Win32Interop.GetWindowLongPtr(hwnd, Win32Interop.GWL_EXSTYLE).ToInt32();
+
+            bool isCloaked = false;
+            int hr = Win32Interop.DwmGetWindowAttribute(hwnd, Win32Interop.DWMWA_CLOAKED, out int cloakedVal, sizeof(int));
+            if (hr == 0 && cloakedVal != 0)
+            {
+                isCloaked = true;
+            }
+
+            Rectangle bounds = Rectangle.Empty;
+            if (Win32Interop.DwmGetWindowAttribute(hwnd, Win32Interop.DWMWA_EXTENDED_FRAME_BOUNDS, out Win32Interop.RECT frameRect, Marshal.SizeOf<Win32Interop.RECT>()) == 0)
+            {
+                bounds = new Rectangle(frameRect.Left, frameRect.Top, frameRect.Width, frameRect.Height);
+            }
+            else if (Win32Interop.GetWindowRect(hwnd, out Win32Interop.RECT winRect))
+            {
+                bounds = new Rectangle(winRect.Left, winRect.Top, winRect.Width, winRect.Height);
+            }
+
+            list.Add(new WindowSnapshot(
+                Hwnd: hwnd,
+                ProcessId: pid,
+                ClassName: className,
+                IsVisible: isVisible,
+                IsIconic: isIconic,
+                IsCloaked: isCloaked,
+                ExStyle: exStyle,
+                Bounds: bounds
+            ));
+
+            return true;
+        }, IntPtr.Zero);
+
+        return list;
+    }
+
+    public static bool ShouldFilterWindow(WindowSnapshot window, uint ownPid)
+    {
+        if (window.ProcessId == ownPid && ownPid != 0) return true;
+        if (!window.IsVisible || window.IsIconic || window.IsCloaked) return true;
+        if ((window.ExStyle & Win32Interop.WS_EX_TOOLWINDOW) != 0) return true;
+        if (window.Bounds.Width <= 10 || window.Bounds.Height <= 10) return true;
+
+        string cls = window.ClassName;
+        if (cls is "Progman" or "WorkerW" or "Shell_TrayWnd" or "Shell_SecondaryTrayWnd" or "NotifyIconOverflowWindow")
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    public static bool IsWindowCoveringArea(Rectangle windowBounds, Rectangle targetArea, int marginTolerance = 4)
+    {
+        if (targetArea.Width <= 0 || targetArea.Height <= 0) return false;
+        return windowBounds.Left <= targetArea.Left + marginTolerance
+            && windowBounds.Top <= targetArea.Top + marginTolerance
+            && windowBounds.Right >= targetArea.Right - marginTolerance
+            && windowBounds.Bottom >= targetArea.Bottom - marginTolerance;
+    }
+
+    public static bool IsCoveringScreen(Win32Interop.RECT rect, Rectangle screen)
+    {
+        return IsWindowCoveringArea(new Rectangle(rect.Left, rect.Top, rect.Width, rect.Height), screen, marginTolerance: 4);
+    }
+
+    public static bool IsOccludedByWindows(IEnumerable<WindowSnapshot> windows, Rectangle wallpaperWorkingArea, uint ownPid)
+    {
+        foreach (var win in windows)
+        {
+            if (ShouldFilterWindow(win, ownPid)) continue;
+            if (IsWindowCoveringArea(win.Bounds, wallpaperWorkingArea, marginTolerance: 4))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public static bool IsFullscreenGameActive(
+        Win32Interop.QUERY_USER_NOTIFICATION_STATE state,
+        IEnumerable<WindowSnapshot> windows,
+        Rectangle monitorBounds,
+        uint ownPid)
+    {
+        if (!IsGameOrPresentationState(state)) return false;
+
+        foreach (var win in windows)
+        {
+            if (ShouldFilterWindow(win, ownPid)) continue;
+            if (IsWindowCoveringArea(win.Bounds, monitorBounds, marginTolerance: 4))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public static bool IsGameOrPresentationState(Win32Interop.QUERY_USER_NOTIFICATION_STATE state)
     {
         return state is Win32Interop.QUERY_USER_NOTIFICATION_STATE.QUNS_RUNNING_D_3D_FULL_SCREEN
             or Win32Interop.QUERY_USER_NOTIFICATION_STATE.QUNS_PRESENTATION_MODE
             or Win32Interop.QUERY_USER_NOTIFICATION_STATE.QUNS_BUSY;
-    }
-
-    public static bool IsCoveringScreen(Win32Interop.RECT rect, Rectangle screen)
-    {
-        if (screen.Width <= 0 || screen.Height <= 0) return false;
-        // Margin allowance of 4px for borders/shadows
-        return rect.Left <= screen.Left + 4
-            && rect.Top <= screen.Top + 4
-            && rect.Right >= screen.Right - 4
-            && rect.Bottom >= screen.Bottom - 4;
     }
 
     private void OnSessionSwitch(object sender, SessionSwitchEventArgs e)
@@ -134,13 +258,17 @@ public class DesktopOcclusionMonitor : IDisposable
         _timer.Stop();
         _timer.Dispose();
 
-        try
+        if (_systemEventsSubscribed)
         {
-            SystemEvents.SessionSwitch -= OnSessionSwitch;
-        }
-        catch
-        {
-            // Ignore
+            try
+            {
+                SystemEvents.SessionSwitch -= OnSessionSwitch;
+                _systemEventsSubscribed = false;
+            }
+            catch
+            {
+                // Ignore
+            }
         }
     }
 }
