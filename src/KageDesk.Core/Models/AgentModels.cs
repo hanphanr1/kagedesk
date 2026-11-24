@@ -93,7 +93,8 @@ public record BuildInfo(
     string Status,
     string? Conclusion = null,
     string? Url = null,
-    DateTimeOffset? UpdatedAt = null
+    DateTimeOffset? UpdatedAt = null,
+    DateTimeOffset? CreatedAt = null
 )
 {
     public bool IsFailing =>

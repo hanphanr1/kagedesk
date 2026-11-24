@@ -26,11 +26,13 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
     private readonly ConcurrentDictionary<Task, byte> _activeRequests = new();
 
     private Task? _listenTask;
+    private volatile bool _stopping;
     private bool _disposed;
 
     public int Port { get; }
     public string BaseUrl => $"http://127.0.0.1:{Port}/";
     public bool IsRunning => _listener.IsListening;
+    public TimeSpan RequestReadTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -69,7 +71,7 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
 
     private async Task ListenLoopAsync()
     {
-        while (!_cts.IsCancellationRequested && _listener.IsListening)
+        while (!_cts.IsCancellationRequested && !_stopping && _listener.IsListening)
         {
             try
             {
@@ -78,14 +80,9 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
                 // Bounded concurrency check: max 16 concurrent requests
                 if (!_concurrencySemaphore.Wait(0))
                 {
-                    _ = Task.Run(async () =>
-                    {
-                        try
-                        {
-                            await WriteJsonAsync(context.Response, 503, new { ok = false, error = "Service Unavailable: concurrency limit reached" }).ConfigureAwait(false);
-                        }
-                        catch { }
-                    });
+                    var saturatedTask = RespondSaturated503Async(context);
+                    _activeRequests.TryAdd(saturatedTask, 0);
+                    _ = saturatedTask.ContinueWith(t => _activeRequests.TryRemove(t, out _));
                     continue;
                 }
 
@@ -93,7 +90,7 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
                 _activeRequests.TryAdd(requestTask, 0);
                 _ = requestTask.ContinueWith(t => _activeRequests.TryRemove(t, out _));
             }
-            catch (HttpListenerException) when (_cts.IsCancellationRequested || !_listener.IsListening)
+            catch (HttpListenerException) when (_cts.IsCancellationRequested || _stopping || !_listener.IsListening)
             {
                 break;
             }
@@ -106,6 +103,15 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
                 // Continue listening
             }
         }
+    }
+
+    private static async Task RespondSaturated503Async(HttpListenerContext context)
+    {
+        try
+        {
+            await WriteJsonAsync(context.Response, 503, new { ok = false, error = "Service Unavailable: concurrency limit reached" }).ConfigureAwait(false);
+        }
+        catch { }
     }
 
     private async Task ProcessTrackedRequestAsync(HttpListenerContext context)
@@ -180,30 +186,77 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
             return;
         }
 
-        // 2. GET /api/state (Omit raw free-text prompt/lastMessage)
+        // 2. GET /api/state (Allowlisted DTO: strictly omit Prompt, LastMessage, QuestionPrompt, and event Message)
         if (method == "GET" && string.Equals(path, "/api/state", StringComparison.OrdinalIgnoreCase))
         {
             var state = _aggregator.GetState();
 
-            // Sanitize sensitive fields (remove LastMessage from external HTTP response)
-            var sanitizedAgents = new List<AgentSnapshot>(state.Agents.Count);
+            var publicAgents = new List<PublicAgentDto>(state.Agents.Count);
             foreach (var a in state.Agents)
             {
-                sanitizedAgents.Add(a with
-                {
-                    LastMessage = null
-                });
+                publicAgents.Add(new PublicAgentDto(
+                    Id: a.Id,
+                    Name: a.Name,
+                    Role: a.Role,
+                    SpriteKey: a.SpriteKey,
+                    State: a.State,
+                    ToolName: a.ToolName,
+                    TaskTitle: a.TaskTitle,
+                    Repo: a.Repo,
+                    Branch: a.Branch,
+                    IsBotHome: a.IsBotHome,
+                    Unread: a.Unread,
+                    Source: a.Source,
+                    LastActivityAt: a.LastActivityAt,
+                    UpdatedAt: a.UpdatedAt
+                ));
             }
 
-            var safeState = state with { Agents = sanitizedAgents };
-            await WriteJsonAsync(response, 200, safeState).ConfigureAwait(false);
+            var publicEvents = new List<PublicVisualEventDto>(state.PendingVisualEvents.Count);
+            foreach (var e in state.PendingVisualEvents)
+            {
+                publicEvents.Add(new PublicVisualEventDto(
+                    SequenceId: e.SequenceId,
+                    Type: e.Type,
+                    AgentId: e.AgentId,
+                    Timestamp: e.Timestamp
+                ));
+            }
+
+            var publicBuilds = new List<PublicBuildDto>(state.Builds.Count);
+            foreach (var b in state.Builds)
+            {
+                publicBuilds.Add(new PublicBuildDto(
+                    Id: b.Id,
+                    Repo: b.Repo,
+                    WorkflowName: b.WorkflowName,
+                    Branch: b.Branch,
+                    Status: b.Status,
+                    Conclusion: b.Conclusion,
+                    CreatedAt: b.CreatedAt,
+                    UpdatedAt: b.UpdatedAt
+                ));
+            }
+
+            var publicState = new PublicHqStateDto(
+                Agents: publicAgents,
+                Accounts: state.Accounts,
+                Builds: publicBuilds,
+                Weather: state.Weather,
+                Mood: state.Mood,
+                PendingVisualEvents: publicEvents,
+                DemoScenario: state.DemoScenario,
+                Timestamp: state.Timestamp
+            );
+
+            await WriteJsonAsync(response, 200, publicState).ConfigureAwait(false);
             return;
         }
 
         // 3. POST /api/event
         if (method == "POST" && string.Equals(path, "/api/event", StringComparison.OrdinalIgnoreCase))
         {
-            var (body, isTooLarge) = await ReadBodySafeAsync(request).ConfigureAwait(false);
+            var (body, isTooLarge) = await ReadBodySafeAsync(context).ConfigureAwait(false);
             if (isTooLarge)
             {
                 await WriteJsonAsync(response, 413, new { ok = false, error = "Payload Too Large: max 32KB allowed" }).ConfigureAwait(false);
@@ -272,15 +325,20 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
         return CryptographicOperations.FixedTimeEquals(expectedBytes, actualBytes);
     }
 
-    private async Task<(string? Body, bool IsTooLarge)> ReadBodySafeAsync(HttpListenerRequest request)
+    private async Task<(string? Body, bool IsTooLarge)> ReadBodySafeAsync(HttpListenerContext context)
     {
+        var request = context.Request;
         if (request.ContentLength64 > MaxBodyBytes)
         {
             return (null, true);
         }
 
         using var readCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-        readCts.CancelAfter(TimeSpan.FromSeconds(5));
+        readCts.CancelAfter(RequestReadTimeout);
+        using var reg = readCts.Token.Register(() =>
+        {
+            try { context.Response.Abort(); } catch { }
+        });
 
         try
         {
@@ -306,6 +364,10 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
             return (encoding.GetString(ms.ToArray()), false);
         }
         catch (OperationCanceledException)
+        {
+            return (null, false);
+        }
+        catch (HttpListenerException)
         {
             return (null, false);
         }
@@ -337,42 +399,84 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
         {
             try
             {
-                await Task.WhenAny(Task.WhenAll(tasks), Task.Delay(timeout)).ConfigureAwait(false);
+                var whenAll = Task.WhenAll(tasks);
+                var delay = Task.Delay(timeout);
+                var finished = await Task.WhenAny(whenAll, delay).ConfigureAwait(false);
+                if (finished != whenAll)
+                {
+                    // If timeout elapsed, in-flight tasks continue to finish or cancel
+                }
             }
             catch { }
         }
     }
 
-    public void Dispose()
+    public async Task StopAsync(TimeSpan timeout = default)
     {
         if (_disposed) return;
-        _disposed = true;
-
+        _stopping = true;
         _cts.Cancel();
+
+        // 1. Stop listener first so no new connections admitted
         try
         {
             if (_listener.IsListening)
                 _listener.Stop();
-            _listener.Close();
         }
         catch { }
 
-        _cts.Dispose();
+        // 2. Wait for accept loop task to finish
+        if (_listenTask != null)
+        {
+            try { await _listenTask.ConfigureAwait(false); } catch { }
+        }
+
+        // 3. Snapshot and drain in-flight tasks with bounded timeout
+        TimeSpan drainTimeout = timeout > TimeSpan.Zero ? timeout : TimeSpan.FromSeconds(2);
+        await DrainActiveRequestsAsync(drainTimeout).ConfigureAwait(false);
+
+        // 4. Dispose concurrency gate only after all admitted handlers exited
+        try { _listener.Close(); } catch { }
         _concurrencySemaphore.Dispose();
+        _cts.Dispose();
+        _disposed = true;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _stopping = true;
+        _cts.Cancel();
+
+        try
+        {
+            if (_listener.IsListening)
+                _listener.Stop();
+        }
+        catch { }
+
+        if (_listenTask != null)
+        {
+            try { _listenTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
+        }
+
+        var tasks = _activeRequests.Keys.ToArray();
+        if (tasks.Length > 0)
+        {
+            try { Task.WaitAll(tasks, TimeSpan.FromSeconds(2)); } catch { }
+        }
+
+        try { _listener.Close(); } catch { }
+        _concurrencySemaphore.Dispose();
+        _cts.Dispose();
+        _disposed = true;
+        GC.SuppressFinalize(this);
     }
 
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;
-
-        // Drain in-flight requests with bounded timeout
-        await DrainActiveRequestsAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
-
-        Dispose();
-        if (_listenTask != null)
-        {
-            try { await _listenTask.ConfigureAwait(false); } catch { }
-        }
+        await StopAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
         GC.SuppressFinalize(this);
     }
 }

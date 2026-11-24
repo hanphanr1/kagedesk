@@ -33,7 +33,8 @@ public class HqStateAggregator
     private readonly Dictionary<string, AgentSnapshot> _orcaAgents = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, (AgentSnapshot Agent, DateTimeOffset ExpiresAt)> _pushedAgents = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, AgentSnapshot> _processAgents = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, AccountInfo> _accounts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, AccountInfo> _orcaAccounts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, (AccountInfo Account, DateTimeOffset ExpiresAt)> _pushedAccounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, (BuildInfo Build, DateTimeOffset ExpiresAt)> _pushedBuilds = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, BuildInfo> _collectorBuilds = new(StringComparer.OrdinalIgnoreCase);
 
@@ -142,35 +143,12 @@ public class HqStateAggregator
                 _departedDoneAgents.Remove(a.Id);
             }
 
-            // Prune deleted Orca accounts while preserving other providers
-            var orcaAccountKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            // Cleanly replace Orca accounts on snapshot poll
+            _orcaAccounts.Clear();
             foreach (var acc in accounts)
             {
                 var key = $"{acc.Provider}:{acc.AccountId}";
-                orcaAccountKeys.Add(key);
-                if (_accounts.TryGetValue(key, out var existing))
-                {
-                    _accounts[key] = acc with
-                    {
-                        QuotaPercent = existing.QuotaPercent ?? acc.QuotaPercent,
-                        QuotaResetAt = existing.QuotaResetAt ?? acc.QuotaResetAt
-                    };
-                }
-                else
-                {
-                    _accounts[key] = acc;
-                }
-            }
-
-            // Remove any Orca account that is no longer returned in the snapshot
-            var staleOrcaAccounts = _accounts
-                .Where(kv => string.Equals(kv.Value.Provider, "orca", StringComparison.OrdinalIgnoreCase) && !orcaAccountKeys.Contains(kv.Key))
-                .Select(kv => kv.Key)
-                .ToList();
-
-            foreach (var k in staleOrcaAccounts)
-            {
-                _accounts.Remove(k);
+                _orcaAccounts[key] = acc;
             }
 
             toEmit = RecalculateStateLocked();
@@ -188,14 +166,7 @@ public class HqStateAggregator
         lock (_lock)
         {
             _orcaAgents.Clear();
-            var orcaAccounts = _accounts
-                .Where(kv => string.Equals(kv.Value.Provider, "orca", StringComparison.OrdinalIgnoreCase))
-                .Select(kv => kv.Key)
-                .ToList();
-            foreach (var k in orcaAccounts)
-            {
-                _accounts.Remove(k);
-            }
+            _orcaAccounts.Clear();
             toEmit = RecalculateStateLocked();
         }
 
@@ -249,6 +220,35 @@ public class HqStateAggregator
             var updatedRepos = builds.Select(b => b.Repo).Distinct(StringComparer.OrdinalIgnoreCase).ToHashSet();
             var staleKeys = _collectorBuilds
                 .Where(kv => updatedRepos.Contains(kv.Value.Repo))
+                .Select(kv => kv.Key)
+                .ToList();
+
+            foreach (var k in staleKeys)
+            {
+                _collectorBuilds.Remove(k);
+            }
+
+            foreach (var b in builds)
+            {
+                _collectorBuilds[b.Id] = b;
+            }
+
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
+        }
+    }
+
+    public void UpdateCiBuildsForRepo(string repo, IReadOnlyList<BuildInfo> builds)
+    {
+        HqState? toEmit = null;
+        lock (_lock)
+        {
+            var staleKeys = _collectorBuilds
+                .Where(kv => string.Equals(kv.Value.Repo, repo, StringComparison.OrdinalIgnoreCase))
                 .Select(kv => kv.Key)
                 .ToList();
 
@@ -362,29 +362,34 @@ public class HqStateAggregator
             if (!string.IsNullOrEmpty(payload.AccountProvider))
             {
                 var accKey = $"{payload.AccountProvider}:{payload.AccountName ?? "default"}";
-                if (_accounts.TryGetValue(accKey, out var existingAcc))
+                double ttl = payload.TtlSeconds ?? 300.0;
+                var expiresAt = now.AddSeconds(ttl);
+
+                var accountInfo = new AccountInfo(
+                    Provider: payload.AccountProvider,
+                    AccountId: payload.AccountName ?? "default",
+                    Label: payload.AccountName ?? "Default",
+                    IsActive: true,
+                    QuotaPercent: payload.QuotaPercent
+                );
+
+                if (_pushedAccounts.TryGetValue(accKey, out var existingAcc))
                 {
-                    _accounts[accKey] = existingAcc with
+                    _pushedAccounts[accKey] = (existingAcc.Account with
                     {
-                        QuotaPercent = payload.QuotaPercent ?? existingAcc.QuotaPercent
-                    };
+                        QuotaPercent = payload.QuotaPercent ?? existingAcc.Account.QuotaPercent
+                    }, expiresAt);
                 }
                 else
                 {
-                    _accounts[accKey] = new AccountInfo(
-                        Provider: payload.AccountProvider,
-                        AccountId: payload.AccountName ?? "default",
-                        Label: payload.AccountName ?? "Default",
-                        IsActive: true,
-                        QuotaPercent: payload.QuotaPercent
-                    );
+                    _pushedAccounts[accKey] = (accountInfo, expiresAt);
                 }
 
-                // Cap accounts at MaxCappedItems
-                if (_accounts.Count > MaxCappedItems)
+                // Cap pushed accounts at MaxCappedItems
+                if (_pushedAccounts.Count > MaxCappedItems)
                 {
-                    var oldest = _accounts.Keys.First();
-                    _accounts.Remove(oldest);
+                    var oldest = _pushedAccounts.OrderBy(kv => kv.Value.ExpiresAt).First().Key;
+                    _pushedAccounts.Remove(oldest);
                 }
             }
 
@@ -551,14 +556,15 @@ public class HqStateAggregator
 
         DetectTransitions(finalAgents, buildsList, now);
 
-        // 6. Compute Effective Weather and HQ Mood
+        var mergedAccounts = GetMergedAccountsLocked(now);
+
         var weather = ComputeEffectiveWeather(_config.WeatherMode, buildsList, now);
         var mood = ComputeHqMood(finalAgents, buildsList, _visualEvents);
 
         var newState = new HqState(
             Agents: finalAgents.OrderBy(a => a.Role).ThenBy(a => a.Name).ToList(),
-            Accounts: _accounts.Values.OrderBy(a => a.Provider).ThenBy(a => a.AccountId).ToList(),
-            Builds: buildsList.OrderByDescending(b => b.UpdatedAt ?? DateTimeOffset.MinValue).ToList(),
+            Accounts: mergedAccounts,
+            Builds: buildsList.OrderByDescending(b => b.CreatedAt ?? b.UpdatedAt ?? DateTimeOffset.MinValue).ToList(),
             Weather: weather,
             Mood: mood,
             PendingVisualEvents: _visualEvents.OrderBy(e => e.SequenceId).ToArray(),
@@ -636,6 +642,37 @@ public class HqStateAggregator
         }
     }
 
+    private IReadOnlyList<AccountInfo> GetMergedAccountsLocked(DateTimeOffset now)
+    {
+        var expiredAccounts = _pushedAccounts.Where(kv => kv.Value.ExpiresAt <= now).Select(kv => kv.Key).ToList();
+        foreach (var k in expiredAccounts)
+        {
+            _pushedAccounts.Remove(k);
+        }
+
+        var mergedAccounts = new Dictionary<string, AccountInfo>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (k, v) in _orcaAccounts)
+        {
+            mergedAccounts[k] = v;
+        }
+        foreach (var (k, (acc, _)) in _pushedAccounts)
+        {
+            if (mergedAccounts.TryGetValue(k, out var existingOrca))
+            {
+                mergedAccounts[k] = existingOrca with
+                {
+                    QuotaPercent = acc.QuotaPercent ?? existingOrca.QuotaPercent
+                };
+            }
+            else
+            {
+                mergedAccounts[k] = acc;
+            }
+        }
+
+        return mergedAccounts.Values.OrderBy(a => a.Provider).ThenBy(a => a.AccountId).ToList();
+    }
+
     private HqState? ApplyDemoScenarioLocked(string scenario, DateTimeOffset now)
     {
         var agents = new List<AgentSnapshot>();
@@ -673,7 +710,7 @@ public class HqStateAggregator
 
         var demoState = new HqState(
             Agents: agents,
-            Accounts: _accounts.Values.ToList(),
+            Accounts: GetMergedAccountsLocked(now),
             Builds: builds,
             Weather: weather,
             Mood: mood,
@@ -696,7 +733,7 @@ public class HqStateAggregator
         // Fresh CI storm logic: compute failure based ONLY on latest build per repo
         var latestPerRepo = builds
             .GroupBy(b => b.Repo, StringComparer.OrdinalIgnoreCase)
-            .Select(g => g.OrderByDescending(b => b.UpdatedAt ?? DateTimeOffset.MinValue).First())
+            .Select(g => g.OrderByDescending(b => b.CreatedAt ?? b.UpdatedAt ?? DateTimeOffset.MinValue).First())
             .ToList();
 
         bool anyLatestFailing = latestPerRepo.Any(b => b.IsFailing);
@@ -746,7 +783,7 @@ public class HqStateAggregator
         // 2. Failing (Build fail or agent fail) - check latest build per repo
         var latestPerRepo = builds
             .GroupBy(b => b.Repo, StringComparer.OrdinalIgnoreCase)
-            .Select(g => g.OrderByDescending(b => b.UpdatedAt ?? DateTimeOffset.MinValue).First())
+            .Select(g => g.OrderByDescending(b => b.CreatedAt ?? b.UpdatedAt ?? DateTimeOffset.MinValue).First())
             .ToList();
 
         if (latestPerRepo.Any(b => b.IsFailing) ||

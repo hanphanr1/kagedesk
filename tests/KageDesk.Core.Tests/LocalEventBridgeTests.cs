@@ -385,4 +385,149 @@ public class LocalEventBridgeTests
         await bridge.DisposeAsync();
         Assert.False(bridge.IsRunning);
     }
+
+    [Fact]
+    public async Task GetState_AllowlistedDto_OmitsSensitiveFields()
+    {
+        var port = GetAvailablePort();
+        var aggregator = new HqStateAggregator();
+        aggregator.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot(
+                Id: "ag-sensitive-1",
+                Name: "Kakashi",
+                Role: AgentRole.Reviewer,
+                SpriteKey: "kakashi",
+                State: AgentState.NeedsApproval,
+                Prompt: "Secret user prompt text",
+                LastMessage: "Secret internal model output",
+                QuestionPrompt: "Do you approve this deployment?",
+                ToolName: "test_tool",
+                TaskTitle: "Review PR"
+            )
+        }, Array.Empty<AccountInfo>());
+
+        aggregator.AddVisualEvent("ApprovalRaised", "Confidential question message", "ag-sensitive-1");
+
+        await using var bridge = new LocalEventBridge(aggregator, port);
+        bridge.Start();
+
+        using var client = new HttpClient();
+        var response = await client.GetAsync($"http://127.0.0.1:{port}/api/state");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        // Verify agent fields
+        var agents = root.GetProperty("agents");
+        Assert.Equal(1, agents.GetArrayLength());
+        var agent = agents[0];
+
+        Assert.Equal("ag-sensitive-1", agent.GetProperty("id").GetString());
+        Assert.Equal("Kakashi", agent.GetProperty("name").GetString());
+        Assert.Equal("Reviewer", agent.GetProperty("role").GetString());
+        Assert.Equal("NeedsApproval", agent.GetProperty("state").GetString());
+        Assert.Equal("test_tool", agent.GetProperty("toolName").GetString());
+        Assert.Equal("Review PR", agent.GetProperty("taskTitle").GetString());
+
+        // Strictly verify sensitive fields are OMITTED
+        Assert.False(agent.TryGetProperty("prompt", out _), "Prompt must be omitted from public state DTO");
+        Assert.False(agent.TryGetProperty("lastMessage", out _), "LastMessage must be omitted from public state DTO");
+        Assert.False(agent.TryGetProperty("questionPrompt", out _), "QuestionPrompt must be omitted from public state DTO");
+
+        // Verify visual events
+        var events = root.GetProperty("pendingVisualEvents");
+        Assert.True(events.GetArrayLength() > 0);
+        var ev = events[0];
+        Assert.True(ev.TryGetProperty("sequenceId", out _));
+        Assert.True(ev.TryGetProperty("type", out _));
+        Assert.True(ev.TryGetProperty("timestamp", out _));
+        Assert.False(ev.TryGetProperty("message", out _), "VisualEvent Message must be omitted from public state DTO");
+    }
+
+    [Fact]
+    public async Task StalledRequest_AbortsAfterReadTimeout()
+    {
+        var port = GetAvailablePort();
+        var aggregator = new HqStateAggregator();
+        await using var bridge = new LocalEventBridge(aggregator, port)
+        {
+            RequestReadTimeout = TimeSpan.FromMilliseconds(250)
+        };
+        bridge.Start();
+
+        using var tcpClient = new TcpClient();
+        await tcpClient.ConnectAsync(IPAddress.Loopback, port);
+        var stream = tcpClient.GetStream();
+
+        // Send headers announcing 500 bytes of body, but never send body
+        string headers = $"POST /api/event HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 500\r\nContent-Type: application/json\r\n\r\n";
+        byte[] headerBytes = Encoding.UTF8.GetBytes(headers);
+        await stream.WriteAsync(headerBytes, 0, headerBytes.Length);
+        await stream.FlushAsync();
+
+        // Read until socket closes / aborts
+        byte[] readBuffer = new byte[1024];
+        using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        bool aborted = false;
+
+        try
+        {
+            while (!readCts.IsCancellationRequested)
+            {
+                int read = await stream.ReadAsync(readBuffer, 0, readBuffer.Length, readCts.Token);
+                if (read == 0)
+                {
+                    aborted = true; // Connection closed by server
+                    break;
+                }
+            }
+        }
+        catch (Exception)
+        {
+            aborted = true; // Socket reset or aborted
+        }
+
+        Assert.True(aborted, "Stalled request was not aborted by server within read timeout");
+    }
+
+    [Fact]
+    public async Task CleanShutdownUnderLoad_NoObjectDisposedException()
+    {
+        var port = GetAvailablePort();
+        var aggregator = new HqStateAggregator();
+        var bridge = new LocalEventBridge(aggregator, port);
+        bridge.Start();
+
+        using var client = new HttpClient();
+        var cts = new CancellationTokenSource();
+
+        // Spawn 16 concurrent requests
+        var tasks = Enumerable.Range(0, 16).Select(async _ =>
+        {
+            while (!cts.IsCancellationRequested)
+            {
+                try
+                {
+                    var res = await client.GetAsync($"http://127.0.0.1:{port}/api/health", cts.Token);
+                }
+                catch
+                {
+                    // Expected during shutdown
+                }
+                await Task.Delay(10);
+            }
+        }).ToList();
+
+        await Task.Delay(100);
+
+        // Stop bridge cleanly while requests are in-flight
+        await bridge.StopAsync(TimeSpan.FromSeconds(1));
+        cts.Cancel();
+        await Task.WhenAll(tasks);
+
+        Assert.False(bridge.IsRunning);
+    }
 }

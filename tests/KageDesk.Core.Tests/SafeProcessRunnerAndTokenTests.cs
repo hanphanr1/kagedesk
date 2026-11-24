@@ -74,4 +74,86 @@ public class SafeProcessRunnerAndTokenTests
         string? resolved = ExecutableResolver.Resolve("definitely_non_existent_binary_xyz_123");
         Assert.Null(resolved);
     }
+
+    [Fact]
+    public void SafeProcessRunner_PathFullyQualified_RejectsDriveRelativePaths()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.False(Path.IsPathFullyQualified(@"\relative\path"));
+            Assert.False(Path.IsPathFullyQualified(@"C:relative\path"));
+            Assert.True(Path.IsPathFullyQualified(@"C:\fully\qualified\path"));
+        }
+    }
+
+    [Fact]
+    public void ExecutableResolver_RejectsCmdAndBatFiles()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        string tempDir = Path.Combine(Path.GetTempPath(), $"kagedesk_cmd_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            File.WriteAllText(Path.Combine(tempDir, "script.cmd"), "@echo off\r\n");
+            File.WriteAllText(Path.Combine(tempDir, "script.bat"), "@echo off\r\n");
+
+            string oldPath = Environment.GetEnvironmentVariable("PATH") ?? "";
+            try
+            {
+                Environment.SetEnvironmentVariable("PATH", tempDir + ";" + oldPath);
+                ExecutableResolver.ClearCache();
+
+                Assert.Null(ExecutableResolver.Resolve("script"));
+                Assert.Null(ExecutableResolver.Resolve("script.cmd"));
+                Assert.Null(ExecutableResolver.Resolve("script.bat"));
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("PATH", oldPath);
+                ExecutableResolver.ClearCache();
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public void BridgeTokenStore_FailClosedAcl_RecreatesCleanlyOnPermissiveAcl()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        string tempPath = Path.Combine(Path.GetTempPath(), $"kagedesk_acl_test_{Guid.NewGuid():N}.token");
+        try
+        {
+            string token1 = BridgeTokenStore.GetOrCreateToken(tempPath);
+            Assert.True(BridgeTokenStore.HasStrictCurrentUserOnlyAcl(tempPath));
+
+            // Create permissive ACL (enable inheritance and allow Everyone)
+            var fileInfo = new FileInfo(tempPath);
+            var security = fileInfo.GetAccessControl();
+            security.SetAccessRuleProtection(isProtected: false, preserveInheritance: true);
+            var everyone = new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.WorldSid, null);
+            security.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(
+                everyone,
+                System.Security.AccessControl.FileSystemRights.FullControl,
+                System.Security.AccessControl.AccessControlType.Allow));
+            fileInfo.SetAccessControl(security);
+
+            // Permissive ACL should be detected as invalid
+            Assert.False(BridgeTokenStore.HasStrictCurrentUserOnlyAcl(tempPath));
+
+            // Calling GetOrCreateToken fails closed: deletes invalid file and recreates with strict ACL
+            string token2 = BridgeTokenStore.GetOrCreateToken(tempPath);
+            Assert.NotEqual(token1, token2);
+            Assert.True(BridgeTokenStore.HasStrictCurrentUserOnlyAcl(tempPath));
+            Assert.True(BridgeTokenStore.IsValidToken(token2));
+        }
+        finally
+        {
+            if (File.Exists(tempPath)) File.Delete(tempPath);
+        }
+    }
 }

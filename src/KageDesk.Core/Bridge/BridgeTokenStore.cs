@@ -1,6 +1,7 @@
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
+using System.Text;
 
 namespace KageDesk.Core.Bridge;
 
@@ -12,23 +13,64 @@ public static class BridgeTokenStore
 
         if (File.Exists(path))
         {
-            try
+            if (OperatingSystem.IsWindows())
             {
-                string token = File.ReadAllText(path).Trim();
-                if (IsValidToken(token))
+                if (!HasStrictCurrentUserOnlyAcl(path))
                 {
-                    return token;
+                    // Fail closed: invalid or permissive ACL, delete file to recreate with strict ACL
+                    File.Delete(path);
+                }
+                else
+                {
+                    try
+                    {
+                        string existing = File.ReadAllText(path).Trim();
+                        if (IsValidToken(existing))
+                        {
+                            return existing;
+                        }
+                        File.Delete(path);
+                    }
+                    catch
+                    {
+                        try { File.Delete(path); } catch { }
+                    }
                 }
             }
-            catch
+            else
             {
-                // Re-create if corrupt
+                try
+                {
+                    string existing = File.ReadAllText(path).Trim();
+                    if (IsValidToken(existing))
+                    {
+                        return existing;
+                    }
+                    File.Delete(path);
+                }
+                catch
+                {
+                    try { File.Delete(path); } catch { }
+                }
             }
         }
 
         string newToken = GenerateSecureToken();
-        SaveTokenSecurely(path, newToken);
-        return newToken;
+        try
+        {
+            CreateTokenFileWithStrictAcl(path, newToken);
+            return newToken;
+        }
+        catch (IOException) when (File.Exists(path))
+        {
+            if (OperatingSystem.IsWindows() && !HasStrictCurrentUserOnlyAcl(path))
+            {
+                throw new InvalidOperationException($"Token file at '{path}' has invalid or permissive ACL.");
+            }
+            string token = File.ReadAllText(path).Trim();
+            if (IsValidToken(token)) return token;
+            throw;
+        }
     }
 
     public static string GetDefaultTokenPath()
@@ -53,50 +95,136 @@ public static class BridgeTokenStore
         return true;
     }
 
+    public static bool HasStrictCurrentUserOnlyAcl(string filePath)
+    {
+        if (!OperatingSystem.IsWindows()) return true;
+
+        try
+        {
+            var fileInfo = new FileInfo(filePath);
+            var fileSecurity = fileInfo.GetAccessControl();
+            if (!fileSecurity.AreAccessRulesProtected)
+            {
+                // Inheritance is not disabled
+                return false;
+            }
+
+            var currentUser = WindowsIdentity.GetCurrent().User;
+            if (currentUser == null) return false;
+
+            var rules = fileSecurity.GetAccessRules(includeExplicit: true, includeInherited: false, typeof(SecurityIdentifier));
+            if (rules.Count == 0) return false;
+
+            var systemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+            var adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+            var usersSid = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
+            var everyoneSid = new SecurityIdentifier(WellKnownSidType.WorldSid, null);
+            var authUsersSid = new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null);
+
+            bool hasCurrentUser = false;
+
+            foreach (FileSystemAccessRule rule in rules)
+            {
+                if (rule.AccessControlType != AccessControlType.Allow)
+                    return false;
+
+                if (rule.IdentityReference is SecurityIdentifier sid)
+                {
+                    if (sid == usersSid || sid == everyoneSid || sid == authUsersSid)
+                    {
+                        return false;
+                    }
+
+                    if (sid == currentUser)
+                    {
+                        hasCurrentUser = true;
+                    }
+                    else if (sid != systemSid && sid != adminSid)
+                    {
+                        return false;
+                    }
+                }
+                else
+                {
+                    return false;
+                }
+            }
+
+            return hasCurrentUser;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static string GenerateSecureToken()
     {
         byte[] bytes = RandomNumberGenerator.GetBytes(32);
         return Convert.ToHexString(bytes).ToLowerInvariant();
     }
 
-    private static void SaveTokenSecurely(string filePath, string token)
+    public static void CreateTokenFileWithStrictAcl(string filePath, string token)
     {
-        string? dir = Path.GetDirectoryName(filePath);
-        if (!string.IsNullOrEmpty(dir))
-        {
-            Directory.CreateDirectory(dir);
-        }
-
-        File.WriteAllText(filePath, token);
+        EnsureDirectoryWithAcl(filePath);
 
         if (OperatingSystem.IsWindows())
         {
-            try
-            {
-                ApplyWindowsCurrentUserAcl(filePath);
-            }
-            catch
-            {
-                // Best-effort ACL application (e.g. FAT32 or network shares may not support NTFS ACLs)
-            }
+            var currentUser = WindowsIdentity.GetCurrent().User
+                ?? throw new InvalidOperationException("Current user SID could not be resolved.");
+
+            var fileSecurity = new FileSecurity();
+            fileSecurity.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+            fileSecurity.AddAccessRule(new FileSystemAccessRule(
+                currentUser,
+                FileSystemRights.FullControl,
+                AccessControlType.Allow));
+
+            var fileInfo = new FileInfo(filePath);
+            using var stream = FileSystemAclExtensions.Create(
+                fileInfo,
+                FileMode.CreateNew,
+                FileSystemRights.ReadData | FileSystemRights.WriteData | FileSystemRights.Delete,
+                FileShare.None,
+                4096,
+                FileOptions.None,
+                fileSecurity);
+            using var writer = new StreamWriter(stream, Encoding.UTF8);
+            writer.Write(token);
+            writer.Flush();
+        }
+        else
+        {
+            using var stream = new FileStream(filePath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            using var writer = new StreamWriter(stream, Encoding.UTF8);
+            writer.Write(token);
+            writer.Flush();
         }
     }
 
-    private static void ApplyWindowsCurrentUserAcl(string filePath)
+    private static void EnsureDirectoryWithAcl(string filePath)
     {
-        if (!OperatingSystem.IsWindows()) return;
+        string? dir = Path.GetDirectoryName(filePath);
+        if (string.IsNullOrEmpty(dir) || Directory.Exists(dir)) return;
 
-        var fileInfo = new FileInfo(filePath);
-        var security = fileInfo.GetAccessControl();
-        var user = WindowsIdentity.GetCurrent().User;
-        if (user != null)
+        if (OperatingSystem.IsWindows())
         {
-            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
-            security.AddAccessRule(new FileSystemAccessRule(
-                user,
-                FileSystemRights.FullControl,
-                AccessControlType.Allow));
-            fileInfo.SetAccessControl(security);
+            var currentUser = WindowsIdentity.GetCurrent().User;
+            if (currentUser != null)
+            {
+                var dirSec = new DirectorySecurity();
+                dirSec.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+                dirSec.AddAccessRule(new FileSystemAccessRule(
+                    currentUser,
+                    FileSystemRights.FullControl,
+                    InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                    PropagationFlags.None,
+                    AccessControlType.Allow));
+                FileSystemAclExtensions.Create(new DirectoryInfo(dir), dirSec);
+                return;
+            }
         }
+
+        Directory.CreateDirectory(dir);
     }
 }

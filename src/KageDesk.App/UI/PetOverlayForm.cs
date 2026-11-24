@@ -23,6 +23,7 @@ public class PetOverlayForm : Form
     private string _idleMode = "chill"; // "chill" | "auto-hide" | "off"
     private int? _petX;
     private bool _isPaused;
+    private bool _isHiddenByDndOrLock;
     private bool _disposed;
 
     private bool _isDragging;
@@ -33,6 +34,16 @@ public class PetOverlayForm : Form
     public int PetScale => _scale;
     public int? PetX => _petX;
     public string IdleMode => _idleMode;
+    public bool IsHiddenByDndOrLock
+    {
+        get => _isHiddenByDndOrLock;
+        set
+        {
+            if (_isHiddenByDndOrLock == value) return;
+            _isHiddenByDndOrLock = value;
+            ApplyEffectiveVisibility();
+        }
+    }
 
     public event Action<int>? PetPositionChanged;
     public event Action<AgentSnapshot>? AgentClicked;
@@ -69,7 +80,15 @@ public class PetOverlayForm : Form
         _cachedRenderState = _currentState;
 
         _petBuffer = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
-        _dibSurface = new LayeredDibSurface(TaskbarPetRenderer.CanvasWidth * _scale, TaskbarPetRenderer.CanvasHeight * _scale);
+        try
+        {
+            _dibSurface = new LayeredDibSurface(TaskbarPetRenderer.CanvasWidth * _scale, TaskbarPetRenderer.CanvasHeight * _scale);
+        }
+        catch
+        {
+            _petBuffer.Dispose();
+            throw;
+        }
         _renderer = new TaskbarPetRenderer();
         _stopwatch = Stopwatch.StartNew();
 
@@ -107,18 +126,25 @@ public class PetOverlayForm : Form
         ApplyEffectiveVisibility();
     }
 
-    public void SetScale(int scale)
+    public bool SetScale(int scale)
     {
         int newScale = Math.Clamp(scale, 1, 2);
-        if (_scale == newScale) return;
+        if (_scale == newScale) return true;
 
-        _scale = newScale;
-        _dibSurface.Resize(TaskbarPetRenderer.CanvasWidth * _scale, TaskbarPetRenderer.CanvasHeight * _scale);
-
-        UpdateWindowBounds();
-        if (Visible && !_isPaused)
+        try
         {
-            RenderAndPresent();
+            _dibSurface.Resize(TaskbarPetRenderer.CanvasWidth * newScale, TaskbarPetRenderer.CanvasHeight * newScale);
+            _scale = newScale;
+            UpdateWindowBounds();
+            if (Visible && !_isPaused && !_isHiddenByDndOrLock)
+            {
+                RenderAndPresent();
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -132,6 +158,16 @@ public class PetOverlayForm : Form
     {
         _petX = x;
         UpdateWindowBounds();
+    }
+
+    public void ApplyRenderState(HqState state, ThemePack theme, bool petPaused, bool petHiddenByDndOrLock)
+    {
+        _currentState = state ?? _currentState;
+        _currentTheme = theme ?? _currentTheme;
+        _isPaused = petPaused;
+        _isHiddenByDndOrLock = petHiddenByDndOrLock;
+        RecomputeCachedRenderState();
+        ApplyEffectiveVisibility();
     }
 
     public void UpdateData(HqState state, ThemePack theme)
@@ -189,7 +225,7 @@ public class PetOverlayForm : Form
     {
         if (_disposed) return;
 
-        if (_isPaused || _idleMode == "off")
+        if (_isPaused || _isHiddenByDndOrLock || _idleMode == "off")
         {
             _renderTimer.Stop();
             if (Visible) Hide();
@@ -244,7 +280,7 @@ public class PetOverlayForm : Form
 
     private void OnRenderTick(object? sender, EventArgs e)
     {
-        if (_disposed || _isPaused || _idleMode == "off") return;
+        if (_disposed || _isPaused || _isHiddenByDndOrLock || _idleMode == "off") return;
 
         if (_idleMode == "auto-hide")
         {

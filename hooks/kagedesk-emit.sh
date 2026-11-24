@@ -36,13 +36,8 @@ data = {"type": sys.argv[1], "agentId": sys.argv[2], "message": sys.argv[3]}
 print(json.dumps(data))
 ' "$TYPE" "$AGENT_ID" "$MESSAGE")
 else
-    json_escape() {
-        printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\n/\\n/g; s/\r/\\r/g; s/\t/\\t/g'
-    }
-    ESC_TYPE=$(json_escape "$TYPE")
-    ESC_AGENT=$(json_escape "$AGENT_ID")
-    ESC_MSG=$(json_escape "$MESSAGE")
-    JSON_BODY="{\"type\":\"$ESC_TYPE\",\"agentId\":\"$ESC_AGENT\",\"message\":\"$ESC_MSG\"}"
+    echo "Error: jq or python3 is required for safe JSON encoding" >&2
+    exit 1
 fi
 
 # Prepare curl arguments

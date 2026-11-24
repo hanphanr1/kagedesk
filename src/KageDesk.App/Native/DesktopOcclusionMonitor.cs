@@ -56,6 +56,22 @@ public class DesktopOcclusionMonitor : IDisposable
         }
     }
 
+    public void UnsubscribeSessionSwitch()
+    {
+        if (_systemEventsSubscribed)
+        {
+            try
+            {
+                SystemEvents.SessionSwitch -= OnSessionSwitch;
+                _systemEventsSubscribed = false;
+            }
+            catch
+            {
+                // Ignore in environments where SystemEvents is unsupported
+            }
+        }
+    }
+
     public void Start()
     {
         _timer.Start();

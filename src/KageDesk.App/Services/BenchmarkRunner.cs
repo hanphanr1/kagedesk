@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using KageDesk.App.Native;
@@ -52,7 +53,8 @@ public static class BenchmarkRunner
 
         // 3. Setup LocalEventBridge on an ephemeral port
         int ephemeralPort = GetFreeTcpPort();
-        using var bridge = new LocalEventBridge(aggregator, ephemeralPort);
+        string ephemeralToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+        using var bridge = new LocalEventBridge(aggregator, ephemeralPort, requiredToken: ephemeralToken);
         try
         {
             bridge.Start();

@@ -55,6 +55,19 @@ public class WallpaperHostForm : Form
 
     public event Action? TaskbarRecreated;
 
+    public void StopRendering()
+    {
+        _renderTimer.Stop();
+    }
+
+    public void StartRendering()
+    {
+        if (!_isPaused && !_disposed)
+        {
+            _renderTimer.Start();
+        }
+    }
+
     protected override bool ShowWithoutActivation => true;
 
     public WallpaperHostForm(ThemePack initialTheme, int targetFps = 15)

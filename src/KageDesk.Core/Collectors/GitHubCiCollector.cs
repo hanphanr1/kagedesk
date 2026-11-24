@@ -41,22 +41,18 @@ public class GitHubCiCollector
             var args = new[]
             {
                 "run", "list",
-                "--json", "databaseId,status,conclusion,workflowName,headBranch,displayTitle,url,updatedAt",
+                "--json", "databaseId,workflowName,headBranch,displayTitle,status,conclusion,url,createdAt,updatedAt",
                 "--limit", "5",
                 "-R", repo
             };
 
             var res = await _commandRunner(args, CommandTimeout, cancellationToken).ConfigureAwait(false);
-            if (res.ExitCode == 0 && !string.IsNullOrWhiteSpace(res.StandardOutput))
+            if (res.ExitCode == 0)
             {
                 var builds = ParseRunList(res.StandardOutput, repo);
                 allBuilds.AddRange(builds);
+                _aggregator.UpdateCiBuildsForRepo(repo, builds);
             }
-        }
-
-        if (allBuilds.Count > 0)
-        {
-            _aggregator.UpdateCiBuilds(allBuilds);
         }
 
         return allBuilds;
@@ -84,6 +80,12 @@ public class GitHubCiCollector
                 var title = el.TryGetProperty("displayTitle", out var tProp) ? tProp.GetString() ?? "" : "";
                 var url = el.TryGetProperty("url", out var uProp) ? uProp.GetString() : null;
 
+                DateTimeOffset? createdAt = null;
+                if (el.TryGetProperty("createdAt", out var crProp) && DateTimeOffset.TryParse(crProp.GetString(), out var crDt))
+                {
+                    createdAt = crDt;
+                }
+
                 DateTimeOffset? updatedAt = null;
                 if (el.TryGetProperty("updatedAt", out var upProp) && DateTimeOffset.TryParse(upProp.GetString(), out var dt))
                 {
@@ -99,7 +101,8 @@ public class GitHubCiCollector
                     Status: status,
                     Conclusion: conclusion,
                     Url: url,
-                    UpdatedAt: updatedAt
+                    UpdatedAt: updatedAt,
+                    CreatedAt: createdAt
                 ));
             }
 

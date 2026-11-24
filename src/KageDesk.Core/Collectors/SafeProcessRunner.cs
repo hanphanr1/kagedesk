@@ -25,6 +25,8 @@ public static class ExecutableResolver
         return resolved;
     }
 
+    private static readonly string[] AllowedWindowsExtensions = new[] { ".exe", ".com" };
+
     private static string? ResolveInternal(string command)
     {
         string? pathEnv = Environment.GetEnvironmentVariable("PATH");
@@ -38,7 +40,7 @@ public static class ExecutableResolver
         foreach (var rawDir in dirs)
         {
             // Security: Never search current directory or relative paths
-            if (rawDir is "." or ".." || !Path.IsPathRooted(rawDir))
+            if (rawDir is "." or ".." || !Path.IsPathFullyQualified(rawDir))
             {
                 continue;
             }
@@ -48,6 +50,15 @@ public static class ExecutableResolver
             // If command already has an extension that exists
             if (Path.HasExtension(command))
             {
+                if (OperatingSystem.IsWindows())
+                {
+                    string ext = Path.GetExtension(command);
+                    if (!AllowedWindowsExtensions.Contains(ext, StringComparer.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                }
+
                 string full = Path.Combine(rawDir, command);
                 if (File.Exists(full))
                 {
@@ -56,7 +67,7 @@ public static class ExecutableResolver
             }
             else
             {
-                // Check all extensions
+                // Check all extensions (.exe, .com only on Windows)
                 foreach (var ext in extensions)
                 {
                     string candidate = Path.Combine(rawDir, command + ext);
@@ -78,13 +89,7 @@ public static class ExecutableResolver
             return new[] { "" };
         }
 
-        string? pathExt = Environment.GetEnvironmentVariable("PATHEXT");
-        if (string.IsNullOrWhiteSpace(pathExt))
-        {
-            return new[] { ".exe", ".cmd", ".bat" };
-        }
-
-        return pathExt.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return AllowedWindowsExtensions;
     }
 }
 

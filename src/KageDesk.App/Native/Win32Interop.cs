@@ -212,6 +212,9 @@ public static class Win32Interop
         int dwFlags);
 
     [DllImport("user32.dll")]
+    public static extern IntPtr GetShellWindow();
+
+    [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
 
     [DllImport("user32.dll")]

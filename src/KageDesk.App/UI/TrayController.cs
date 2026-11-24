@@ -178,13 +178,11 @@ public class TrayController : IDisposable
 
         var scale1x = new ToolStripMenuItem("Scale: 1x (Retro 384px)", null, (_, _) =>
         {
-            UpdateConfig?.Invoke(c => c.PetScale = 1);
             OnPetScaleChanged?.Invoke(1);
         }) { Checked = config.PetScale == 1 };
 
         var scale2x = new ToolStripMenuItem("Scale: 2x (HiDPI 768px)", null, (_, _) =>
         {
-            UpdateConfig?.Invoke(c => c.PetScale = 2);
             OnPetScaleChanged?.Invoke(2);
         }) { Checked = config.PetScale == 2 };
 

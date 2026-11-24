@@ -420,4 +420,85 @@ public class HqStateAggregatorTests
         aggregator.SetDemoScenario("working");
         Assert.True(received);
     }
+
+    [Fact]
+    public void UpdateCiBuildsForRepo_EmptyBuilds_ClearsRepoRunsAndStormAlert()
+    {
+        var aggregator = new HqStateAggregator();
+        var repo = "kagedesk-test/repo-1";
+
+        // Initial failing build triggers StormAlert
+        aggregator.UpdateCiBuildsForRepo(repo, new[]
+        {
+            new BuildInfo("b-1", repo, "CI", "main", "Build Failed", "completed", "failure")
+        });
+
+        var stateWithFailure = aggregator.GetState();
+        Assert.Single(stateWithFailure.Builds);
+        Assert.Equal(EffectiveWeather.StormAlert, stateWithFailure.Weather);
+
+        // Empty run list reported for this repo
+        aggregator.UpdateCiBuildsForRepo(repo, Array.Empty<BuildInfo>());
+
+        var stateCleared = aggregator.GetState();
+        Assert.Empty(stateCleared.Builds);
+        Assert.NotEqual(EffectiveWeather.StormAlert, stateCleared.Weather);
+    }
+
+    [Fact]
+    public void OrderRunsNewestFirst_OrdersByCreatedAt_BeforeUpdatedAt()
+    {
+        var aggregator = new HqStateAggregator();
+        var repo = "kagedesk-test/repo-order";
+        var t0 = new DateTimeOffset(2026, 11, 25, 10, 0, 0, TimeSpan.Zero);
+
+        // Older run (created 10:00, failed, updated later at 10:30)
+        var olderRun = new BuildInfo("b-old", repo, "CI", "main", "Older", "completed", "failure",
+            CreatedAt: t0, UpdatedAt: t0.AddMinutes(30));
+
+        // Newer run (created 10:20, succeeded, updated at 10:25)
+        var newerRun = new BuildInfo("b-new", repo, "CI", "main", "Newer", "completed", "success",
+            CreatedAt: t0.AddMinutes(20), UpdatedAt: t0.AddMinutes(25));
+
+        aggregator.UpdateCiBuilds(new[] { olderRun, newerRun });
+
+        var state = aggregator.GetState();
+        Assert.Equal(2, state.Builds.Count);
+        Assert.Equal("b-new", state.Builds[0].Id);
+        Assert.Equal("success", state.Builds[0].Conclusion);
+        Assert.NotEqual(EffectiveWeather.StormAlert, state.Weather);
+    }
+
+    [Fact]
+    public void PushedAccounts_CappedAt32_DoesNotEvictOrcaAccounts()
+    {
+        var aggregator = new HqStateAggregator();
+
+        // 1. Snapshot with Orca accounts
+        aggregator.UpdateOrcaSnapshot(Array.Empty<AgentSnapshot>(), new[]
+        {
+            new AccountInfo("orca", "orca-acc-1", "Orca Account", true)
+        });
+
+        Assert.Single(aggregator.GetState().Accounts);
+
+        // 2. Push 35 bridge accounts
+        for (int i = 0; i < 35; i++)
+        {
+            aggregator.UpdatePushedEvent(new PushedEventPayload(
+                AccountProvider: "bridge",
+                AccountName: $"acc-{i}",
+                QuotaPercent: 50.0
+            ));
+        }
+
+        var accounts = aggregator.GetState().Accounts;
+        // Orca account is NEVER evicted by pushed bridge accounts
+        Assert.Contains(accounts, a => a.Provider == "orca" && a.AccountId == "orca-acc-1");
+
+        // Pushed accounts must be capped to at most 32
+        var pushedCount = accounts.Count(a => a.Provider == "bridge");
+        Assert.True(pushedCount <= 32, $"Expected at most 32 pushed accounts, got {pushedCount}");
+    }
 }
+

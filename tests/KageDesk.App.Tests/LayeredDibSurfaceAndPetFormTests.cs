@@ -95,4 +95,63 @@ public class LayeredDibSurfaceAndPetFormTests
         bool showWithoutAct = (bool)prop.GetValue(wpForm)!;
         Assert.True(showWithoutAct);
     }
+
+    [Fact]
+    public void PetOverlayForm_SetScale_SuccessAndPreservation()
+    {
+        var theme = ThemePackLoader.BuiltInFallback;
+        using var form = new PetOverlayForm(theme, initialScale: 1);
+        Assert.Equal(1, form.PetScale);
+
+        bool success = form.SetScale(2);
+        Assert.True(success);
+        Assert.Equal(2, form.PetScale);
+
+        // Same scale is no-op and returns true
+        bool sameSuccess = form.SetScale(2);
+        Assert.True(sameSuccess);
+        Assert.Equal(2, form.PetScale);
+    }
+
+    [Fact]
+    public void PetOverlayForm_ApplyRenderState_AtomicallyAppliesPauseAndState()
+    {
+        var theme = ThemePackLoader.BuiltInFallback;
+        using var form = new PetOverlayForm(theme, initialScale: 1);
+        form.Start();
+
+        var activeState = new KageDesk.Core.Models.HqState(
+            Agents: new[]
+            {
+                new KageDesk.Core.Models.AgentSnapshot("a1", "Worker", KageDesk.Core.Models.AgentRole.Coder, "minato", KageDesk.Core.Models.AgentState.Working)
+            },
+            Accounts: Array.Empty<KageDesk.Core.Models.AccountInfo>(),
+            Builds: Array.Empty<KageDesk.Core.Models.BuildInfo>(),
+            Weather: KageDesk.Core.Models.EffectiveWeather.Day,
+            Mood: KageDesk.Core.Models.HqMood.Busy,
+            PendingVisualEvents: Array.Empty<KageDesk.Core.Models.HqEvent>()
+        );
+
+        // 1. Paused -> Form must NOT be visible even with active agent
+        form.ApplyRenderState(activeState, theme, petPaused: true, petHiddenByDndOrLock: false);
+        Assert.False(form.Visible);
+
+        // 2. Unpaused -> Active agent causes form to be visible
+        form.ApplyRenderState(activeState, theme, petPaused: false, petHiddenByDndOrLock: false);
+        Assert.True(form.Visible);
+
+        // 3. Hidden by DND/Lock -> Form hides immediately
+        form.ApplyRenderState(activeState, theme, petPaused: false, petHiddenByDndOrLock: true);
+        Assert.False(form.Visible);
+    }
+
+    [Fact]
+    public void UiDispatcherForm_PropertiesAndHandleCreation()
+    {
+        using var dispatcher = new UiDispatcherForm();
+        Assert.Equal(System.Windows.Forms.FormBorderStyle.None, dispatcher.FormBorderStyle);
+        Assert.False(dispatcher.ShowInTaskbar);
+        Assert.NotEqual(IntPtr.Zero, dispatcher.Handle);
+    }
 }
+

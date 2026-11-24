@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Runtime.InteropServices;
+using KageDesk.App.UI;
 
 namespace KageDesk.App.Native;
 
@@ -15,8 +16,9 @@ public class Win32WallpaperBridge
     private IntPtr _attachedHwnd = IntPtr.Zero;
     private IntPtr _hostHwnd = IntPtr.Zero;
     private Form? _attachedForm;
-    private IntPtr _savedStyle = IntPtr.Zero;
-    private IntPtr _savedExStyle = IntPtr.Zero;
+    private IntPtr _originalParent = IntPtr.Zero;
+    private nint? _savedStyle;
+    private nint? _savedExStyle;
     private bool _isAttached;
     private DesktopTopology _currentTopology = DesktopTopology.None;
     private string _statusReason = "Not attached";
@@ -39,20 +41,54 @@ public class Win32WallpaperBridge
             return false;
         }
 
+        // Capture original parent and styles with exact nint? preservation
+        _originalParent = Win32Interop.GetParent(formHandle);
+
+        Marshal.SetLastPInvokeError(0);
+        nint style = Win32Interop.GetWindowLongPtr(formHandle, Win32Interop.GWL_STYLE);
+        int errStyle = Marshal.GetLastWin32Error();
+        _savedStyle = (style != 0 || errStyle == 0) ? style : null;
+
+        Marshal.SetLastPInvokeError(0);
+        nint exStyle = Win32Interop.GetWindowLongPtr(formHandle, Win32Interop.GWL_EXSTYLE);
+        int errExStyle = Marshal.GetLastWin32Error();
+        _savedExStyle = (exStyle != 0 || errExStyle == 0) ? exStyle : null;
+
         try
         {
-            // 1. Locate Progman and resolve Explorer shell PID
-            IntPtr progman = Win32Interop.FindWindow("Progman", null);
-            if (progman == IntPtr.Zero)
+            // 1. Obtain verified Explorer shell window via GetShellWindow()
+            IntPtr shellWindow = Win32Interop.GetShellWindow();
+            if (shellWindow == IntPtr.Zero || !Win32Interop.IsWindow(shellWindow))
             {
-                _statusReason = "Progman window not found";
-                return false;
+                IntPtr progmanCandidate = Win32Interop.FindWindow("Progman", null);
+                if (progmanCandidate != IntPtr.Zero && progmanCandidate == Win32Interop.GetShellWindow())
+                {
+                    shellWindow = progmanCandidate;
+                }
+                else
+                {
+                    _statusReason = "Verified Explorer shell window not found";
+                    return false;
+                }
             }
 
-            Win32Interop.GetWindowThreadProcessId(progman, out uint shellPid);
+            Win32Interop.GetWindowThreadProcessId(shellWindow, out uint shellPid);
             if (shellPid == 0)
             {
                 _statusReason = "Failed to determine Explorer shell PID";
+                return false;
+            }
+
+            IntPtr progman = Win32Interop.FindWindow("Progman", null);
+            if (progman == IntPtr.Zero)
+            {
+                progman = shellWindow;
+            }
+
+            Win32Interop.GetWindowThreadProcessId(progman, out uint progmanPid);
+            if (progmanPid != shellPid)
+            {
+                _statusReason = "Progman PID does not match verified shell PID";
                 return false;
             }
 
@@ -135,11 +171,8 @@ public class Win32WallpaperBridge
 
     private bool AttachClassicTopology(Form form, IntPtr formHandle, IntPtr targetWorkerW)
     {
-        // Capture original styles
-        _savedStyle = Win32Interop.GetWindowLongPtr(formHandle, Win32Interop.GWL_STYLE);
-        _savedExStyle = Win32Interop.GetWindowLongPtr(formHandle, Win32Interop.GWL_EXSTYLE);
-
-        long newStyle = _savedStyle.ToInt64();
+        long baseStyle = _savedStyle.HasValue ? _savedStyle.Value : Win32Interop.GetWindowLongPtr(formHandle, Win32Interop.GWL_STYLE).ToInt64();
+        long newStyle = baseStyle;
         newStyle &= ~((long)Win32Interop.WS_POPUP);
         newStyle |= Win32Interop.WS_CHILD | Win32Interop.WS_VISIBLE;
 
@@ -150,7 +183,7 @@ public class Win32WallpaperBridge
             return false;
         }
 
-        IntPtr prevParent = Win32Interop.SetParent(formHandle, targetWorkerW);
+        Win32Interop.SetParent(formHandle, targetWorkerW);
         IntPtr actualParent = Win32Interop.GetParent(formHandle);
         if (actualParent != targetWorkerW)
         {
@@ -190,16 +223,13 @@ public class Win32WallpaperBridge
 
     private bool AttachRaisedDesktopTopology(Form form, IntPtr formHandle, IntPtr progman, IntPtr defViewHwnd)
     {
-        // Capture original styles
-        _savedStyle = Win32Interop.GetWindowLongPtr(formHandle, Win32Interop.GWL_STYLE);
-        _savedExStyle = Win32Interop.GetWindowLongPtr(formHandle, Win32Interop.GWL_EXSTYLE);
-
-        long newStyle = _savedStyle.ToInt64();
+        long baseStyle = _savedStyle.HasValue ? _savedStyle.Value : Win32Interop.GetWindowLongPtr(formHandle, Win32Interop.GWL_STYLE).ToInt64();
+        long newStyle = baseStyle;
         newStyle &= ~((long)Win32Interop.WS_POPUP);
         newStyle |= Win32Interop.WS_CHILD | Win32Interop.WS_VISIBLE;
 
-        long newExStyle = _savedExStyle.ToInt64();
-        newExStyle |= Win32Interop.WS_EX_LAYERED;
+        long baseExStyle = _savedExStyle.HasValue ? _savedExStyle.Value : Win32Interop.GetWindowLongPtr(formHandle, Win32Interop.GWL_EXSTYLE).ToInt64();
+        long newExStyle = baseExStyle | Win32Interop.WS_EX_LAYERED;
 
         if (!TrySetWindowLong(formHandle, Win32Interop.GWL_STYLE, new IntPtr(newStyle), out _) ||
             !TrySetWindowLong(formHandle, Win32Interop.GWL_EXSTYLE, new IntPtr(newExStyle), out _))
@@ -209,8 +239,13 @@ public class Win32WallpaperBridge
             return false;
         }
 
-        // Set layered window attributes
-        Win32Interop.SetLayeredWindowAttributes(formHandle, 0, 255, Win32Interop.LWA_ALPHA);
+        // Set layered window attributes - if false, immediately roll back and return failure
+        if (!Win32Interop.SetLayeredWindowAttributes(formHandle, 0, 255, Win32Interop.LWA_ALPHA))
+        {
+            _statusReason = "SetLayeredWindowAttributes failed in Raised-Desktop";
+            RollbackAttach(formHandle);
+            return false;
+        }
 
         Win32Interop.SetParent(formHandle, progman);
         IntPtr actualParent = Win32Interop.GetParent(formHandle);
@@ -255,27 +290,37 @@ public class Win32WallpaperBridge
     {
         try
         {
+            if (_attachedForm is WallpaperHostForm hostForm)
+            {
+                hostForm.StopRendering();
+            }
+
             if (formHandle != IntPtr.Zero && Win32Interop.IsWindow(formHandle))
             {
-                Win32Interop.SetParent(formHandle, IntPtr.Zero);
-                if (_savedStyle != IntPtr.Zero)
+                if (_savedStyle.HasValue)
                 {
-                    Win32Interop.SetWindowLongPtr(formHandle, Win32Interop.GWL_STYLE, _savedStyle);
+                    TrySetWindowLong(formHandle, Win32Interop.GWL_STYLE, new IntPtr(_savedStyle.Value), out _);
                 }
-                if (_savedExStyle != IntPtr.Zero)
+                if (_savedExStyle.HasValue)
                 {
-                    Win32Interop.SetWindowLongPtr(formHandle, Win32Interop.GWL_EXSTYLE, _savedExStyle);
+                    TrySetWindowLong(formHandle, Win32Interop.GWL_EXSTYLE, new IntPtr(_savedExStyle.Value), out _);
                 }
+                Win32Interop.SetParent(formHandle, _originalParent);
                 Win32Interop.ShowWindow(formHandle, 0 /* SW_HIDE */);
             }
         }
         catch { }
-
-        _attachedHwnd = IntPtr.Zero;
-        _hostHwnd = IntPtr.Zero;
-        _attachedForm = null;
-        _isAttached = false;
-        _currentTopology = DesktopTopology.None;
+        finally
+        {
+            _attachedHwnd = IntPtr.Zero;
+            _hostHwnd = IntPtr.Zero;
+            _attachedForm = null;
+            _isAttached = false;
+            _currentTopology = DesktopTopology.None;
+            _savedStyle = null;
+            _savedExStyle = null;
+            _originalParent = IntPtr.Zero;
+        }
     }
 
     private static bool TrySetWindowLong(IntPtr hwnd, int index, IntPtr newLong, out IntPtr oldLong)
@@ -286,38 +331,67 @@ public class Win32WallpaperBridge
         return oldLong != IntPtr.Zero || error == 0;
     }
 
-    public void RestoreDesktopWallpaper()
+    public bool Detach(Form? form = null)
     {
-        if (!_isAttached || _attachedHwnd == IntPtr.Zero) return;
+        if (!_isAttached && _attachedHwnd == IntPtr.Zero)
+        {
+            _statusReason = "Detached";
+            return true;
+        }
 
         IntPtr hwnd = _attachedHwnd;
         IntPtr host = _hostHwnd;
+        Form? targetForm = form ?? _attachedForm;
+
+        if (targetForm is WallpaperHostForm hostForm)
+        {
+            hostForm.StopRendering();
+        }
+
+        bool detached = true;
+        try
+        {
+            if (hwnd != IntPtr.Zero && Win32Interop.IsWindow(hwnd))
+            {
+                Win32Interop.ShowWindow(hwnd, 0 /* SW_HIDE */);
+
+                if (_savedStyle.HasValue)
+                {
+                    TrySetWindowLong(hwnd, Win32Interop.GWL_STYLE, new IntPtr(_savedStyle.Value), out _);
+                }
+                if (_savedExStyle.HasValue)
+                {
+                    TrySetWindowLong(hwnd, Win32Interop.GWL_EXSTYLE, new IntPtr(_savedExStyle.Value), out _);
+                }
+
+                Win32Interop.SetParent(hwnd, _originalParent);
+                IntPtr currentParent = Win32Interop.GetParent(hwnd);
+                if (currentParent != _originalParent && Win32Interop.IsWindow(hwnd))
+                {
+                    detached = false;
+                }
+            }
+        }
+        catch
+        {
+            detached = false;
+        }
+
+        if (!detached)
+        {
+            _statusReason = "Detach failed: unable to restore parent window";
+            return false;
+        }
 
         _isAttached = false;
         _attachedHwnd = IntPtr.Zero;
         _hostHwnd = IntPtr.Zero;
         _attachedForm = null;
         _currentTopology = DesktopTopology.None;
+        _savedStyle = null;
+        _savedExStyle = null;
+        _originalParent = IntPtr.Zero;
         _statusReason = "Detached";
-
-        try
-        {
-            if (hwnd != IntPtr.Zero && Win32Interop.IsWindow(hwnd))
-            {
-                Win32Interop.ShowWindow(hwnd, 0 /* SW_HIDE */);
-                Win32Interop.SetParent(hwnd, IntPtr.Zero);
-
-                if (_savedStyle != IntPtr.Zero)
-                {
-                    Win32Interop.SetWindowLongPtr(hwnd, Win32Interop.GWL_STYLE, _savedStyle);
-                }
-                if (_savedExStyle != IntPtr.Zero)
-                {
-                    Win32Interop.SetWindowLongPtr(hwnd, Win32Interop.GWL_EXSTYLE, _savedExStyle);
-                }
-            }
-        }
-        catch { }
 
         // Invalidate host desktop window so Explorer repaints the original desktop wallpaper
         try
@@ -333,5 +407,9 @@ public class Win32WallpaperBridge
             }
         }
         catch { }
+
+        return true;
     }
+
+    public bool RestoreDesktopWallpaper() => Detach(_attachedForm);
 }
