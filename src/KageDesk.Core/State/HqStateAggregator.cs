@@ -66,6 +66,8 @@ public class HqStateAggregator
         }
     }
 
+    public HqState CurrentState => GetState();
+
     public void SetWeatherMode(WeatherMode mode)
     {
         lock (_lock)

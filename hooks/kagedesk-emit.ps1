@@ -1,0 +1,1 @@
+param([string]$Type = "tool_start", [string]$AgentId = "external", [string]$Message = "event", [int]$Port = 4319) Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/event" -Method Post -ContentType "application/json" -Body (@{ type = $Type; agentId = $AgentId; message = $Message } | ConvertTo-Json)
