@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore KageDesk.sln
+
+      - name: Build Release (zero warnings)
+        run: dotnet build KageDesk.sln -c Release --no-restore --no-incremental
+
+      - name: Run unit test suite
+        run: dotnet test KageDesk.sln -c Release --no-build --verbosity normal
+
+      - name: Validate theme JSONs, hook templates, bash syntax, and preview snapshots
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # 1. Validate all theme.json files
+          $themeFiles = Get-ChildItem -Path 'themes\*\theme.json'
+          if ($themeFiles.Count -lt 3) {
+            throw "Expected at least 3 theme.json files, found $($themeFiles.Count)"
+          }
+          foreach ($file in $themeFiles) {
+            Get-Content -Path $file.FullName -Raw | ConvertFrom-Json | Out-Null
+            Write-Host "Validated JSON: $($file.FullName)"
+          }
+
+          # 2. Validate Claude Code hook templates
+          $hookFiles = Get-ChildItem -Path 'hooks\claude-code-hooks*.json'
+          if ($hookFiles.Count -lt 2) {
+            throw "Expected at least 2 hook template JSON files, found $($hookFiles.Count)"
+          }
+          foreach ($file in $hookFiles) {
+            Get-Content -Path $file.FullName -Raw | ConvertFrom-Json | Out-Null
+            Write-Host "Validated JSON: $($file.FullName)"
+          }
+
+          # 3. Validate Bash emitter syntax via Git Bash
+          $bashExe = if (Test-Path 'C:\Program Files\Git\bin\bash.exe') {
+            'C:\Program Files\Git\bin\bash.exe'
+          } else {
+            (Get-Command bash).Source
+          }
+          & $bashExe -n hooks/kagedesk-emit.sh
+          if ($LASTEXITCODE -ne 0) {
+            throw "bash -n hooks/kagedesk-emit.sh failed with exit code $LASTEXITCODE"
+          }
+          Write-Host "Validated Bash syntax: hooks/kagedesk-emit.sh"
+
+          # 4. Run Release KageDesk.exe --snapshot into a temp directory and verify PNG outputs
+          $tempDir = Join-Path $env:RUNNER_TEMP "kagedesk-snapshots"
+          $exePath = (Resolve-Path 'src\KageDesk.App\bin\Release\net8.0-windows\KageDesk.exe').Path
+          $proc = Start-Process -FilePath $exePath -ArgumentList @('--snapshot', $tempDir) -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            throw "KageDesk.exe --snapshot exited with code $($proc.ExitCode)"
+          }
+
+          $expectedPngs = @(
+            'shinobi-hq-working.png',
+            'shinobi-hq-approve.png',
+            'shinobi-hq-done.png',
+            'shinobi-hq-fail.png',
+            'shinobi-hq-clone.png',
+            'cyber-bunker-working.png',
+            'cozy-lofi-idle.png',
+            'pet-overlay-approve.png',
+            'pet-overlay-working.png'
+          )
+
+          foreach ($png in $expectedPngs) {
+            $pngPath = Join-Path $tempDir $png
+            if (!(Test-Path $pngPath)) {
+              throw "Missing expected snapshot PNG: $png"
+            }
+            $len = (Get-Item $pngPath).Length
+            if ($len -le 0) {
+              throw "Snapshot PNG is empty: $png"
+            }
+            Write-Host "Verified snapshot: $png ($len bytes)"
+          }
