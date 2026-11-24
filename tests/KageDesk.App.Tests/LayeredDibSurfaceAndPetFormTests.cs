@@ -10,6 +10,7 @@ using Xunit;
 
 namespace KageDesk.App.Tests;
 
+[Collection("WinFormsGdi")]
 public class LayeredDibSurfaceAndPetFormTests
 {
     [Fact]

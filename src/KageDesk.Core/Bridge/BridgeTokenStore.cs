@@ -144,53 +144,52 @@ public static class BridgeTokenStore
     [SupportedOSPlatform("windows")]
     public static bool VerifySecurity(FileSecurity security, SecurityIdentifier currentUser)
     {
+        if (security == null || currentUser == null)
+        {
+            return false;
+        }
+
         if (!security.AreAccessRulesProtected)
         {
             return false;
         }
 
         var owner = security.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
-        if (owner == null || owner != currentUser)
+        if (owner == null || !currentUser.Equals(owner))
         {
             return false;
         }
 
-        var rules = security.GetAccessRules(includeExplicit: true, includeInherited: false, typeof(SecurityIdentifier));
-        if (rules.Count == 0) return false;
+        AuthorizationRuleCollection rules = security.GetAccessRules(
+            includeExplicit: true,
+            includeInherited: true,
+            typeof(SecurityIdentifier));
 
-        var systemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
-        var adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
-        var usersSid = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
-        var everyoneSid = new SecurityIdentifier(WellKnownSidType.WorldSid, null);
-        var authUsersSid = new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null);
+        if (rules.Count == 0)
+        {
+            return false;
+        }
 
         bool hasCurrentUser = false;
 
-        foreach (FileSystemAccessRule rule in rules)
+        foreach (AuthorizationRule authRule in rules)
         {
+            if (authRule is not FileSystemAccessRule rule)
+            {
+                return false;
+            }
+
             if (rule.AccessControlType != AccessControlType.Allow)
-                return false;
-
-            if (rule.IdentityReference is SecurityIdentifier sid)
-            {
-                if (sid == usersSid || sid == everyoneSid || sid == authUsersSid)
-                {
-                    return false;
-                }
-
-                if (sid == currentUser)
-                {
-                    hasCurrentUser = true;
-                }
-                else if (sid != systemSid && sid != adminSid)
-                {
-                    return false;
-                }
-            }
-            else
             {
                 return false;
             }
+
+            if (!currentUser.Equals(rule.IdentityReference))
+            {
+                return false;
+            }
+
+            hasCurrentUser = true;
         }
 
         return hasCurrentUser;

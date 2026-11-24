@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using KageDesk.App.Native;
 using KageDesk.App.UI;
 using KageDesk.Core.Bridge;
@@ -124,9 +125,10 @@ public class KageDeskRuntime : IDisposable
             _petForm.Start();
         }
 
-        // Attach Wallpaper Form
+        // Attach Wallpaper Form (render frame-0 synchronously before presenting, even if paused)
         if (!_noWallpaperMode && _config.WallpaperEnabled && _wallpaperForm != null)
         {
+            _wallpaperForm.RenderFrameNow();
             _wallpaperBridge.AttachWallpaper(_wallpaperForm);
             _wallpaperForm.IsAttached = _wallpaperBridge.IsAttached;
         }
@@ -206,12 +208,14 @@ public class KageDeskRuntime : IDisposable
             {
                 if (enabled)
                 {
-                    if (_wallpaperForm == null && !_noWallpaperMode)
+                    if ((_wallpaperForm == null || _wallpaperForm.IsDisposed) && !_noWallpaperMode)
                     {
                         _wallpaperForm = new WallpaperHostForm(_activeTheme, _config.TargetFps);
                     }
                     if (_wallpaperForm != null)
                     {
+                        SyncUiOnDispatcher();
+                        _wallpaperForm.RenderFrameNow();
                         _wallpaperBridge.AttachWallpaper(_wallpaperForm);
                         _wallpaperForm.IsAttached = _wallpaperBridge.IsAttached;
                     }
@@ -219,7 +223,7 @@ public class KageDeskRuntime : IDisposable
                 else
                 {
                     _wallpaperBridge.RestoreDesktopWallpaper();
-                    if (_wallpaperForm != null)
+                    if (_wallpaperForm != null && !_wallpaperForm.IsDisposed)
                     {
                         _wallpaperForm.IsAttached = false;
                     }
@@ -303,6 +307,57 @@ public class KageDeskRuntime : IDisposable
         }
     }
 
+    internal static bool ExecuteExplorerRestartRecovery(
+        bool hadAttachment,
+        Func<bool> isHostAlive,
+        Func<bool> detachHost,
+        Action disposeOldForm,
+        Func<bool> resetAfterDestroyedHost,
+        Action markOldFormDetached,
+        bool shouldAttachReplacement,
+        Action createAndAttachReplacement,
+        Action<string>? logError = null)
+    {
+        if (hadAttachment)
+        {
+            if (!isHostAlive())
+            {
+                // Old host HWND is ALREADY gone: ALWAYS dispose old form, reset bridge, and recreate fresh form
+                disposeOldForm();
+                if (!resetAfterDestroyedHost())
+                {
+                    logError?.Invoke("Explorer restart recovery aborted: ResetAfterDestroyedHost returned false for destroyed host.");
+                    return false;
+                }
+            }
+            else
+            {
+                // Old host HWND is still alive: try clean detach first
+                bool detached = detachHost();
+                if (!detached)
+                {
+                    disposeOldForm();
+                    if (!resetAfterDestroyedHost())
+                    {
+                        logError?.Invoke("Explorer restart recovery aborted: Detach failed and ResetAfterDestroyedHost returned false; skipping replacement to prevent overlapping hosts.");
+                        return false;
+                    }
+                }
+                else
+                {
+                    markOldFormDetached();
+                }
+            }
+        }
+
+        if (shouldAttachReplacement)
+        {
+            createAndAttachReplacement();
+        }
+
+        return true;
+    }
+
     private void OnExplorerRestarted()
     {
         if (_stopping || _disposed) return;
@@ -316,31 +371,44 @@ public class KageDeskRuntime : IDisposable
                     if (_stopping || _disposed) return;
 
                     var oldForm = _wallpaperForm;
-                    bool detached = _wallpaperBridge.Detach(oldForm);
-                    if (!detached && oldForm != null)
-                    {
-                        oldForm.StopRendering();
-                        oldForm.Dispose();
-                        _wallpaperBridge.ResetAfterDestroyedHost();
-                        _wallpaperForm = null;
-                    }
-                    else if (oldForm != null)
-                    {
-                        oldForm.IsAttached = false;
-                    }
+                    bool hadAttachment = _wallpaperBridge.IsAttached || _wallpaperBridge.AttachedHwnd != IntPtr.Zero;
 
-                    if (_config.WallpaperEnabled && !_noWallpaperMode)
-                    {
-                        if (_wallpaperForm == null || _wallpaperForm.IsDisposed)
+                    ExecuteExplorerRestartRecovery(
+                        hadAttachment: hadAttachment,
+                        isHostAlive: () => _wallpaperBridge.IsAttachedHostAlive(),
+                        detachHost: () => _wallpaperBridge.Detach(oldForm),
+                        disposeOldForm: () =>
                         {
-                            _wallpaperForm = new WallpaperHostForm(_activeTheme, _config.TargetFps);
-                        }
+                            if (oldForm != null && !oldForm.IsDisposed)
+                            {
+                                oldForm.StopRendering();
+                                oldForm.Dispose();
+                            }
+                            _wallpaperForm = null;
+                        },
+                        resetAfterDestroyedHost: () => _wallpaperBridge.ResetAfterDestroyedHost(),
+                        markOldFormDetached: () =>
+                        {
+                            if (oldForm != null && !oldForm.IsDisposed)
+                            {
+                                oldForm.IsAttached = false;
+                            }
+                        },
+                        shouldAttachReplacement: _config.WallpaperEnabled && !_noWallpaperMode,
+                        createAndAttachReplacement: () =>
+                        {
+                            if (_wallpaperForm == null || _wallpaperForm.IsDisposed)
+                            {
+                                _wallpaperForm = new WallpaperHostForm(_activeTheme, _config.TargetFps);
+                            }
 
-                        SyncUiOnDispatcher();
+                            SyncUiOnDispatcher();
+                            _wallpaperForm.RenderFrameNow();
 
-                        _wallpaperBridge.AttachWallpaper(_wallpaperForm);
-                        _wallpaperForm.IsAttached = _wallpaperBridge.IsAttached;
-                    }
+                            _wallpaperBridge.AttachWallpaper(_wallpaperForm);
+                            _wallpaperForm.IsAttached = _wallpaperBridge.IsAttached;
+                        },
+                        logError: msg => Trace.WriteLine($"[KageDesk] {msg}"));
                 }));
             }
             catch { }
@@ -574,10 +642,9 @@ public class KageDeskRuntime : IDisposable
         {
             try
             {
-                _localBridge.DrainActiveRequestsAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+                _localBridge.StopAsync().GetAwaiter().GetResult();
             }
             catch { }
-            _localBridge.Dispose();
         }
 
         _wallpaperBridge.RestoreDesktopWallpaper();

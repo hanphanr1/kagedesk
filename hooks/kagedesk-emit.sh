@@ -16,11 +16,14 @@ fi
 # Locate token if not provided
 if [ -z "$TOKEN" ]; then
     if [ -n "${APPDATA:-}" ] && [ -f "$APPDATA/KageDesk/bridge.token" ]; then
-        TOKEN=$(sed '1s/^\xef\xbb\xbf//' "$APPDATA/KageDesk/bridge.token" | tr -d '\r\n')
+        TOKEN=$(tr -d '\r\n' < "$APPDATA/KageDesk/bridge.token")
     elif [ -f "$HOME/.config/kagedesk/bridge.token" ]; then
-        TOKEN=$(sed '1s/^\xef\xbb\xbf//' "$HOME/.config/kagedesk/bridge.token" | tr -d '\r\n')
+        TOKEN=$(tr -d '\r\n' < "$HOME/.config/kagedesk/bridge.token")
     fi
 fi
+
+# Strip UTF-8 BOM portably using pure Bash parameter expansion
+TOKEN="${TOKEN#$'\xef\xbb\xbf'}"
 
 # Construct JSON payload safely without unescaped interpolation
 if command -v jq >/dev/null 2>&1; then

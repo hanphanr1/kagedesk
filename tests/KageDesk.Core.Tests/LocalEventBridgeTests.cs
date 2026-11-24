@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -452,49 +453,62 @@ public class LocalEventBridgeTests
     {
         var port = GetAvailablePort();
         var aggregator = new HqStateAggregator();
+        TimeSpan readTimeout = TimeSpan.FromMilliseconds(350);
+        TimeSpan outerTimeout = TimeSpan.FromSeconds(3);
         await using var bridge = new LocalEventBridge(
             aggregator,
             port,
-            requestReadTimeout: TimeSpan.FromMilliseconds(350));
+            requestReadTimeout: readTimeout);
         bridge.Start();
 
         using var tcpClient = new TcpClient();
         await tcpClient.ConnectAsync(IPAddress.Loopback, port);
         var stream = tcpClient.GetStream();
 
-        // Send headers announcing 500 bytes of body, but never send body
-        string headers = $"POST /api/event HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 500\r\nContent-Type: application/json\r\n\r\n";
-        byte[] headerBytes = Encoding.UTF8.GetBytes(headers);
-        await stream.WriteAsync(headerBytes, 0, headerBytes.Length);
+        // Send headers announcing 500 bytes of body plus partial body, then stall
+        string partialRequest = $"POST /api/event HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 500\r\nContent-Type: application/json\r\n\r\n{{\"agentId\":\"stalled\"";
+        byte[] requestBytes = Encoding.UTF8.GetBytes(partialRequest);
+        var sw = Stopwatch.StartNew();
+        await stream.WriteAsync(requestBytes, 0, requestBytes.Length);
         await stream.FlushAsync();
 
-        // Read until socket closes / aborts
+        // Read from raw TCP stream; server must abort (clean EOF or reset) without sending HTTP response bytes
         byte[] readBuffer = new byte[1024];
-        using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        using var readCts = new CancellationTokenSource(outerTimeout);
         bool aborted = false;
 
         try
         {
-            while (true)
+            int bytesRead = await stream.ReadAsync(readBuffer, 0, readBuffer.Length, readCts.Token);
+            sw.Stop();
+            if (bytesRead > 0)
             {
-                int read = await stream.ReadAsync(readBuffer, 0, readBuffer.Length, readCts.Token);
-                if (read == 0)
-                {
-                    aborted = true; // Connection closed by server
-                    break;
-                }
+                string preview = Encoding.UTF8.GetString(readBuffer, 0, bytesRead);
+                Assert.Fail($"Server sent {bytesRead} HTTP response byte(s) instead of aborting stalled request: {preview}");
             }
+
+            aborted = true; // Clean EOF after server abort
         }
         catch (OperationCanceledException) when (readCts.IsCancellationRequested)
         {
-            Assert.Fail("Server did not abort stalled request within deadline");
+            sw.Stop();
+            Assert.Fail($"Server did not abort stalled request within outer deadline ({outerTimeout.TotalMilliseconds:F0}ms)");
         }
-        catch (Exception)
+        catch (IOException)
         {
-            aborted = true; // Socket reset or aborted by server
+            sw.Stop();
+            aborted = true; // Connection reset by server abort
+        }
+        catch (SocketException)
+        {
+            sw.Stop();
+            aborted = true; // Connection reset by server abort
         }
 
         Assert.True(aborted, "Stalled request was not aborted by server within read timeout");
+        Assert.True(
+            sw.Elapsed >= TimeSpan.FromMilliseconds(150) && sw.Elapsed < outerTimeout,
+            $"Expected server abort inside [150ms, {outerTimeout.TotalMilliseconds:F0}ms), actual elapsed: {sw.Elapsed.TotalMilliseconds:F1}ms");
     }
 
     [Fact]

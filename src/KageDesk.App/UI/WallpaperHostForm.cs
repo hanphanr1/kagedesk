@@ -122,6 +122,17 @@ public class WallpaperHostForm : Form
         _currentTheme = theme ?? _currentTheme;
     }
 
+    internal ReadOnlySpan<int> CurrentFramePixels => _buffer.ReadOnlyPixels;
+
+    public void RenderFrameNow()
+    {
+        if (_disposed) return;
+
+        float timeSeconds = (float)_stopwatch.Elapsed.TotalSeconds;
+        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds);
+        Invalidate();
+    }
+
     public void SetTargetFps(int targetFps)
     {
         int fps = Math.Clamp(targetFps, 5, 30);

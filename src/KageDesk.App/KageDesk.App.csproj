@@ -15,6 +15,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="KageDesk.App.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\KageDesk.Core\KageDesk.Core.csproj" />
     <ProjectReference Include="..\KageDesk.Rendering\KageDesk.Rendering.csproj" />
   </ItemGroup>

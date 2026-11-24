@@ -20,14 +20,21 @@ public class Win32WallpaperBridge
     private nint? _savedStyle;
     private nint? _savedExStyle;
     private bool _isAttached;
+    private bool _lastRollbackVerified;
     private DesktopTopology _currentTopology = DesktopTopology.None;
     private string _statusReason = "Not attached";
 
     public bool IsAttached => _isAttached;
+    public bool LastRollbackVerified => _lastRollbackVerified;
     public IntPtr TargetHwnd => _hostHwnd;
     public IntPtr AttachedHwnd => _attachedHwnd;
     public DesktopTopology CurrentTopology => _currentTopology;
     public string StatusReason => _statusReason;
+
+    public bool IsAttachedHostAlive()
+    {
+        return _attachedHwnd != IntPtr.Zero && Win32Interop.IsWindow(_attachedHwnd);
+    }
 
     public bool AttachWallpaper(Form form)
     {
@@ -41,8 +48,8 @@ public class Win32WallpaperBridge
             return false;
         }
 
-        // Capture original parent and styles with exact nint? preservation
-        _originalParent = Win32Interop.GetParent(formHandle);
+        // Capture original parent (via owner-insensitive GetAncestor) and styles with exact nint? preservation
+        _originalParent = Win32Interop.GetAncestor(formHandle, Win32Interop.GA_PARENT);
 
         Marshal.SetLastPInvokeError(0);
         nint style = Win32Interop.GetWindowLongPtr(formHandle, Win32Interop.GWL_STYLE);
@@ -184,7 +191,7 @@ public class Win32WallpaperBridge
         }
 
         Win32Interop.SetParent(formHandle, targetWorkerW);
-        IntPtr actualParent = Win32Interop.GetParent(formHandle);
+        IntPtr actualParent = Win32Interop.GetAncestor(formHandle, Win32Interop.GA_PARENT);
         if (actualParent != targetWorkerW)
         {
             _statusReason = "SetParent to WorkerW failed verification";
@@ -248,7 +255,7 @@ public class Win32WallpaperBridge
         }
 
         Win32Interop.SetParent(formHandle, progman);
-        IntPtr actualParent = Win32Interop.GetParent(formHandle);
+        IntPtr actualParent = Win32Interop.GetAncestor(formHandle, Win32Interop.GA_PARENT);
         if (actualParent != progman)
         {
             _statusReason = "SetParent to Progman failed verification in Raised-Desktop";
@@ -286,8 +293,61 @@ public class Win32WallpaperBridge
         return true;
     }
 
-    private void RollbackAttach(Form attemptedForm, IntPtr formHandle)
+    internal static IntPtr ResolveSetParentTarget(IntPtr originalParent)
     {
+        IntPtr desktop = Win32Interop.GetDesktopWindow();
+        return (originalParent == IntPtr.Zero || originalParent == desktop) ? IntPtr.Zero : originalParent;
+    }
+
+    internal static IntPtr ResolveExpectedParent(IntPtr originalParent)
+    {
+        return originalParent == IntPtr.Zero ? Win32Interop.GetDesktopWindow() : originalParent;
+    }
+
+    internal static bool VerifyRestoredWindowState(
+        IntPtr formHandle,
+        IntPtr expectedParent,
+        nint? expectedStyle,
+        nint? expectedExStyle)
+    {
+        if (formHandle == IntPtr.Zero || !Win32Interop.IsWindow(formHandle))
+        {
+            return false;
+        }
+
+        if (!expectedStyle.HasValue || !expectedExStyle.HasValue)
+        {
+            return false;
+        }
+
+        IntPtr actualParent = Win32Interop.GetAncestor(formHandle, Win32Interop.GA_PARENT);
+        if (actualParent != expectedParent)
+        {
+            return false;
+        }
+
+        Marshal.SetLastPInvokeError(0);
+        nint actualStyle = Win32Interop.GetWindowLongPtr(formHandle, Win32Interop.GWL_STYLE);
+        int errStyle = Marshal.GetLastWin32Error();
+        if ((actualStyle == 0 && errStyle != 0) || actualStyle != expectedStyle.Value)
+        {
+            return false;
+        }
+
+        Marshal.SetLastPInvokeError(0);
+        nint actualExStyle = Win32Interop.GetWindowLongPtr(formHandle, Win32Interop.GWL_EXSTYLE);
+        int errExStyle = Marshal.GetLastWin32Error();
+        if ((actualExStyle == 0 && errExStyle != 0) || actualExStyle != expectedExStyle.Value)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    internal bool RollbackAttach(Form? attemptedForm, IntPtr formHandle)
+    {
+        bool restoreOk = false;
         try
         {
             if (attemptedForm is WallpaperHostForm hostForm)
@@ -297,7 +357,12 @@ public class Win32WallpaperBridge
 
             if (formHandle != IntPtr.Zero && Win32Interop.IsWindow(formHandle))
             {
-                bool restoreOk = true;
+                restoreOk = true;
+                Win32Interop.ShowWindow(formHandle, 0 /* SW_HIDE */);
+
+                IntPtr setParentTarget = ResolveSetParentTarget(_originalParent);
+                IntPtr expectedParent = ResolveExpectedParent(_originalParent);
+                Win32Interop.SetParent(formHandle, setParentTarget);
 
                 if (_savedStyle.HasValue)
                 {
@@ -306,6 +371,11 @@ public class Win32WallpaperBridge
                         restoreOk = false;
                     }
                 }
+                else
+                {
+                    restoreOk = false;
+                }
+
                 if (_savedExStyle.HasValue)
                 {
                     if (!TrySetWindowLong(formHandle, Win32Interop.GWL_EXSTYLE, new IntPtr(_savedExStyle.Value), out _))
@@ -313,15 +383,16 @@ public class Win32WallpaperBridge
                         restoreOk = false;
                     }
                 }
-
-                Win32Interop.SetParent(formHandle, _originalParent);
-                IntPtr currentParent = Win32Interop.GetParent(formHandle);
-                if (Win32Interop.IsWindow(formHandle) && currentParent != _originalParent)
+                else
                 {
                     restoreOk = false;
                 }
 
-                Win32Interop.ShowWindow(formHandle, 0 /* SW_HIDE */);
+                // Verify restored parent via GetAncestor(GA_PARENT) AND read back both GWL_STYLE & GWL_EXSTYLE
+                if (restoreOk && !VerifyRestoredWindowState(formHandle, expectedParent, _savedStyle, _savedExStyle))
+                {
+                    restoreOk = false;
+                }
 
                 if (!restoreOk)
                 {
@@ -331,10 +402,12 @@ public class Win32WallpaperBridge
         }
         catch (Exception ex)
         {
+            restoreOk = false;
             _statusReason = $"Attach rollback error: {ex.Message}";
         }
         finally
         {
+            _lastRollbackVerified = restoreOk;
             _attachedHwnd = IntPtr.Zero;
             _hostHwnd = IntPtr.Zero;
             _attachedForm = null;
@@ -344,6 +417,17 @@ public class Win32WallpaperBridge
             _savedExStyle = null;
             _originalParent = IntPtr.Zero;
         }
+
+        return restoreOk;
+    }
+
+    internal void SeedSavedStateForTest(IntPtr attachedHwnd, IntPtr originalParent, nint? savedStyle, nint? savedExStyle, bool isAttached = false)
+    {
+        _attachedHwnd = attachedHwnd;
+        _originalParent = originalParent;
+        _savedStyle = savedStyle;
+        _savedExStyle = savedExStyle;
+        _isAttached = isAttached;
     }
 
     public bool ResetAfterDestroyedHost()
@@ -406,9 +490,10 @@ public class Win32WallpaperBridge
                     TrySetWindowLong(hwnd, Win32Interop.GWL_EXSTYLE, new IntPtr(_savedExStyle.Value), out _);
                 }
 
-                Win32Interop.SetParent(hwnd, _originalParent);
-                IntPtr currentParent = Win32Interop.GetParent(hwnd);
-                if (currentParent != _originalParent && Win32Interop.IsWindow(hwnd))
+                Win32Interop.SetParent(hwnd, ResolveSetParentTarget(_originalParent));
+                IntPtr expectedParent = ResolveExpectedParent(_originalParent);
+                IntPtr currentParent = Win32Interop.GetAncestor(hwnd, Win32Interop.GA_PARENT);
+                if (currentParent != expectedParent && Win32Interop.IsWindow(hwnd))
                 {
                     detached = false;
                 }
