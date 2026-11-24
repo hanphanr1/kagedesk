@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File ${CLAUDE_PROJECT_DIR}/hooks/kagedesk-emit.ps1 -Type tool_start -AgentId claude -Message \"Tool execution started\""
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/hooks/kagedesk-emit.ps1\" -Type tool_start -AgentId claude -Message \"Tool execution started\""
           }
         ]
       }
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File ${CLAUDE_PROJECT_DIR}/hooks/kagedesk-emit.ps1 -Type tool_done -AgentId claude -Message \"Tool execution completed\""
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/hooks/kagedesk-emit.ps1\" -Type tool_done -AgentId claude -Message \"Tool execution completed\""
           }
         ]
       }
@@ -25,7 +25,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File ${CLAUDE_PROJECT_DIR}/hooks/kagedesk-emit.ps1 -Type notification -AgentId claude -Message \"Notification received\""
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/hooks/kagedesk-emit.ps1\" -Type notification -AgentId claude -Message \"Notification received\""
           }
         ]
       }
@@ -35,7 +35,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File ${CLAUDE_PROJECT_DIR}/hooks/kagedesk-emit.ps1 -Type idle -AgentId claude -Message \"Agent stopped\""
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/hooks/kagedesk-emit.ps1\" -Type idle -AgentId claude -Message \"Agent stopped\""
           }
         ]
       }

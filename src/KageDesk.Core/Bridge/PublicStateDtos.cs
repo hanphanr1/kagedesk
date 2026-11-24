@@ -27,6 +27,15 @@ public record PublicVisualEventDto(
     DateTimeOffset Timestamp
 );
 
+public record PublicAccountDto(
+    string Provider,
+    string AccountId,
+    string? Label,
+    bool IsActive,
+    double? QuotaPercent = null,
+    DateTimeOffset? QuotaResetAt = null
+);
+
 public record PublicBuildDto(
     string Id,
     string Repo,
@@ -40,11 +49,15 @@ public record PublicBuildDto(
 
 public record PublicHqStateDto(
     IReadOnlyList<PublicAgentDto> Agents,
-    IReadOnlyList<AccountInfo> Accounts,
+    IReadOnlyList<PublicAccountDto> Accounts,
     IReadOnlyList<PublicBuildDto> Builds,
     EffectiveWeather Weather,
     HqMood Mood,
     IReadOnlyList<PublicVisualEventDto> PendingVisualEvents,
     string? DemoScenario,
     DateTimeOffset Timestamp
-);
+)
+{
+    [JsonIgnore]
+    public IReadOnlyList<PublicBuildDto> RecentBuilds => Builds;
+}

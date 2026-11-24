@@ -156,4 +156,51 @@ public class SafeProcessRunnerAndTokenTests
             if (File.Exists(tempPath)) File.Delete(tempPath);
         }
     }
+
+    [Fact]
+    public void BridgeTokenStore_WritesBomFreeUtf8()
+    {
+        string tempPath = Path.Combine(Path.GetTempPath(), $"kagedesk_nobom_{Guid.NewGuid():N}.token");
+        try
+        {
+            string token = BridgeTokenStore.GetOrCreateToken(tempPath);
+            byte[] bytes = File.ReadAllBytes(tempPath);
+
+            Assert.Equal(64, bytes.Length);
+            // Assert written bytes do NOT start with UTF-8 BOM (0xEF, 0xBB, 0xBF)
+            Assert.False(bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF,
+                "Token file must not contain a UTF-8 BOM");
+            Assert.Equal(token, System.Text.Encoding.UTF8.GetString(bytes));
+        }
+        finally
+        {
+            if (File.Exists(tempPath)) File.Delete(tempPath);
+        }
+    }
+
+    [Fact]
+    public void BridgeTokenStore_ReadsLegacyBomPrefixedToken_Successfully()
+    {
+        string tempPath = Path.Combine(Path.GetTempPath(), $"kagedesk_bomlegacy_{Guid.NewGuid():N}.token");
+        try
+        {
+            string rawToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+            // Write legacy BOM + token + \r\n
+            byte[] bom = new byte[] { 0xEF, 0xBB, 0xBF };
+            byte[] tokenBytes = System.Text.Encoding.UTF8.GetBytes(rawToken + "\r\n");
+            byte[] fullBytes = bom.Concat(tokenBytes).ToArray();
+
+            // Create file with strict ACL
+            BridgeTokenStore.CreateTokenFileWithStrictAcl(tempPath, rawToken);
+            // Overwrite content with BOM-prefixed content while keeping ACL
+            File.WriteAllBytes(tempPath, fullBytes);
+
+            string readToken = BridgeTokenStore.GetOrCreateToken(tempPath);
+            Assert.Equal(rawToken, readToken);
+        }
+        finally
+        {
+            if (File.Exists(tempPath)) File.Delete(tempPath);
+        }
+    }
 }

@@ -153,5 +153,41 @@ public class LayeredDibSurfaceAndPetFormTests
         Assert.False(dispatcher.ShowInTaskbar);
         Assert.NotEqual(IntPtr.Zero, dispatcher.Handle);
     }
+
+    [Fact]
+    public void Win32WallpaperBridge_ResetAfterDestroyedHost_ClearsAttachmentState()
+    {
+        var bridge = new Win32WallpaperBridge();
+        // Initially not attached
+        Assert.False(bridge.IsAttached);
+        Assert.Equal(IntPtr.Zero, bridge.AttachedHwnd);
+        Assert.Equal(DesktopTopology.None, bridge.CurrentTopology);
+
+        // ResetAfterDestroyedHost when handle is zero or dead succeeds and clears state
+        bool resetOk = bridge.ResetAfterDestroyedHost();
+        Assert.True(resetOk);
+        Assert.False(bridge.IsAttached);
+        Assert.Equal(IntPtr.Zero, bridge.AttachedHwnd);
+        Assert.Equal(IntPtr.Zero, bridge.TargetHwnd);
+        Assert.Equal(DesktopTopology.None, bridge.CurrentTopology);
+    }
+
+    [Fact]
+    public void PetOverlayForm_SetScale_PreservesLiveScale_WhenSurfaceResized()
+    {
+        var theme = ThemePackLoader.BuiltInFallback;
+        using var form = new PetOverlayForm(theme, initialScale: 1);
+        Assert.Equal(1, form.PetScale);
+
+        // Resize to 2
+        bool ok = form.SetScale(2);
+        Assert.True(ok);
+        Assert.Equal(2, form.PetScale);
+
+        // Resize back to 1
+        bool ok2 = form.SetScale(1);
+        Assert.True(ok2);
+        Assert.Equal(1, form.PetScale);
+    }
 }
 

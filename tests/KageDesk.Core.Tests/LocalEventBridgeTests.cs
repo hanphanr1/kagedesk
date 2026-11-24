@@ -452,10 +452,10 @@ public class LocalEventBridgeTests
     {
         var port = GetAvailablePort();
         var aggregator = new HqStateAggregator();
-        await using var bridge = new LocalEventBridge(aggregator, port)
-        {
-            RequestReadTimeout = TimeSpan.FromMilliseconds(250)
-        };
+        await using var bridge = new LocalEventBridge(
+            aggregator,
+            port,
+            requestReadTimeout: TimeSpan.FromMilliseconds(350));
         bridge.Start();
 
         using var tcpClient = new TcpClient();
@@ -470,12 +470,12 @@ public class LocalEventBridgeTests
 
         // Read until socket closes / aborts
         byte[] readBuffer = new byte[1024];
-        using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
         bool aborted = false;
 
         try
         {
-            while (!readCts.IsCancellationRequested)
+            while (true)
             {
                 int read = await stream.ReadAsync(readBuffer, 0, readBuffer.Length, readCts.Token);
                 if (read == 0)
@@ -485,9 +485,13 @@ public class LocalEventBridgeTests
                 }
             }
         }
+        catch (OperationCanceledException) when (readCts.IsCancellationRequested)
+        {
+            Assert.Fail("Server did not abort stalled request within deadline");
+        }
         catch (Exception)
         {
-            aborted = true; // Socket reset or aborted
+            aborted = true; // Socket reset or aborted by server
         }
 
         Assert.True(aborted, "Stalled request was not aborted by server within read timeout");

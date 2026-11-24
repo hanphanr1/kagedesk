@@ -16,9 +16,9 @@ fi
 # Locate token if not provided
 if [ -z "$TOKEN" ]; then
     if [ -n "${APPDATA:-}" ] && [ -f "$APPDATA/KageDesk/bridge.token" ]; then
-        TOKEN=$(tr -d '\r\n' < "$APPDATA/KageDesk/bridge.token")
+        TOKEN=$(sed '1s/^\xef\xbb\xbf//' "$APPDATA/KageDesk/bridge.token" | tr -d '\r\n')
     elif [ -f "$HOME/.config/kagedesk/bridge.token" ]; then
-        TOKEN=$(tr -d '\r\n' < "$HOME/.config/kagedesk/bridge.token")
+        TOKEN=$(sed '1s/^\xef\xbb\xbf//' "$HOME/.config/kagedesk/bridge.token" | tr -d '\r\n')
     fi
 fi
 

@@ -23,7 +23,10 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
     private readonly DateTimeOffset _startedAt;
     private readonly CancellationTokenSource _cts = new();
     private readonly SemaphoreSlim _concurrencySemaphore = new(16, 16);
-    private readonly ConcurrentDictionary<Task, byte> _activeRequests = new();
+    private readonly ConcurrentDictionary<Task, byte> _inFlightTasks = new();
+    private readonly ConcurrentDictionary<HttpListenerContext, byte> _activeContexts = new();
+    private readonly object _shutdownLock = new();
+    private Task? _shutdownTask;
 
     private Task? _listenTask;
     private volatile bool _stopping;
@@ -47,13 +50,18 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
         int port = DefaultPort,
         AppConfig? config = null,
         string? requiredToken = null,
-        Func<string>? getActiveThemeId = null)
+        Func<string>? getActiveThemeId = null,
+        TimeSpan? requestReadTimeout = null)
     {
         _aggregator = aggregator ?? throw new ArgumentNullException(nameof(aggregator));
         _config = config ?? new AppConfig();
         _requiredToken = requiredToken;
         _getActiveThemeId = getActiveThemeId;
         Port = port;
+        if (requestReadTimeout.HasValue)
+        {
+            RequestReadTimeout = requestReadTimeout.Value;
+        }
         _startedAt = DateTimeOffset.UtcNow;
 
         _listener = new HttpListener();
@@ -81,14 +89,14 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
                 if (!_concurrencySemaphore.Wait(0))
                 {
                     var saturatedTask = RespondSaturated503Async(context);
-                    _activeRequests.TryAdd(saturatedTask, 0);
-                    _ = saturatedTask.ContinueWith(t => _activeRequests.TryRemove(t, out _));
+                    _inFlightTasks.TryAdd(saturatedTask, 0);
+                    _ = saturatedTask.ContinueWith(t => _inFlightTasks.TryRemove(t, out _), TaskScheduler.Default);
                     continue;
                 }
 
                 var requestTask = ProcessTrackedRequestAsync(context);
-                _activeRequests.TryAdd(requestTask, 0);
-                _ = requestTask.ContinueWith(t => _activeRequests.TryRemove(t, out _));
+                _inFlightTasks.TryAdd(requestTask, 0);
+                _ = requestTask.ContinueWith(t => _inFlightTasks.TryRemove(t, out _), TaskScheduler.Default);
             }
             catch (HttpListenerException) when (_cts.IsCancellationRequested || _stopping || !_listener.IsListening)
             {
@@ -116,13 +124,20 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
 
     private async Task ProcessTrackedRequestAsync(HttpListenerContext context)
     {
+        _activeContexts.TryAdd(context, 0);
         try
         {
             await HandleRequestSafeAsync(context).ConfigureAwait(false);
         }
         finally
         {
-            _concurrencySemaphore.Release();
+            _activeContexts.TryRemove(context, out _);
+            try
+            {
+                _concurrencySemaphore.Release();
+            }
+            catch (ObjectDisposedException) { }
+            catch (SemaphoreFullException) { }
         }
     }
 
@@ -223,24 +238,29 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
                 ));
             }
 
-            var publicBuilds = new List<PublicBuildDto>(state.Builds.Count);
-            foreach (var b in state.Builds)
-            {
-                publicBuilds.Add(new PublicBuildDto(
-                    Id: b.Id,
-                    Repo: b.Repo,
-                    WorkflowName: b.WorkflowName,
-                    Branch: b.Branch,
-                    Status: b.Status,
-                    Conclusion: b.Conclusion,
-                    CreatedAt: b.CreatedAt,
-                    UpdatedAt: b.UpdatedAt
-                ));
-            }
+            var publicAccounts = state.Accounts.Select(a => new PublicAccountDto(
+                Provider: a.Provider,
+                AccountId: a.AccountId,
+                Label: a.Label,
+                IsActive: a.IsActive,
+                QuotaPercent: a.QuotaPercent,
+                QuotaResetAt: a.QuotaResetAt
+            )).ToList();
+
+            var publicBuilds = state.Builds.Select(b => new PublicBuildDto(
+                Id: b.Id,
+                Repo: b.Repo,
+                WorkflowName: b.WorkflowName,
+                Branch: b.Branch,
+                Status: b.Status,
+                Conclusion: b.Conclusion,
+                CreatedAt: b.CreatedAt,
+                UpdatedAt: b.UpdatedAt
+            )).ToList();
 
             var publicState = new PublicHqStateDto(
                 Agents: publicAgents,
-                Accounts: state.Accounts,
+                Accounts: publicAccounts,
                 Builds: publicBuilds,
                 Weather: state.Weather,
                 Mood: state.Mood,
@@ -394,7 +414,52 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
 
     public async Task DrainActiveRequestsAsync(TimeSpan timeout)
     {
-        var tasks = _activeRequests.Keys.ToArray();
+        var tasks = _inFlightTasks.Keys.ToArray();
+        if (tasks.Length > 0)
+        {
+            try
+            {
+                var whenAll = Task.WhenAll(tasks);
+                var delay = Task.Delay(timeout);
+                await Task.WhenAny(whenAll, delay).ConfigureAwait(false);
+            }
+            catch { }
+        }
+    }
+
+    private Task ShutdownCoreAsync(TimeSpan timeout)
+    {
+        lock (_shutdownLock)
+        {
+            if (_shutdownTask != null)
+                return _shutdownTask;
+
+            _shutdownTask = PerformShutdownAsync(timeout);
+            return _shutdownTask;
+        }
+    }
+
+    private async Task PerformShutdownAsync(TimeSpan timeout)
+    {
+        _stopping = true;
+        _cts.Cancel();
+
+        // 1. Stop listener so no new requests admitted
+        try
+        {
+            if (_listener.IsListening)
+                _listener.Stop();
+        }
+        catch { }
+
+        // 2. Await accept loop task completion
+        if (_listenTask != null)
+        {
+            try { await _listenTask.ConfigureAwait(false); } catch { }
+        }
+
+        // 3. Snapshot and wait up to bounded timeout for in-flight tasks
+        var tasks = _inFlightTasks.Keys.ToArray();
         if (tasks.Length > 0)
         {
             try
@@ -404,79 +469,44 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
                 var finished = await Task.WhenAny(whenAll, delay).ConfigureAwait(false);
                 if (finished != whenAll)
                 {
-                    // If timeout elapsed, in-flight tasks continue to finish or cancel
+                    // If still running after timeout, call Response.Abort() on active contexts
+                    foreach (var ctx in _activeContexts.Keys)
+                    {
+                        try { ctx.Response.Abort(); } catch { }
+                    }
+                    // Await completion of ALL tracked tasks BEFORE disposing concurrency gate
+                    try { await whenAll.ConfigureAwait(false); } catch { }
                 }
             }
             catch { }
         }
-    }
 
-    public async Task StopAsync(TimeSpan timeout = default)
-    {
-        if (_disposed) return;
-        _stopping = true;
-        _cts.Cancel();
-
-        // 1. Stop listener first so no new connections admitted
-        try
-        {
-            if (_listener.IsListening)
-                _listener.Stop();
-        }
-        catch { }
-
-        // 2. Wait for accept loop task to finish
-        if (_listenTask != null)
-        {
-            try { await _listenTask.ConfigureAwait(false); } catch { }
-        }
-
-        // 3. Snapshot and drain in-flight tasks with bounded timeout
-        TimeSpan drainTimeout = timeout > TimeSpan.Zero ? timeout : TimeSpan.FromSeconds(2);
-        await DrainActiveRequestsAsync(drainTimeout).ConfigureAwait(false);
-
-        // 4. Dispose concurrency gate only after all admitted handlers exited
+        // 4. Safely close listener and dispose gate only after all admitted handlers exited
         try { _listener.Close(); } catch { }
         _concurrencySemaphore.Dispose();
         _cts.Dispose();
         _disposed = true;
+    }
+
+    public Task StopAsync(TimeSpan timeout = default)
+    {
+        TimeSpan drainTimeout = timeout > TimeSpan.Zero ? timeout : TimeSpan.FromSeconds(2);
+        return ShutdownCoreAsync(drainTimeout);
     }
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _stopping = true;
-        _cts.Cancel();
-
         try
         {
-            if (_listener.IsListening)
-                _listener.Stop();
+            ShutdownCoreAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
         }
         catch { }
-
-        if (_listenTask != null)
-        {
-            try { _listenTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
-        }
-
-        var tasks = _activeRequests.Keys.ToArray();
-        if (tasks.Length > 0)
-        {
-            try { Task.WaitAll(tasks, TimeSpan.FromSeconds(2)); } catch { }
-        }
-
-        try { _listener.Close(); } catch { }
-        _concurrencySemaphore.Dispose();
-        _cts.Dispose();
-        _disposed = true;
         GC.SuppressFinalize(this);
     }
 
     public async ValueTask DisposeAsync()
     {
-        if (_disposed) return;
-        await StopAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+        await ShutdownCoreAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
         GC.SuppressFinalize(this);
     }
 }

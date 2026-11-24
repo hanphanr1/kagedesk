@@ -38,11 +38,11 @@ public class KageDeskRuntime : IDisposable
     private bool _disposed;
     private readonly bool _noWallpaperMode;
 
+    private readonly object _syncLock = new();
+    private int _uiSyncScheduled;
     private long _uiVersion;
-    private long _lastAppliedUiVersion;
     private UiSnapshot? _latestSnapshot;
 
-    private long _ciCollectorGen;
     private long _processCollectorGen;
 
     public record UiSnapshot(
@@ -115,6 +115,9 @@ public class KageDeskRuntime : IDisposable
     {
         _occlusionMonitor.Start();
 
+        // Synchronous initial UI sync BEFORE presentation
+        SyncUiOnDispatcher();
+
         // Start Pet Overlay
         if (_petForm != null && _config.PetOverlayEnabled)
         {
@@ -127,9 +130,6 @@ public class KageDeskRuntime : IDisposable
             _wallpaperBridge.AttachWallpaper(_wallpaperForm);
             _wallpaperForm.IsAttached = _wallpaperBridge.IsAttached;
         }
-
-        // Post initial state snapshot
-        PostRenderPacket();
 
         // Start adaptive polling loop
         _pollingLoopTask = Task.Run(PollingLoopAsync);
@@ -246,12 +246,12 @@ public class KageDeskRuntime : IDisposable
             OnAutoPauseToggled = enabled =>
             {
                 UpdateConfig(c => c.AutoPauseWallpaperWhenCovered = enabled);
-                PostRenderPacket();
+                RequestUiSync();
             },
             OnGameDndToggled = enabled =>
             {
                 UpdateConfig(c => c.HidePetsInFullscreenGame = enabled);
-                PostRenderPacket();
+                RequestUiSync();
             },
             OnProcessAgentCollectorToggled = enabled =>
             {
@@ -276,7 +276,6 @@ public class KageDeskRuntime : IDisposable
             },
             OnGitHubCiCollectorToggled = enabled =>
             {
-                Interlocked.Increment(ref _ciCollectorGen);
                 UpdateConfig(c => c.EnableGitHubCiCollector = enabled);
                 if (enabled)
                 {
@@ -292,7 +291,7 @@ public class KageDeskRuntime : IDisposable
                 else
                 {
                     if (_gitHubCollector != null) _gitHubCollector.Enabled = false;
-                    _aggregator.ClearCiBuildEntries();
+                    _aggregator.DisableAndClearCiBuilds();
                 }
             },
             OnDemoTrigger = scenario => _aggregator.SetDemoScenario(scenario)
@@ -315,10 +314,19 @@ public class KageDeskRuntime : IDisposable
                 _dispatcherForm.BeginInvoke(new Action(() =>
                 {
                     if (_stopping || _disposed) return;
-                    _wallpaperBridge.RestoreDesktopWallpaper();
-                    if (_wallpaperForm != null)
+
+                    var oldForm = _wallpaperForm;
+                    bool detached = _wallpaperBridge.Detach(oldForm);
+                    if (!detached && oldForm != null)
                     {
-                        _wallpaperForm.IsAttached = false;
+                        oldForm.StopRendering();
+                        oldForm.Dispose();
+                        _wallpaperBridge.ResetAfterDestroyedHost();
+                        _wallpaperForm = null;
+                    }
+                    else if (oldForm != null)
+                    {
+                        oldForm.IsAttached = false;
                     }
 
                     if (_config.WallpaperEnabled && !_noWallpaperMode)
@@ -327,6 +335,8 @@ public class KageDeskRuntime : IDisposable
                         {
                             _wallpaperForm = new WallpaperHostForm(_activeTheme, _config.TargetFps);
                         }
+
+                        SyncUiOnDispatcher();
 
                         _wallpaperBridge.AttachWallpaper(_wallpaperForm);
                         _wallpaperForm.IsAttached = _wallpaperBridge.IsAttached;
@@ -363,11 +373,11 @@ public class KageDeskRuntime : IDisposable
 
                 if (_gitHubCollector != null && _config.EnableGitHubCiCollector)
                 {
-                    long ciGen = Interlocked.Read(ref _ciCollectorGen);
-                    await _gitHubCollector.CollectOnceAsync(_cts.Token).ConfigureAwait(false);
-                    if (Interlocked.Read(ref _ciCollectorGen) != ciGen || !_config.EnableGitHubCiCollector)
+                    long ciGen = _aggregator.GetCiGeneration();
+                    await _gitHubCollector.CollectOnceAsync(ciGen, _cts.Token).ConfigureAwait(false);
+                    if (_aggregator.GetCiGeneration() != ciGen || !_config.EnableGitHubCiCollector)
                     {
-                        _aggregator.ClearCiBuildEntries();
+                        _aggregator.DisableAndClearCiBuilds();
                     }
                 }
             }
@@ -404,69 +414,89 @@ public class KageDeskRuntime : IDisposable
 
     private void OnHqStateChanged(object? sender, HqState state)
     {
-        PostRenderPacket();
+        RequestUiSync();
     }
 
     private void OnOcclusionStateChanged(object? sender, EventArgs e)
     {
-        PostRenderPacket();
+        RequestUiSync();
     }
 
-    public void PostRenderPacket()
+    public void RequestUiSync()
     {
         if (_stopping || _disposed) return;
 
-        bool sessionLocked = _occlusionMonitor.IsSessionLocked;
-        bool wpOccluded = _occlusionMonitor.IsWallpaperOccluded && _config.AutoPauseWallpaperWhenCovered;
-        bool gameDnd = _occlusionMonitor.IsFullscreenGame && _config.HidePetsInFullscreenGame;
-
-        bool wpPaused = sessionLocked || wpOccluded;
-        bool petPaused = sessionLocked || gameDnd;
-        bool petHidden = sessionLocked || gameDnd;
-
-        long ver = Interlocked.Increment(ref _uiVersion);
-        var snapshot = new UiSnapshot(ver, _aggregator.CurrentState, _activeTheme, wpPaused, petPaused, petHidden);
-        _latestSnapshot = snapshot;
-
-        if (_dispatcherForm.IsHandleCreated && !_stopping && !_disposed)
+        if (Interlocked.Exchange(ref _uiSyncScheduled, 1) == 0)
         {
-            try
+            if (_dispatcherForm.IsHandleCreated && !_stopping && !_disposed)
             {
-                _dispatcherForm.BeginInvoke(new Action(() =>
+                try
                 {
-                    if (_stopping || _disposed) return;
-
-                    var latest = _latestSnapshot;
-                    if (latest != null && latest.Version > _lastAppliedUiVersion)
-                    {
-                        _lastAppliedUiVersion = latest.Version;
-
-                        if (_wallpaperForm != null && !_wallpaperForm.IsDisposed)
-                        {
-                            _wallpaperForm.UpdateData(latest.State, latest.Theme);
-                            _wallpaperForm.IsPaused = latest.WallpaperPaused;
-                        }
-
-                        if (_petForm != null && !_petForm.IsDisposed)
-                        {
-                            _petForm.ApplyRenderState(
-                                latest.State,
-                                latest.Theme,
-                                latest.PetPaused,
-                                latest.PetHiddenByDndOrLock);
-                        }
-                    }
-                }));
+                    _dispatcherForm.BeginInvoke(new Action(SyncUiOnDispatcher));
+                }
+                catch
+                {
+                    Interlocked.Exchange(ref _uiSyncScheduled, 0);
+                }
             }
-            catch { }
+            else
+            {
+                Interlocked.Exchange(ref _uiSyncScheduled, 0);
+            }
+        }
+    }
+
+    public void PostRenderPacket() => RequestUiSync();
+
+    public void SyncUiOnDispatcher()
+    {
+        if (_stopping || _disposed) return;
+
+        Interlocked.Exchange(ref _uiSyncScheduled, 0);
+
+        HqState state;
+        ThemePack theme;
+        bool wpPaused;
+        bool petPaused;
+        bool petHidden;
+
+        lock (_syncLock)
+        {
+            bool sessionLocked = _occlusionMonitor.IsSessionLocked;
+            bool wpOccluded = _occlusionMonitor.IsWallpaperOccluded && _config.AutoPauseWallpaperWhenCovered;
+            bool gameDnd = _occlusionMonitor.IsFullscreenGame && _config.HidePetsInFullscreenGame;
+
+            wpPaused = sessionLocked || wpOccluded;
+            petPaused = sessionLocked || gameDnd;
+            petHidden = sessionLocked || gameDnd;
+
+            state = _aggregator.CurrentState;
+            theme = _activeTheme;
+
+            long ver = Interlocked.Increment(ref _uiVersion);
+            _latestSnapshot = new UiSnapshot(ver, state, theme, wpPaused, petPaused, petHidden);
+        }
+
+        if (_wallpaperForm != null && !_wallpaperForm.IsDisposed)
+        {
+            _wallpaperForm.UpdateData(state, theme);
+            _wallpaperForm.IsPaused = wpPaused;
+        }
+
+        if (_petForm != null && !_petForm.IsDisposed)
+        {
+            _petForm.ApplyRenderState(state, theme, petPaused, petHidden);
         }
     }
 
     public void SwitchTheme(string themeId)
     {
-        _activeTheme = FindActiveTheme(themeId);
+        lock (_syncLock)
+        {
+            _activeTheme = FindActiveTheme(themeId);
+        }
         UpdateConfig(c => c.ActiveThemeId = _activeTheme.Id);
-        PostRenderPacket();
+        RequestUiSync();
     }
 
     public void ReloadThemes()

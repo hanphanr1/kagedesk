@@ -164,7 +164,7 @@ public class Win32WallpaperBridge
         catch (Exception ex)
         {
             _statusReason = $"Attach error: {ex.Message}";
-            RollbackAttach(formHandle);
+            RollbackAttach(form, formHandle);
             return false;
         }
     }
@@ -179,7 +179,7 @@ public class Win32WallpaperBridge
         if (!TrySetWindowLong(formHandle, Win32Interop.GWL_STYLE, new IntPtr(newStyle), out _))
         {
             _statusReason = "Failed to apply WS_CHILD style in Classic topology";
-            RollbackAttach(formHandle);
+            RollbackAttach(form, formHandle);
             return false;
         }
 
@@ -188,7 +188,7 @@ public class Win32WallpaperBridge
         if (actualParent != targetWorkerW)
         {
             _statusReason = "SetParent to WorkerW failed verification";
-            RollbackAttach(formHandle);
+            RollbackAttach(form, formHandle);
             return false;
         }
 
@@ -208,7 +208,7 @@ public class Win32WallpaperBridge
         if (!posOk)
         {
             _statusReason = "SetWindowPos failed in Classic topology";
-            RollbackAttach(formHandle);
+            RollbackAttach(form, formHandle);
             return false;
         }
 
@@ -235,7 +235,7 @@ public class Win32WallpaperBridge
             !TrySetWindowLong(formHandle, Win32Interop.GWL_EXSTYLE, new IntPtr(newExStyle), out _))
         {
             _statusReason = "Failed to configure styles for Raised-Desktop topology";
-            RollbackAttach(formHandle);
+            RollbackAttach(form, formHandle);
             return false;
         }
 
@@ -243,7 +243,7 @@ public class Win32WallpaperBridge
         if (!Win32Interop.SetLayeredWindowAttributes(formHandle, 0, 255, Win32Interop.LWA_ALPHA))
         {
             _statusReason = "SetLayeredWindowAttributes failed in Raised-Desktop";
-            RollbackAttach(formHandle);
+            RollbackAttach(form, formHandle);
             return false;
         }
 
@@ -252,7 +252,7 @@ public class Win32WallpaperBridge
         if (actualParent != progman)
         {
             _statusReason = "SetParent to Progman failed verification in Raised-Desktop";
-            RollbackAttach(formHandle);
+            RollbackAttach(form, formHandle);
             return false;
         }
 
@@ -273,7 +273,7 @@ public class Win32WallpaperBridge
         if (!posOk)
         {
             _statusReason = "SetWindowPos below SHELLDLL_DefView failed";
-            RollbackAttach(formHandle);
+            RollbackAttach(form, formHandle);
             return false;
         }
 
@@ -286,30 +286,53 @@ public class Win32WallpaperBridge
         return true;
     }
 
-    private void RollbackAttach(IntPtr formHandle)
+    private void RollbackAttach(Form attemptedForm, IntPtr formHandle)
     {
         try
         {
-            if (_attachedForm is WallpaperHostForm hostForm)
+            if (attemptedForm is WallpaperHostForm hostForm)
             {
                 hostForm.StopRendering();
             }
 
             if (formHandle != IntPtr.Zero && Win32Interop.IsWindow(formHandle))
             {
+                bool restoreOk = true;
+
                 if (_savedStyle.HasValue)
                 {
-                    TrySetWindowLong(formHandle, Win32Interop.GWL_STYLE, new IntPtr(_savedStyle.Value), out _);
+                    if (!TrySetWindowLong(formHandle, Win32Interop.GWL_STYLE, new IntPtr(_savedStyle.Value), out _))
+                    {
+                        restoreOk = false;
+                    }
                 }
                 if (_savedExStyle.HasValue)
                 {
-                    TrySetWindowLong(formHandle, Win32Interop.GWL_EXSTYLE, new IntPtr(_savedExStyle.Value), out _);
+                    if (!TrySetWindowLong(formHandle, Win32Interop.GWL_EXSTYLE, new IntPtr(_savedExStyle.Value), out _))
+                    {
+                        restoreOk = false;
+                    }
                 }
+
                 Win32Interop.SetParent(formHandle, _originalParent);
+                IntPtr currentParent = Win32Interop.GetParent(formHandle);
+                if (Win32Interop.IsWindow(formHandle) && currentParent != _originalParent)
+                {
+                    restoreOk = false;
+                }
+
                 Win32Interop.ShowWindow(formHandle, 0 /* SW_HIDE */);
+
+                if (!restoreOk)
+                {
+                    _statusReason = "Attach rollback verification failed: unable to restore styles or parent";
+                }
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            _statusReason = $"Attach rollback error: {ex.Message}";
+        }
         finally
         {
             _attachedHwnd = IntPtr.Zero;
@@ -321,6 +344,25 @@ public class Win32WallpaperBridge
             _savedExStyle = null;
             _originalParent = IntPtr.Zero;
         }
+    }
+
+    public bool ResetAfterDestroyedHost()
+    {
+        if (_attachedHwnd != IntPtr.Zero && Win32Interop.IsWindow(_attachedHwnd))
+        {
+            return false;
+        }
+
+        _isAttached = false;
+        _attachedHwnd = IntPtr.Zero;
+        _hostHwnd = IntPtr.Zero;
+        _attachedForm = null;
+        _currentTopology = DesktopTopology.None;
+        _savedStyle = null;
+        _savedExStyle = null;
+        _originalParent = IntPtr.Zero;
+        _statusReason = "Reset after destroyed host";
+        return true;
     }
 
     private static bool TrySetWindowLong(IntPtr hwnd, int index, IntPtr newLong, out IntPtr oldLong)

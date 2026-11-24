@@ -27,7 +27,10 @@ public class GitHubCiCollector
         _commandRunner = commandRunner ?? ((args, t, ct) => SafeProcessRunner.ExecuteAsync("gh", args, t, ct));
     }
 
-    public async Task<IReadOnlyList<BuildInfo>> CollectOnceAsync(CancellationToken cancellationToken = default)
+    public Task<IReadOnlyList<BuildInfo>> CollectOnceAsync(CancellationToken cancellationToken = default)
+        => CollectOnceAsync(null, cancellationToken);
+
+    public async Task<IReadOnlyList<BuildInfo>> CollectOnceAsync(long? expectedGeneration, CancellationToken cancellationToken = default)
     {
         if (!Enabled || Repositories.Count == 0)
             return Array.Empty<BuildInfo>();
@@ -51,7 +54,7 @@ public class GitHubCiCollector
             {
                 var builds = ParseRunList(res.StandardOutput, repo);
                 allBuilds.AddRange(builds);
-                _aggregator.UpdateCiBuildsForRepo(repo, builds);
+                _aggregator.UpdateCiBuildsForRepo(repo, builds, expectedGeneration);
             }
         }
 

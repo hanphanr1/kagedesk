@@ -500,5 +500,30 @@ public class HqStateAggregatorTests
         var pushedCount = accounts.Count(a => a.Provider == "bridge");
         Assert.True(pushedCount <= 32, $"Expected at most 32 pushed accounts, got {pushedCount}");
     }
+
+    [Fact]
+    public void SerializedCiGeneration_RejectsStalePublication_NoStormAlertOrVisualEvent()
+    {
+        var aggregator = new HqStateAggregator();
+        long gen = aggregator.GetCiGeneration();
+
+        // Simulate disabling CI: clears builds and bumps generation
+        long disabledGen = aggregator.DisableAndClearCiBuilds();
+        Assert.True(disabledGen > gen);
+
+        // Attempt in-flight publication from the captured earlier generation
+        var failingRuns = new[]
+        {
+            new BuildInfo("b-fail-1", "test/repo", "CI", "main", "CI", "completed", "failure")
+        };
+
+        bool accepted = aggregator.UpdateCiBuildsForRepo("test/repo", failingRuns, expectedGeneration: gen);
+
+        Assert.False(accepted);
+        var state = aggregator.GetState();
+        Assert.Empty(state.Builds);
+        Assert.NotEqual(EffectiveWeather.StormAlert, state.Weather);
+        Assert.DoesNotContain(state.PendingVisualEvents, e => e.Type == "BuildFailed");
+    }
 }
 

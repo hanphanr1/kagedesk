@@ -37,6 +37,7 @@ public class HqStateAggregator
     private readonly Dictionary<string, (AccountInfo Account, DateTimeOffset ExpiresAt)> _pushedAccounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, (BuildInfo Build, DateTimeOffset ExpiresAt)> _pushedBuilds = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, BuildInfo> _collectorBuilds = new(StringComparer.OrdinalIgnoreCase);
+    private long _ciGeneration;
 
     private readonly List<HqEvent> _visualEvents = new();
     private readonly Dictionary<string, (AgentSnapshot LastSnapshot, DateTimeOffset EnteredAt)> _departedDoneAgents = new(StringComparer.OrdinalIgnoreCase);
@@ -242,11 +243,43 @@ public class HqStateAggregator
         }
     }
 
-    public void UpdateCiBuildsForRepo(string repo, IReadOnlyList<BuildInfo> builds)
+    public long DisableAndClearCiBuilds()
+    {
+        HqState? toEmit = null;
+        long newGen;
+        lock (_lock)
+        {
+            newGen = ++_ciGeneration;
+            _collectorBuilds.Clear();
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
+        }
+
+        return newGen;
+    }
+
+    public long GetCiGeneration()
+    {
+        lock (_lock)
+        {
+            return _ciGeneration;
+        }
+    }
+
+    public bool UpdateCiBuildsForRepo(string repo, IReadOnlyList<BuildInfo> builds, long? expectedGeneration = null)
     {
         HqState? toEmit = null;
         lock (_lock)
         {
+            if (expectedGeneration.HasValue && expectedGeneration.Value != _ciGeneration)
+            {
+                return false;
+            }
+
             var staleKeys = _collectorBuilds
                 .Where(kv => string.Equals(kv.Value.Repo, repo, StringComparison.OrdinalIgnoreCase))
                 .Select(kv => kv.Key)
@@ -269,21 +302,13 @@ public class HqStateAggregator
         {
             StateChanged?.Invoke(this, toEmit);
         }
+
+        return true;
     }
 
     public void ClearCiBuildEntries()
     {
-        HqState? toEmit = null;
-        lock (_lock)
-        {
-            _collectorBuilds.Clear();
-            toEmit = RecalculateStateLocked();
-        }
-
-        if (toEmit != null)
-        {
-            StateChanged?.Invoke(this, toEmit);
-        }
+        DisableAndClearCiBuilds();
     }
 
     public void UpdatePushedEvent(PushedEventPayload payload)

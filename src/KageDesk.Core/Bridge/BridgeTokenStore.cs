@@ -1,3 +1,4 @@
+using System.Runtime.Versioning;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
@@ -7,6 +8,8 @@ namespace KageDesk.Core.Bridge;
 
 public static class BridgeTokenStore
 {
+    private static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
+
     public static string GetOrCreateToken(string? customPath = null)
     {
         string path = customPath ?? GetDefaultTokenPath();
@@ -15,33 +18,20 @@ public static class BridgeTokenStore
         {
             if (OperatingSystem.IsWindows())
             {
-                if (!HasStrictCurrentUserOnlyAcl(path))
+                string? validToken = TryReadTokenZeroToctou(path);
+                if (validToken != null)
                 {
-                    // Fail closed: invalid or permissive ACL, delete file to recreate with strict ACL
-                    File.Delete(path);
+                    return validToken;
                 }
-                else
-                {
-                    try
-                    {
-                        string existing = File.ReadAllText(path).Trim();
-                        if (IsValidToken(existing))
-                        {
-                            return existing;
-                        }
-                        File.Delete(path);
-                    }
-                    catch
-                    {
-                        try { File.Delete(path); } catch { }
-                    }
-                }
+
+                // Fail closed: invalid ACL, owner, or token content. Delete and recreate.
+                try { File.Delete(path); } catch { }
             }
             else
             {
                 try
                 {
-                    string existing = File.ReadAllText(path).Trim();
+                    string existing = File.ReadAllText(path).TrimStart('\uFEFF').Trim();
                     if (IsValidToken(existing))
                     {
                         return existing;
@@ -63,14 +53,51 @@ public static class BridgeTokenStore
         }
         catch (IOException) when (File.Exists(path))
         {
-            if (OperatingSystem.IsWindows() && !HasStrictCurrentUserOnlyAcl(path))
+            if (OperatingSystem.IsWindows())
             {
-                throw new InvalidOperationException($"Token file at '{path}' has invalid or permissive ACL.");
+                string? validToken = TryReadTokenZeroToctou(path);
+                if (validToken != null)
+                {
+                    return validToken;
+                }
+                throw new InvalidOperationException($"Token file at '{path}' has invalid owner, ACL, or token.");
             }
-            string token = File.ReadAllText(path).Trim();
+
+            string token = File.ReadAllText(path).TrimStart('\uFEFF').Trim();
             if (IsValidToken(token)) return token;
             throw;
         }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static string? TryReadTokenZeroToctou(string path)
+    {
+        try
+        {
+            var currentUser = WindowsIdentity.GetCurrent().User;
+            if (currentUser == null) return null;
+
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            var security = FileSystemAclExtensions.GetAccessControl(fs);
+            if (!VerifySecurity(security, currentUser))
+            {
+                return null;
+            }
+
+            using var reader = new StreamReader(fs, Utf8NoBom);
+            string content = reader.ReadToEnd();
+            string token = content.TrimStart('\uFEFF').Trim();
+            if (IsValidToken(token))
+            {
+                return token;
+            }
+        }
+        catch
+        {
+            return null;
+        }
+
+        return null;
     }
 
     public static string GetDefaultTokenPath()
@@ -101,61 +128,72 @@ public static class BridgeTokenStore
 
         try
         {
-            var fileInfo = new FileInfo(filePath);
-            var fileSecurity = fileInfo.GetAccessControl();
-            if (!fileSecurity.AreAccessRulesProtected)
-            {
-                // Inheritance is not disabled
-                return false;
-            }
-
             var currentUser = WindowsIdentity.GetCurrent().User;
             if (currentUser == null) return false;
 
-            var rules = fileSecurity.GetAccessRules(includeExplicit: true, includeInherited: false, typeof(SecurityIdentifier));
-            if (rules.Count == 0) return false;
-
-            var systemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
-            var adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
-            var usersSid = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
-            var everyoneSid = new SecurityIdentifier(WellKnownSidType.WorldSid, null);
-            var authUsersSid = new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null);
-
-            bool hasCurrentUser = false;
-
-            foreach (FileSystemAccessRule rule in rules)
-            {
-                if (rule.AccessControlType != AccessControlType.Allow)
-                    return false;
-
-                if (rule.IdentityReference is SecurityIdentifier sid)
-                {
-                    if (sid == usersSid || sid == everyoneSid || sid == authUsersSid)
-                    {
-                        return false;
-                    }
-
-                    if (sid == currentUser)
-                    {
-                        hasCurrentUser = true;
-                    }
-                    else if (sid != systemSid && sid != adminSid)
-                    {
-                        return false;
-                    }
-                }
-                else
-                {
-                    return false;
-                }
-            }
-
-            return hasCurrentUser;
+            var fileInfo = new FileInfo(filePath);
+            var fileSecurity = fileInfo.GetAccessControl();
+            return VerifySecurity(fileSecurity, currentUser);
         }
         catch
         {
             return false;
         }
+    }
+
+    [SupportedOSPlatform("windows")]
+    public static bool VerifySecurity(FileSecurity security, SecurityIdentifier currentUser)
+    {
+        if (!security.AreAccessRulesProtected)
+        {
+            return false;
+        }
+
+        var owner = security.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
+        if (owner == null || owner != currentUser)
+        {
+            return false;
+        }
+
+        var rules = security.GetAccessRules(includeExplicit: true, includeInherited: false, typeof(SecurityIdentifier));
+        if (rules.Count == 0) return false;
+
+        var systemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+        var adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+        var usersSid = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
+        var everyoneSid = new SecurityIdentifier(WellKnownSidType.WorldSid, null);
+        var authUsersSid = new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null);
+
+        bool hasCurrentUser = false;
+
+        foreach (FileSystemAccessRule rule in rules)
+        {
+            if (rule.AccessControlType != AccessControlType.Allow)
+                return false;
+
+            if (rule.IdentityReference is SecurityIdentifier sid)
+            {
+                if (sid == usersSid || sid == everyoneSid || sid == authUsersSid)
+                {
+                    return false;
+                }
+
+                if (sid == currentUser)
+                {
+                    hasCurrentUser = true;
+                }
+                else if (sid != systemSid && sid != adminSid)
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        return hasCurrentUser;
     }
 
     private static string GenerateSecureToken()
@@ -174,6 +212,7 @@ public static class BridgeTokenStore
                 ?? throw new InvalidOperationException("Current user SID could not be resolved.");
 
             var fileSecurity = new FileSecurity();
+            fileSecurity.SetOwner(currentUser);
             fileSecurity.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
             fileSecurity.AddAccessRule(new FileSystemAccessRule(
                 currentUser,
@@ -189,14 +228,14 @@ public static class BridgeTokenStore
                 4096,
                 FileOptions.None,
                 fileSecurity);
-            using var writer = new StreamWriter(stream, Encoding.UTF8);
+            using var writer = new StreamWriter(stream, Utf8NoBom);
             writer.Write(token);
             writer.Flush();
         }
         else
         {
             using var stream = new FileStream(filePath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-            using var writer = new StreamWriter(stream, Encoding.UTF8);
+            using var writer = new StreamWriter(stream, Utf8NoBom);
             writer.Write(token);
             writer.Flush();
         }
@@ -213,6 +252,7 @@ public static class BridgeTokenStore
             if (currentUser != null)
             {
                 var dirSec = new DirectorySecurity();
+                dirSec.SetOwner(currentUser);
                 dirSec.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
                 dirSec.AddAccessRule(new FileSystemAccessRule(
                     currentUser,

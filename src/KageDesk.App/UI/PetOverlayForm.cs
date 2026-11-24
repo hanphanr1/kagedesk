@@ -79,32 +79,34 @@ public class PetOverlayForm : Form
             Timestamp: DateTimeOffset.UtcNow);
         _cachedRenderState = _currentState;
 
-        _petBuffer = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
         try
         {
+            _petBuffer = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
             _dibSurface = new LayeredDibSurface(TaskbarPetRenderer.CanvasWidth * _scale, TaskbarPetRenderer.CanvasHeight * _scale);
+            _renderer = new TaskbarPetRenderer();
+            _stopwatch = Stopwatch.StartNew();
+
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            DoubleBuffered = false; // Layered windows handle painting via UpdateLayeredWindow
+
+            int fps = Math.Clamp(targetFps, 5, 30);
+            _renderTimer = new System.Windows.Forms.Timer
+            {
+                Interval = Math.Max(16, 1000 / fps)
+            };
+            _renderTimer.Tick += OnRenderTick;
+
+            UpdateWindowBounds();
         }
         catch
         {
-            _petBuffer.Dispose();
+            _renderTimer?.Dispose();
+            _dibSurface?.Dispose();
+            _petBuffer?.Dispose();
             throw;
         }
-        _renderer = new TaskbarPetRenderer();
-        _stopwatch = Stopwatch.StartNew();
-
-        FormBorderStyle = FormBorderStyle.None;
-        ShowInTaskbar = false;
-        StartPosition = FormStartPosition.Manual;
-        DoubleBuffered = false; // Layered windows handle painting via UpdateLayeredWindow
-
-        int fps = Math.Clamp(targetFps, 5, 30);
-        _renderTimer = new System.Windows.Forms.Timer
-        {
-            Interval = Math.Max(16, 1000 / fps)
-        };
-        _renderTimer.Tick += OnRenderTick;
-
-        UpdateWindowBounds();
     }
 
     protected override CreateParams CreateParams
@@ -134,18 +136,27 @@ public class PetOverlayForm : Form
         try
         {
             _dibSurface.Resize(TaskbarPetRenderer.CanvasWidth * newScale, TaskbarPetRenderer.CanvasHeight * newScale);
-            _scale = newScale;
-            UpdateWindowBounds();
-            if (Visible && !_isPaused && !_isHiddenByDndOrLock)
-            {
-                RenderAndPresent();
-            }
-            return true;
         }
         catch
         {
             return false;
         }
+
+        _scale = newScale;
+        try
+        {
+            UpdateWindowBounds();
+            if (Visible && !_isPaused && !_isHiddenByDndOrLock)
+            {
+                RenderAndPresent();
+            }
+        }
+        catch
+        {
+            // Do NOT return false here because _scale was committed and DIB surface was resized
+        }
+
+        return true;
     }
 
     public void SetIdleMode(string idleMode)
