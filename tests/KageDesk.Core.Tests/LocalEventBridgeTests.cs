@@ -454,7 +454,8 @@ public class LocalEventBridgeTests
         var port = GetAvailablePort();
         var aggregator = new HqStateAggregator();
         TimeSpan readTimeout = TimeSpan.FromMilliseconds(350);
-        TimeSpan outerTimeout = TimeSpan.FromSeconds(3);
+        TimeSpan maxExpectedAbortWindow = TimeSpan.FromMilliseconds(1500);
+        TimeSpan outerWatchdogTimeout = TimeSpan.FromMilliseconds(4000);
         await using var bridge = new LocalEventBridge(
             aggregator,
             port,
@@ -472,9 +473,9 @@ public class LocalEventBridgeTests
         await stream.WriteAsync(requestBytes, 0, requestBytes.Length);
         await stream.FlushAsync();
 
-        // Read from raw TCP stream; server must abort (clean EOF or reset) without sending HTTP response bytes
+        // Read from raw TCP stream; server must abort (clean EOF or verified socket reset/abort) without sending HTTP response bytes
         byte[] readBuffer = new byte[1024];
-        using var readCts = new CancellationTokenSource(outerTimeout);
+        using var readCts = new CancellationTokenSource(outerWatchdogTimeout);
         bool aborted = false;
 
         try
@@ -487,29 +488,50 @@ public class LocalEventBridgeTests
                 Assert.Fail($"Server sent {bytesRead} HTTP response byte(s) instead of aborting stalled request: {preview}");
             }
 
-            aborted = true; // Clean EOF after server abort
+            aborted = true; // Clean EOF (bytesRead == 0) after server abort
         }
         catch (OperationCanceledException) when (readCts.IsCancellationRequested)
         {
             sw.Stop();
-            Assert.Fail($"Server did not abort stalled request within outer deadline ({outerTimeout.TotalMilliseconds:F0}ms)");
+            Assert.Fail($"Server did not abort stalled request within outer watchdog deadline ({outerWatchdogTimeout.TotalMilliseconds:F0}ms)");
         }
-        catch (IOException)
+        catch (IOException ex) when (ex.InnerException is SocketException sockEx)
         {
             sw.Stop();
-            aborted = true; // Connection reset by server abort
+            if (!IsExpectedAbortSocketError(sockEx.SocketErrorCode))
+            {
+                Assert.Fail($"Unexpected SocketErrorCode on stalled request abort: {sockEx.SocketErrorCode} ({ex.Message})");
+            }
+
+            aborted = true; // Verified connection reset/abort by server
         }
-        catch (SocketException)
+        catch (IOException ex)
         {
             sw.Stop();
-            aborted = true; // Connection reset by server abort
+            Assert.Fail($"Unexpected IOException without verified abort SocketException: {ex}");
+        }
+        catch (SocketException sockEx)
+        {
+            sw.Stop();
+            if (!IsExpectedAbortSocketError(sockEx.SocketErrorCode))
+            {
+                Assert.Fail($"Unexpected SocketErrorCode on stalled request abort: {sockEx.SocketErrorCode} ({sockEx.Message})");
+            }
+
+            aborted = true; // Verified connection reset/abort by server
         }
 
         Assert.True(aborted, "Stalled request was not aborted by server within read timeout");
         Assert.True(
-            sw.Elapsed >= TimeSpan.FromMilliseconds(150) && sw.Elapsed < outerTimeout,
-            $"Expected server abort inside [150ms, {outerTimeout.TotalMilliseconds:F0}ms), actual elapsed: {sw.Elapsed.TotalMilliseconds:F1}ms");
+            sw.Elapsed >= TimeSpan.FromMilliseconds(150) && sw.Elapsed <= maxExpectedAbortWindow,
+            $"Expected server abort inside [150ms, {maxExpectedAbortWindow.TotalMilliseconds:F0}ms] for {readTimeout.TotalMilliseconds:F0}ms timeout, actual elapsed: {sw.Elapsed.TotalMilliseconds:F1}ms");
     }
+
+    private static bool IsExpectedAbortSocketError(SocketError error) =>
+        error is SocketError.ConnectionReset
+            or SocketError.ConnectionAborted
+            or SocketError.Shutdown
+            or SocketError.OperationAborted;
 
     [Fact]
     public async Task CleanShutdownUnderLoad_NoObjectDisposedException()

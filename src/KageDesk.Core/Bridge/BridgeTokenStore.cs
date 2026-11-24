@@ -149,50 +149,47 @@ public static class BridgeTokenStore
             return false;
         }
 
-        if (!security.AreAccessRulesProtected)
+        byte[] rawBytes = security.GetSecurityDescriptorBinaryForm();
+        if (rawBytes == null || rawBytes.Length == 0)
         {
             return false;
         }
 
-        var owner = security.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
-        if (owner == null || !currentUser.Equals(owner))
+        var rawSd = new RawSecurityDescriptor(rawBytes, 0);
+
+        // 1. Owner SID must match current user
+        if (rawSd.Owner == null || !currentUser.Equals(rawSd.Owner))
         {
             return false;
         }
 
-        AuthorizationRuleCollection rules = security.GetAccessRules(
-            includeExplicit: true,
-            includeInherited: true,
-            typeof(SecurityIdentifier));
-
-        if (rules.Count == 0)
+        // 2. DACL protection must be enabled (inheritance blocked)
+        if (!rawSd.ControlFlags.HasFlag(ControlFlags.DiscretionaryAclProtected))
         {
             return false;
         }
 
-        bool hasCurrentUser = false;
-
-        foreach (AuthorizationRule authRule in rules)
+        // 3. Discretionary ACL must be present and non-empty
+        if (rawSd.DiscretionaryAcl == null || rawSd.DiscretionaryAcl.Count == 0)
         {
-            if (authRule is not FileSystemAccessRule rule)
-            {
-                return false;
-            }
-
-            if (rule.AccessControlType != AccessControlType.Allow)
-            {
-                return false;
-            }
-
-            if (!currentUser.Equals(rule.IdentityReference))
-            {
-                return false;
-            }
-
-            hasCurrentUser = true;
+            return false;
         }
 
-        return hasCurrentUser;
+        // 4. Inspect EVERY raw ACE in the DACL (never silently drop unknown/callback/compound/object ACEs)
+        foreach (GenericAce ace in rawSd.DiscretionaryAcl)
+        {
+            if (ace is not CommonAce commonAce || commonAce.AceType != AceType.AccessAllowed)
+            {
+                return false;
+            }
+
+            if (!currentUser.Equals(commonAce.SecurityIdentifier))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static string GenerateSecureToken()

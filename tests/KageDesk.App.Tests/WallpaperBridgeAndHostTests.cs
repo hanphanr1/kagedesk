@@ -146,6 +146,66 @@ public class WallpaperBridgeAndHostTests
     }
 
     [Fact]
+    public void Win32WallpaperBridge_Detach_VerifiesParentAndStyleReadbackOnSuccess()
+    {
+        using var childForm = new Form { FormBorderStyle = FormBorderStyle.None, ShowInTaskbar = false };
+        using var tempParent = new Form { FormBorderStyle = FormBorderStyle.None, ShowInTaskbar = false };
+
+        IntPtr hwnd = childForm.Handle;
+        IntPtr tempParentHwnd = tempParent.Handle;
+        IntPtr originalParent = Win32Interop.GetAncestor(hwnd, Win32Interop.GA_PARENT);
+        nint savedStyle = Win32Interop.GetWindowLongPtr(hwnd, Win32Interop.GWL_STYLE);
+        nint savedExStyle = Win32Interop.GetWindowLongPtr(hwnd, Win32Interop.GWL_EXSTYLE);
+
+        long mutatedStyle = (savedStyle & ~((long)Win32Interop.WS_POPUP)) | Win32Interop.WS_CHILD;
+        long mutatedExStyle = savedExStyle | Win32Interop.WS_EX_LAYERED;
+        Win32Interop.SetWindowLongPtr(hwnd, Win32Interop.GWL_STYLE, new IntPtr(mutatedStyle));
+        Win32Interop.SetWindowLongPtr(hwnd, Win32Interop.GWL_EXSTYLE, new IntPtr(mutatedExStyle));
+        Win32Interop.SetParent(hwnd, tempParentHwnd);
+
+        var bridge = new Win32WallpaperBridge();
+        bridge.SeedSavedStateForTest(hwnd, originalParent, savedStyle, savedExStyle, isAttached: true);
+
+        bool detached = bridge.Detach(childForm);
+
+        Assert.True(detached);
+        Assert.False(bridge.IsAttached);
+        Assert.Equal(IntPtr.Zero, bridge.AttachedHwnd);
+        Assert.Equal(originalParent, Win32Interop.GetAncestor(hwnd, Win32Interop.GA_PARENT));
+        Assert.Equal(savedStyle, Win32Interop.GetWindowLongPtr(hwnd, Win32Interop.GWL_STYLE));
+        Assert.Equal(savedExStyle, Win32Interop.GetWindowLongPtr(hwnd, Win32Interop.GWL_EXSTYLE));
+    }
+
+    [Fact]
+    public void Win32WallpaperBridge_Detach_ReturnsFalseWhenLiveWindowStyleOrParentReadbackFails()
+    {
+        using var form = new Form { FormBorderStyle = FormBorderStyle.None, ShowInTaskbar = false };
+        IntPtr hwnd = form.Handle;
+        IntPtr originalParent = Win32Interop.GetAncestor(hwnd, Win32Interop.GA_PARENT);
+        nint actualStyle = Win32Interop.GetWindowLongPtr(hwnd, Win32Interop.GWL_STYLE);
+        nint actualExStyle = Win32Interop.GetWindowLongPtr(hwnd, Win32Interop.GWL_EXSTYLE);
+
+        // 1. Missing saved style while HWND is live -> Detach must return false
+        var bridgeMissingStyle = new Win32WallpaperBridge();
+        bridgeMissingStyle.SeedSavedStateForTest(hwnd, originalParent, savedStyle: null, savedExStyle: actualExStyle, isAttached: true);
+        Assert.False(bridgeMissingStyle.Detach(form));
+        Assert.True(bridgeMissingStyle.IsAttached);
+
+        // 2. ExStyle readback mismatch while HWND is live (WS_EX_TOPMOST cannot be set via SetWindowLongPtr)
+        const nint WsExTopMost = 0x00000008;
+        var bridgeStyleMismatch = new Win32WallpaperBridge();
+        bridgeStyleMismatch.SeedSavedStateForTest(hwnd, originalParent, actualStyle, actualExStyle | WsExTopMost, isAttached: true);
+        Assert.False(bridgeStyleMismatch.Detach(form));
+        Assert.True(bridgeStyleMismatch.IsAttached);
+
+        // 3. Parent readback mismatch while HWND is live (invalid/unrestorable parent HWND)
+        var bridgeParentMismatch = new Win32WallpaperBridge();
+        bridgeParentMismatch.SeedSavedStateForTest(hwnd, new IntPtr(0x123456), actualStyle, actualExStyle, isAttached: true);
+        Assert.False(bridgeParentMismatch.Detach(form));
+        Assert.True(bridgeParentMismatch.IsAttached);
+    }
+
+    [Fact]
     public void ExplorerRestartRecovery_DeadHostAlwaysResetsAndRecreatesWithoutCallingDetach()
     {
         bool detachCalled = false;

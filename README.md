@@ -180,7 +180,7 @@ bash ./hooks/kagedesk-emit.sh tool_done codex "Build green"
 
 Drop-in **Claude Code** hook configurations are included:
 - **Bash / Git Bash**: [`hooks/claude-code-hooks.example.json`](hooks/claude-code-hooks.example.json)
-- **Windows PowerShell (`pwsh`)**: [`hooks/claude-code-hooks.windows.example.json`](hooks/claude-code-hooks.windows.example.json)
+- **Windows PowerShell 7 (`pwsh`)**: [`hooks/claude-code-hooks.windows.example.json`](hooks/claude-code-hooks.windows.example.json) — requires **PowerShell 7 (`pwsh`)** on `PATH` (or replace `pwsh` with `powershell.exe` if using Windows PowerShell 5.1)
 
 Both wire `PreToolUse` (`tool_start`), `PostToolUse` (`tool_done`), `Notification` (`notification`), and `Stop` (`idle`) verbatim.
 
@@ -188,12 +188,12 @@ Both wire `PreToolUse` (`tool_start`), `PostToolUse` (`tool_done`), `Notificatio
 
 ## Architecture & Security
 
-- **Dual Desktop Wallpaper Topology**: Supports both **Windows 10 / Win11 <= 23H2 Classic `WorkerW`** and **Windows 11 24H2 / 25H2 Raised Desktop (`Progman` + `SHELLDLL_DefView`)**. Verifies Explorer PID ownership, rolls back cleanly with `GetAncestor(GA_PARENT)` and `GWL_STYLE`/`GWL_EXSTYLE` readback if attachment fails, never modifies Windows OS wallpaper registry/SPI settings on detach, and automatically recovers when Explorer restarts (`TaskbarCreated`).
+- **Dual Desktop Wallpaper Topology**: Supports both **Windows 10 / Win11 <= 23H2 Classic `WorkerW`** and **Windows 11 24H2 / 25H2 Raised Desktop (`Progman` + `SHELLDLL_DefView`)**. Verifies Explorer PID ownership, verifies `GetAncestor(GA_PARENT)` and `GWL_STYLE`/`GWL_EXSTYLE` readback on both rollback and detach, never modifies Windows OS wallpaper registry/SPI settings on detach, and automatically recovers when Explorer restarts (`TaskbarCreated`).
 - **Monitor-Aware Auto-Pause & Game DND**: Tracks DWM extended frame bounds and cloaked state on the primary monitor to pause wallpaper rendering at 0% CPU/GPU when covered, plus `SHQueryUserNotificationState` fullscreen DND to hide taskbar pets during games or presentations.
-- **Zero-Allocation Native Rendering**: Fixed-size pinned `PixelBuffer` (`480x270` wallpaper, `384x96` taskbar pets) blitted via nearest-neighbor scaling and persistent `CreateDIBSection` (`UpdateLayeredWindow`) for crisp per-pixel alpha with zero GDI leaks.
+- **Zero-Allocation Native Rendering**: Fixed-size pinned `PixelBuffer` canvases — **`384x216` wallpaper** (nearest-neighbor blit; 2x previews at `768x432`) and **`384x128` taskbar pets** (2x HiDPI / previews at `768x256`). The pet overlay specifically renders through a persistent 32bpp `CreateDIBSection` + `UpdateLayeredWindow` path for crisp per-pixel alpha with zero GDI leaks.
 - **Defense-in-Depth Local Bridge**:
   - Strictly bound to `127.0.0.1` loopback with remote address verification, 32 KB body cap (including chunked streams), 16-request concurrency cap, and slow-client read-timeout aborts.
-  - Zero-TOCTOU token verification validates protected NTFS DACL (both explicit and inherited rules), owner SID match, and current-user-only Allow ACEs — failing closed and regenerating on mismatch.
+  - Zero-TOCTOU token verification inspects the raw binary NTFS security descriptor (`RawSecurityDescriptor`), enforcing protected DACL inheritance, owner SID match, and current-user-only Allow `CommonAce` entries — failing closed and regenerating on mismatch.
   - Allowlisted `/api/state` public DTO omits `Prompt`, `LastMessage`, `QuestionPrompt`, and event `Message` fields so private prompt/chat contents are never exposed.
 
 ---

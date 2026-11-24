@@ -96,10 +96,24 @@ public class BridgeTokenStoreTests
         string tempPath = Path.Combine(tempDir, "bridge.token");
         try
         {
+            var currentUser = WindowsIdentity.GetCurrent().User!;
+            var foreignSid = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
+
+            // Deterministically grant an inheritable foreign SID rule on the temporary parent folder
+            var dirInfo = new DirectoryInfo(tempDir);
+            var dirSec = dirInfo.GetAccessControl();
+            dirSec.AddAccessRule(new FileSystemAccessRule(
+                foreignSid,
+                FileSystemRights.ReadAndExecute,
+                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                PropagationFlags.None,
+                AccessControlType.Allow));
+            dirInfo.SetAccessControl(dirSec);
+
             string token1 = BridgeTokenStore.GetOrCreateToken(tempPath);
             Assert.True(BridgeTokenStore.HasStrictCurrentUserOnlyAcl(tempPath));
 
-            // Re-enable inheritance from parent temp directory, then protect while preserving inherited ACEs
+            // Re-enable inheritance from parent directory, then protect while preserving inherited ACEs
             var fileInfo = new FileInfo(tempPath);
             var sec = fileInfo.GetAccessControl();
             sec.SetAccessRuleProtection(isProtected: false, preserveInheritance: false);
@@ -109,32 +123,160 @@ public class BridgeTokenStoreTests
             sec.SetAccessRuleProtection(isProtected: true, preserveInheritance: true);
             fileInfo.SetAccessControl(sec);
 
-            var currentUser = WindowsIdentity.GetCurrent().User!;
             var inspected = fileInfo.GetAccessControl();
-            // On standard Windows temp directories, preserved ACEs include SYSTEM / Administrators
-            var rules = inspected.GetAccessRules(includeExplicit: true, includeInherited: true, typeof(SecurityIdentifier));
-            bool hasForeignSid = false;
-            foreach (AuthorizationRule r in rules)
+            var rawInspected = new RawSecurityDescriptor(inspected.GetSecurityDescriptorBinaryForm(), 0);
+            Assert.NotNull(rawInspected.DiscretionaryAcl);
+            bool foundForeignSid = false;
+            foreach (GenericAce ace in rawInspected.DiscretionaryAcl)
             {
-                if (!currentUser.Equals(r.IdentityReference))
+                if (ace is CommonAce commonAce && foreignSid.Equals(commonAce.SecurityIdentifier))
                 {
-                    hasForeignSid = true;
+                    foundForeignSid = true;
                     break;
                 }
             }
+            Assert.True(foundForeignSid, "Expected inherited foreign SID ACE to be present in raw DACL");
 
-            if (hasForeignSid)
+            // Deterministically verify rejection and regeneration with a clean current-user-only raw DACL
+            Assert.False(BridgeTokenStore.VerifySecurity(inspected, currentUser));
+            Assert.False(BridgeTokenStore.HasStrictCurrentUserOnlyAcl(tempPath));
+
+            string token2 = BridgeTokenStore.GetOrCreateToken(tempPath);
+            Assert.NotEqual(token1, token2);
+            Assert.True(BridgeTokenStore.IsValidToken(token2));
+            Assert.True(BridgeTokenStore.HasStrictCurrentUserOnlyAcl(tempPath));
+
+            var regeneratedSec = new FileInfo(tempPath).GetAccessControl();
+            var rawRegenerated = new RawSecurityDescriptor(regeneratedSec.GetSecurityDescriptorBinaryForm(), 0);
+            Assert.Equal(currentUser, rawRegenerated.Owner);
+            Assert.True(rawRegenerated.ControlFlags.HasFlag(ControlFlags.DiscretionaryAclProtected));
+            Assert.NotNull(rawRegenerated.DiscretionaryAcl);
+            Assert.True(rawRegenerated.DiscretionaryAcl.Count > 0);
+            foreach (GenericAce ace in rawRegenerated.DiscretionaryAcl)
             {
-                Assert.False(BridgeTokenStore.VerifySecurity(inspected, currentUser));
-
-                string token2 = BridgeTokenStore.GetOrCreateToken(tempPath);
-                Assert.NotEqual(token1, token2);
-                Assert.True(BridgeTokenStore.HasStrictCurrentUserOnlyAcl(tempPath));
+                var commonAce = Assert.IsType<CommonAce>(ace);
+                Assert.Equal(AceType.AccessAllowed, commonAce.AceType);
+                Assert.Equal(currentUser, commonAce.SecurityIdentifier);
             }
         }
         finally
         {
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
         }
+    }
+
+    [Fact]
+    public void VerifySecurity_RawDaclWithInheritedForeignCommonAce_ReturnsFalse()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var currentUser = WindowsIdentity.GetCurrent().User!;
+        var worldSid = new SecurityIdentifier(WellKnownSidType.WorldSid, null);
+
+        var rawDacl = new RawAcl(RawAcl.AclRevision, 2);
+        rawDacl.InsertAce(0, new CommonAce(
+            AceFlags.None,
+            AceQualifier.AccessAllowed,
+            (int)FileSystemRights.FullControl,
+            currentUser,
+            isCallback: false,
+            opaque: null));
+        rawDacl.InsertAce(1, new CommonAce(
+            AceFlags.Inherited,
+            AceQualifier.AccessAllowed,
+            (int)FileSystemRights.Read,
+            worldSid,
+            isCallback: false,
+            opaque: null));
+
+        var rawSd = new RawSecurityDescriptor(
+            ControlFlags.DiscretionaryAclPresent | ControlFlags.DiscretionaryAclProtected,
+            currentUser,
+            currentUser,
+            systemAcl: null,
+            discretionaryAcl: rawDacl);
+
+        byte[] binary = new byte[rawSd.BinaryLength];
+        rawSd.GetBinaryForm(binary, 0);
+
+        var fileSecurity = new FileSecurity();
+        fileSecurity.SetSecurityDescriptorBinaryForm(binary);
+
+        Assert.False(BridgeTokenStore.VerifySecurity(fileSecurity, currentUser));
+    }
+
+    [Fact]
+    public void VerifySecurity_RawDaclWithCallbackOrNonCommonAce_ReturnsFalse()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var currentUser = WindowsIdentity.GetCurrent().User!;
+
+        var rawDacl = new RawAcl(RawAcl.AclRevision, 2);
+        rawDacl.InsertAce(0, new CommonAce(
+            AceFlags.None,
+            AceQualifier.AccessAllowed,
+            (int)FileSystemRights.FullControl,
+            currentUser,
+            isCallback: false,
+            opaque: null));
+        // Callback Allow ACE: FileSecurity.GetAccessRules silently drops it, but raw DACL inspection MUST reject it
+        rawDacl.InsertAce(1, new CommonAce(
+            AceFlags.None,
+            AceQualifier.AccessAllowed,
+            (int)FileSystemRights.Read,
+            currentUser,
+            isCallback: true,
+            opaque: new byte[] { 0, 0, 0, 0 }));
+
+        var rawSd = new RawSecurityDescriptor(
+            ControlFlags.DiscretionaryAclPresent | ControlFlags.DiscretionaryAclProtected,
+            currentUser,
+            currentUser,
+            systemAcl: null,
+            discretionaryAcl: rawDacl);
+
+        byte[] binary = new byte[rawSd.BinaryLength];
+        rawSd.GetBinaryForm(binary, 0);
+
+        var fileSecurity = new FileSecurity();
+        fileSecurity.SetSecurityDescriptorBinaryForm(binary);
+
+        Assert.False(BridgeTokenStore.VerifySecurity(fileSecurity, currentUser));
+
+        // Non-CommonAce (ObjectAce): must also be rejected by raw DACL inspection
+        var rawDaclWithObjectAce = new RawAcl(RawAcl.AclRevisionDS, 2);
+        rawDaclWithObjectAce.InsertAce(0, new CommonAce(
+            AceFlags.None,
+            AceQualifier.AccessAllowed,
+            (int)FileSystemRights.FullControl,
+            currentUser,
+            isCallback: false,
+            opaque: null));
+        rawDaclWithObjectAce.InsertAce(1, new ObjectAce(
+            AceFlags.None,
+            AceQualifier.AccessAllowed,
+            (int)FileSystemRights.Read,
+            currentUser,
+            ObjectAceFlags.None,
+            Guid.Empty,
+            Guid.Empty,
+            isCallback: false,
+            opaque: null));
+
+        var rawSdObj = new RawSecurityDescriptor(
+            ControlFlags.DiscretionaryAclPresent | ControlFlags.DiscretionaryAclProtected,
+            currentUser,
+            currentUser,
+            systemAcl: null,
+            discretionaryAcl: rawDaclWithObjectAce);
+
+        byte[] objBinary = new byte[rawSdObj.BinaryLength];
+        rawSdObj.GetBinaryForm(objBinary, 0);
+
+        var fileSecurityObj = new FileSecurity();
+        fileSecurityObj.SetSecurityDescriptorBinaryForm(objBinary);
+
+        Assert.False(BridgeTokenStore.VerifySecurity(fileSecurityObj, currentUser));
     }
 }

@@ -345,6 +345,48 @@ public class Win32WallpaperBridge
         return true;
     }
 
+    private bool RestoreAndVerifyWindowState(IntPtr formHandle)
+    {
+        bool restoreOk = true;
+        Win32Interop.ShowWindow(formHandle, 0 /* SW_HIDE */);
+
+        IntPtr setParentTarget = ResolveSetParentTarget(_originalParent);
+        IntPtr expectedParent = ResolveExpectedParent(_originalParent);
+        Win32Interop.SetParent(formHandle, setParentTarget);
+
+        if (_savedStyle.HasValue)
+        {
+            if (!TrySetWindowLong(formHandle, Win32Interop.GWL_STYLE, new IntPtr(_savedStyle.Value), out _))
+            {
+                restoreOk = false;
+            }
+        }
+        else
+        {
+            restoreOk = false;
+        }
+
+        if (_savedExStyle.HasValue)
+        {
+            if (!TrySetWindowLong(formHandle, Win32Interop.GWL_EXSTYLE, new IntPtr(_savedExStyle.Value), out _))
+            {
+                restoreOk = false;
+            }
+        }
+        else
+        {
+            restoreOk = false;
+        }
+
+        // Verify restored parent via GetAncestor(GA_PARENT) AND read back both GWL_STYLE & GWL_EXSTYLE
+        if (restoreOk && !VerifyRestoredWindowState(formHandle, expectedParent, _savedStyle, _savedExStyle))
+        {
+            restoreOk = false;
+        }
+
+        return restoreOk;
+    }
+
     internal bool RollbackAttach(Form? attemptedForm, IntPtr formHandle)
     {
         bool restoreOk = false;
@@ -357,42 +399,7 @@ public class Win32WallpaperBridge
 
             if (formHandle != IntPtr.Zero && Win32Interop.IsWindow(formHandle))
             {
-                restoreOk = true;
-                Win32Interop.ShowWindow(formHandle, 0 /* SW_HIDE */);
-
-                IntPtr setParentTarget = ResolveSetParentTarget(_originalParent);
-                IntPtr expectedParent = ResolveExpectedParent(_originalParent);
-                Win32Interop.SetParent(formHandle, setParentTarget);
-
-                if (_savedStyle.HasValue)
-                {
-                    if (!TrySetWindowLong(formHandle, Win32Interop.GWL_STYLE, new IntPtr(_savedStyle.Value), out _))
-                    {
-                        restoreOk = false;
-                    }
-                }
-                else
-                {
-                    restoreOk = false;
-                }
-
-                if (_savedExStyle.HasValue)
-                {
-                    if (!TrySetWindowLong(formHandle, Win32Interop.GWL_EXSTYLE, new IntPtr(_savedExStyle.Value), out _))
-                    {
-                        restoreOk = false;
-                    }
-                }
-                else
-                {
-                    restoreOk = false;
-                }
-
-                // Verify restored parent via GetAncestor(GA_PARENT) AND read back both GWL_STYLE & GWL_EXSTYLE
-                if (restoreOk && !VerifyRestoredWindowState(formHandle, expectedParent, _savedStyle, _savedExStyle))
-                {
-                    restoreOk = false;
-                }
+                restoreOk = RestoreAndVerifyWindowState(formHandle);
 
                 if (!restoreOk)
                 {
@@ -479,21 +486,8 @@ public class Win32WallpaperBridge
         {
             if (hwnd != IntPtr.Zero && Win32Interop.IsWindow(hwnd))
             {
-                Win32Interop.ShowWindow(hwnd, 0 /* SW_HIDE */);
-
-                if (_savedStyle.HasValue)
-                {
-                    TrySetWindowLong(hwnd, Win32Interop.GWL_STYLE, new IntPtr(_savedStyle.Value), out _);
-                }
-                if (_savedExStyle.HasValue)
-                {
-                    TrySetWindowLong(hwnd, Win32Interop.GWL_EXSTYLE, new IntPtr(_savedExStyle.Value), out _);
-                }
-
-                Win32Interop.SetParent(hwnd, ResolveSetParentTarget(_originalParent));
-                IntPtr expectedParent = ResolveExpectedParent(_originalParent);
-                IntPtr currentParent = Win32Interop.GetAncestor(hwnd, Win32Interop.GA_PARENT);
-                if (currentParent != expectedParent && Win32Interop.IsWindow(hwnd))
+                bool restored = RestoreAndVerifyWindowState(hwnd);
+                if (!restored && Win32Interop.IsWindow(hwnd))
                 {
                     detached = false;
                 }
@@ -506,7 +500,7 @@ public class Win32WallpaperBridge
 
         if (!detached)
         {
-            _statusReason = "Detach failed: unable to restore parent window";
+            _statusReason = "Detach failed: unable to restore parent window or styles";
             return false;
         }
 
