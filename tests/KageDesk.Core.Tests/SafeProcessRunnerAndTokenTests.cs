@@ -203,4 +203,40 @@ public class SafeProcessRunnerAndTokenTests
             if (File.Exists(tempPath)) File.Delete(tempPath);
         }
     }
+
+    [Fact]
+    public async Task SafeProcessRunner_DecodesUtf8StdoutAndStderrCleanly()
+    {
+        string exe;
+        string[] args;
+        string expectedStdout = "mày xem tiếng việt nè";
+        string expectedStderr = "lỗi tiếng việt nè";
+
+        if (OperatingSystem.IsWindows())
+        {
+            exe = "powershell";
+            args = new[]
+            {
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$b = [System.Text.Encoding]::UTF8.GetBytes('mày xem tiếng việt nè'); [Console]::OpenStandardOutput().Write($b, 0, $b.Length); $eb = [System.Text.Encoding]::UTF8.GetBytes('lỗi tiếng việt nè'); [Console]::OpenStandardError().Write($eb, 0, $eb.Length);"
+            };
+        }
+        else
+        {
+            exe = "sh";
+            args = new[]
+            {
+                "-c",
+                "printf 'mày xem tiếng việt nè'; printf 'lỗi tiếng việt nè' >&2"
+            };
+        }
+
+        var result = await SafeProcessRunner.ExecuteAsync(exe, args, TimeSpan.FromSeconds(15), CancellationToken.None);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Equal(expectedStdout, result.StandardOutput);
+        Assert.Equal(expectedStderr, result.StandardError);
+    }
 }

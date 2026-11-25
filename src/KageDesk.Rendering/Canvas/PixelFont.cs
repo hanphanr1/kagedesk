@@ -1,3 +1,5 @@
+using System.Globalization;
+
 namespace KageDesk.Rendering.Canvas;
 
 public enum PixelFontSize
@@ -153,10 +155,102 @@ public static class PixelFont
     public static int CharAdvance(PixelFontSize size) => size == PixelFontSize.Small ? 4 : 6;
     public static int LineHeight(PixelFontSize size) => size == PixelFontSize.Small ? 5 : 7;
 
+    private static char NormalizeGlyphChar(char c)
+    {
+        if (c <= 0x7F)
+        {
+            return c is >= 'a' and <= 'z' ? (char)(c - 32) : c;
+        }
+
+        return c switch
+        {
+            // đ / Đ -> 'D'
+            'đ' or 'Đ' => 'D',
+
+            // áàảãạăắằẳẵặâấầẩẫậ / ÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬ + common Latin -> 'A'
+            'á' or 'à' or 'ả' or 'ã' or 'ạ' or
+            'ă' or 'ắ' or 'ằ' or 'ẳ' or 'ẵ' or 'ặ' or
+            'â' or 'ấ' or 'ầ' or 'ẩ' or 'ẫ' or 'ậ' or
+            'Á' or 'À' or 'Ả' or 'Ã' or 'Ạ' or
+            'Ă' or 'Ắ' or 'Ằ' or 'Ẳ' or 'Ẵ' or 'Ặ' or
+            'Â' or 'Ấ' or 'Ầ' or 'Ẩ' or 'Ẫ' or 'Ậ' or
+            'ä' or 'Ä' or 'å' or 'Å' or 'ā' or 'Ā' or 'ą' or 'Ą' => 'A',
+
+            // éèẻẽẹêếềểễệ / ÉÈẺẼẸÊẾỀỂỄỆ + common Latin -> 'E'
+            'é' or 'è' or 'ẻ' or 'ẽ' or 'ẹ' or
+            'ê' or 'ế' or 'ề' or 'ể' or 'ễ' or 'ệ' or
+            'É' or 'È' or 'Ẻ' or 'Ẽ' or 'Ẹ' or
+            'Ê' or 'Ế' or 'Ề' or 'Ể' or 'Ễ' or 'Ệ' or
+            'ë' or 'Ë' or 'ē' or 'Ē' or 'ę' or 'Ę' => 'E',
+
+            // íìỉĩị / ÍÌỈĨỊ + common Latin -> 'I'
+            'í' or 'ì' or 'ỉ' or 'ĩ' or 'ị' or
+            'Í' or 'Ì' or 'Ỉ' or 'Ĩ' or 'Ị' or
+            'î' or 'Î' or 'ï' or 'Ï' or 'ī' or 'Ī' => 'I',
+
+            // óòỏõọôốồổỗộơớờởỡợ / ÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢ + common Latin -> 'O'
+            'ó' or 'ò' or 'ỏ' or 'õ' or 'ọ' or
+            'ô' or 'ố' or 'ồ' or 'ổ' or 'ỗ' or 'ộ' or
+            'ơ' or 'ớ' or 'ờ' or 'ở' or 'ỡ' or 'ợ' or
+            'Ó' or 'Ò' or 'Ỏ' or 'Õ' or 'Ọ' or
+            'Ô' or 'Ố' or 'Ồ' or 'Ổ' or 'Ỗ' or 'Ộ' or
+            'Ơ' or 'Ớ' or 'Ờ' or 'Ở' or 'Ỡ' or 'Ợ' or
+            'ö' or 'Ö' or 'ø' or 'Ø' or 'ō' or 'Ō' => 'O',
+
+            // úùủũụưứừửữự / ÚÙỦŨỤƯỨỪỬỮỰ + common Latin -> 'U'
+            'ú' or 'ù' or 'ủ' or 'ũ' or 'ụ' or
+            'ư' or 'ứ' or 'ừ' or 'ử' or 'ữ' or 'ự' or
+            'Ú' or 'Ù' or 'Ủ' or 'Ũ' or 'Ụ' or
+            'Ư' or 'Ứ' or 'Ừ' or 'Ử' or 'Ữ' or 'Ự' or
+            'û' or 'Û' or 'ü' or 'Ü' or 'ū' or 'Ū' or 'ų' or 'Ų' => 'U',
+
+            // ýỳỷỹỵ / ÝỲỶỸỴ + common Latin -> 'Y'
+            'ý' or 'ỳ' or 'ỷ' or 'ỹ' or 'ỵ' or
+            'Ý' or 'Ỳ' or 'Ỷ' or 'Ỹ' or 'Ỵ' or
+            'ÿ' or 'Ÿ' => 'Y',
+
+            _ => char.ToUpperInvariant(c)
+        };
+    }
+
+    private static int CountVisibleChars(ReadOnlySpan<char> text)
+    {
+        int count = 0;
+        for (int i = 0; i < text.Length; i++)
+        {
+            if (CharUnicodeInfo.GetUnicodeCategory(text[i]) != UnicodeCategory.NonSpacingMark)
+            {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static int GetCharLengthForVisibleChars(ReadOnlySpan<char> text, int maxVisible)
+    {
+        if (maxVisible <= 0) return 0;
+        int visible = 0;
+        int i = 0;
+        for (; i < text.Length; i++)
+        {
+            if (CharUnicodeInfo.GetUnicodeCategory(text[i]) != UnicodeCategory.NonSpacingMark)
+            {
+                if (visible == maxVisible) break;
+                visible++;
+            }
+        }
+        while (i < text.Length && CharUnicodeInfo.GetUnicodeCategory(text[i]) == UnicodeCategory.NonSpacingMark)
+        {
+            i++;
+        }
+        return i;
+    }
+
     public static int MeasureWidth(ReadOnlySpan<char> text, PixelFontSize size = PixelFontSize.Small)
     {
-        if (text.Length == 0) return 0;
-        return text.Length * CharAdvance(size) - 1;
+        int count = CountVisibleChars(text);
+        if (count == 0) return 0;
+        return count * CharAdvance(size) - 1;
     }
 
     public static void DrawText(
@@ -174,7 +268,13 @@ public static class PixelFont
 
         for (int i = 0; i < text.Length; i++)
         {
-            char c = char.ToUpperInvariant(text[i]);
+            char raw = text[i];
+            if (CharUnicodeInfo.GetUnicodeCategory(raw) == UnicodeCategory.NonSpacingMark)
+            {
+                continue;
+            }
+
+            char c = NormalizeGlyphChar(raw);
             if (size == PixelFontSize.Small)
             {
                 if (Glyphs3x5.TryGetValue(c, out ushort bits) && bits != 0)
@@ -224,7 +324,8 @@ public static class PixelFont
         int maxChars = (maxWidthPx + 1) / advance;
         if (maxChars <= 0) return;
 
-        if (text.Length <= maxChars)
+        int visibleCount = CountVisibleChars(text);
+        if (visibleCount <= maxChars)
         {
             DrawText(buf, x, y, text, color, size, shadowColor);
             return;
@@ -232,15 +333,15 @@ public static class PixelFont
 
         if (maxChars <= 2)
         {
-            DrawText(buf, x, y, text.Slice(0, maxChars), color, size, shadowColor);
+            int sliceLen = GetCharLengthForVisibleChars(text, maxChars);
+            DrawText(buf, x, y, text.Slice(0, sliceLen), color, size, shadowColor);
             return;
         }
 
-        Span<char> scratch = maxChars <= 128 ? stackalloc char[maxChars] : new char[maxChars];
-        text.Slice(0, maxChars - 2).CopyTo(scratch);
-        scratch[maxChars - 2] = '.';
-        scratch[maxChars - 1] = '.';
-        DrawText(buf, x, y, scratch, color, size, shadowColor);
+        int keepVisible = maxChars - 2;
+        int prefixLen = GetCharLengthForVisibleChars(text, keepVisible);
+        DrawText(buf, x, y, text.Slice(0, prefixLen), color, size, shadowColor);
+        DrawText(buf, x + keepVisible * advance, y, "..", color, size, shadowColor);
     }
 
     public static void DrawWrappedText(
@@ -270,12 +371,12 @@ public static class PixelFont
             while (start < len && text[start] == ' ') start++;
             if (start >= len) break;
 
-            int remaining = len - start;
+            int remainingVisible = CountVisibleChars(text.Slice(start));
             bool isLastLine = line == maxLines - 1;
 
-            if (remaining <= maxCharsPerLine)
+            if (remainingVisible <= maxCharsPerLine)
             {
-                DrawText(buf, x, y + line * lineStep, text.Slice(start, remaining), color, size, shadowColor);
+                DrawText(buf, x, y + line * lineStep, text.Slice(start), color, size, shadowColor);
                 break;
             }
 
@@ -285,10 +386,11 @@ public static class PixelFont
                 break;
             }
 
+            int takeLen = GetCharLengthForVisibleChars(text.Slice(start), maxCharsPerLine);
             // Try to break on a space within maxCharsPerLine
             int breakIdx = -1;
-            int searchEnd = start + maxCharsPerLine;
-            for (int i = searchEnd; i > start; i--)
+            int searchEnd = Math.Min(start + takeLen, len);
+            for (int i = searchEnd - 1; i > start; i--)
             {
                 if (text[i] == ' ')
                 {
@@ -297,7 +399,7 @@ public static class PixelFont
                 }
             }
 
-            int take = breakIdx > start ? breakIdx - start : maxCharsPerLine;
+            int take = breakIdx > start ? breakIdx - start : takeLen;
             DrawText(buf, x, y + line * lineStep, text.Slice(start, take), color, size, shadowColor);
             start += take;
         }
