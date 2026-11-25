@@ -68,14 +68,17 @@ public class ProcessAgentCollectorTests
         var detected = collector.DetectProcesses();
 
         var single = Assert.Single(detected);
-        Assert.StartsWith("proc:omp:", single.Id);
+        Assert.Matches(@"^proc:omp:[0-9a-f]{8}$", single.Id);
         Assert.NotEqual("proc:omp:100", single.Id);
-        Assert.DoesNotContain("100", single.Id);
         Assert.Equal(17, single.Id.Length);
         Assert.Equal("OMP", single.Name);
         Assert.Equal(AgentRole.Coder, single.Role);
         Assert.Equal("omp", single.SpriteKey);
         Assert.Equal(100, single.ProcessId);
+
+        // Stable identity across polls
+        var secondPoll = collector.DetectProcesses();
+        Assert.Equal(single.Id, secondPoll[0].Id);
     }
 
     [Fact]
@@ -123,12 +126,15 @@ public class ProcessAgentCollectorTests
         var detected = collector.DetectProcesses();
 
         var agent = Assert.Single(detected);
-        Assert.StartsWith("proc:agy:", agent.Id);
+        Assert.Matches(@"^proc:agy:[0-9a-f]{8}$", agent.Id);
         Assert.NotEqual("proc:agy:81", agent.Id);
-        Assert.DoesNotContain("81", agent.Id);
         Assert.Equal(17, agent.Id.Length);
         Assert.Equal("AGY", agent.Name);
         Assert.Equal("agy", agent.SpriteKey);
+
+        // Stable identity across polls
+        var secondPoll = collector.DetectProcesses();
+        Assert.Equal(agent.Id, secondPoll[0].Id);
     }
 
     [Fact]
@@ -289,5 +295,63 @@ public class ProcessAgentCollectorTests
     {
         bool actual = Win32ProcessInspector.IsRelevantExecutable(exeName!);
         Assert.Equal(expected, actual);
+    }
+
+    private class BlockingMockInspector : IProcessInspectionProvider
+    {
+        public ManualResetEventSlim StartedEvent { get; } = new(false);
+        public ManualResetEventSlim UnblockEvent { get; } = new(false);
+        public bool CacheCleared { get; private set; }
+        public List<ProcessItem> Processes { get; set; } = new();
+
+        public IReadOnlyList<ProcessItem> InspectProcesses()
+        {
+            StartedEvent.Set();
+            UnblockEvent.Wait(5000);
+            return Processes;
+        }
+
+        public void ClearCache()
+        {
+            CacheCleared = true;
+        }
+    }
+
+    [Fact]
+    public void Disable_DuringBlockedInspection_VerifiesHistoryTokensAndInspectorCacheStayEmpty()
+    {
+        var blockingInspector = new BlockingMockInspector
+        {
+            Processes = new List<ProcessItem>
+            {
+                new(100, 10, "omp.exe", "omp.exe", 1000, 20)
+            }
+        };
+
+        var aggregator = new HqStateAggregator();
+        var collector = new ProcessAgentCollector(aggregator, enabled: true, inspector: blockingInspector);
+
+        IReadOnlyList<AgentSnapshot>? detected = null;
+        var thread = new Thread(() =>
+        {
+            detected = collector.DetectProcesses();
+        });
+        thread.Start();
+
+        // Wait until inspection has started and is blocked
+        Assert.True(blockingInspector.StartedEvent.Wait(2000));
+
+        // Disable collector while inspection is still in flight
+        collector.Enabled = false;
+
+        // Unblock inspection
+        blockingInspector.UnblockEvent.Set();
+        thread.Join(2000);
+
+        Assert.NotNull(detected);
+        Assert.Empty(detected);
+        Assert.Equal(0, collector.HistoryCount);
+        Assert.Equal(0, collector.OpaqueTokensCount);
+        Assert.True(blockingInspector.CacheCleared);
     }
 }

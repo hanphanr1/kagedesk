@@ -164,6 +164,112 @@ public class AgentDetailToastAndOverlayClickTests
     }
 
     [Fact]
+    public void WindowFocuser_AncestryValidation_GuardsAgainstPidRecyclingAndCycles()
+    {
+        var parentMap = new Dictionary<int, int>
+        {
+            [100] = 200,
+            [200] = 300,
+            [300] = 100 // cycle
+        };
+
+        var hwnd200 = new IntPtr(0x200);
+        var hwnd300 = new IntPtr(0x300);
+
+        // 1. PID recycled immediately after ancestry snapshot -> aborts!
+        int callCount100 = 0;
+        bool focusedRecycledStart = WindowFocuser.TryFocusProcessWindowCore(
+            pid: 100,
+            expectedStartTicks: 1000L,
+            getStartTime: p =>
+            {
+                if (p == 100)
+                {
+                    callCount100++;
+                    return callCount100 == 1 ? 1000L : 9999L; // recycled after snapshot!
+                }
+                return 500L;
+            },
+            getAncestry: () => parentMap,
+            findWindow: p => p == 200 ? hwnd200 : IntPtr.Zero,
+            verifyOwnership: (h, p, t) => true,
+            focusWindow: h => true);
+        Assert.False(focusedRecycledStart);
+
+        // 2. Child PID recycled during hop child -> parent -> aborts!
+        int childQueryCount = 0;
+        bool focusedRecycledChild = WindowFocuser.TryFocusProcessWindowCore(
+            pid: 100,
+            expectedStartTicks: 1000L,
+            getStartTime: p =>
+            {
+                if (p == 100)
+                {
+                    childQueryCount++;
+                    // 1st: initial check, 2nd: post-snapshot check, 3rd: hop child verification -> recycled!
+                    return childQueryCount < 3 ? 1000L : 8888L;
+                }
+                return 500L;
+            },
+            getAncestry: () => parentMap,
+            findWindow: p => p == 200 ? hwnd200 : IntPtr.Zero,
+            verifyOwnership: (h, p, t) => true,
+            focusWindow: h => true);
+        Assert.False(focusedRecycledChild);
+
+        // 3. Parent created AFTER child (recycled parent PID) -> aborts!
+        bool focusedInvalidParentAge = WindowFocuser.TryFocusProcessWindowCore(
+            pid: 100,
+            expectedStartTicks: 1000L,
+            getStartTime: p => p switch
+            {
+                100 => 1000L,
+                200 => 2000L, // Parent created AFTER child (2000 > 1000)
+                _ => null
+            },
+            getAncestry: () => parentMap,
+            findWindow: p => p == 200 ? hwnd200 : IntPtr.Zero,
+            verifyOwnership: (h, p, t) => true,
+            focusWindow: h => true);
+        Assert.False(focusedInvalidParentAge);
+
+        // 4. Cycle in ancestry -> terminates gracefully without infinite loop
+        bool cycleTerminated = WindowFocuser.TryFocusProcessWindowCore(
+            pid: 100,
+            expectedStartTicks: 1000L,
+            getStartTime: p => p switch
+            {
+                100 => 1000L,
+                200 => 800L,
+                300 => 600L,
+                _ => null
+            },
+            getAncestry: () => parentMap,
+            findWindow: p => IntPtr.Zero, // no windows anywhere
+            verifyOwnership: (h, p, t) => false,
+            focusWindow: h => false);
+        Assert.False(cycleTerminated);
+
+        // 5. Valid ancestry walk finds ancestor window and focuses it
+        IntPtr focusedHwnd = IntPtr.Zero;
+        bool focusSuccess = WindowFocuser.TryFocusProcessWindowCore(
+            pid: 100,
+            expectedStartTicks: 1000L,
+            getStartTime: p => p switch
+            {
+                100 => 1000L,
+                200 => 800L,
+                _ => null
+            },
+            getAncestry: () => parentMap,
+            findWindow: p => p == 200 ? hwnd200 : IntPtr.Zero,
+            verifyOwnership: (h, p, t) => h == hwnd200 && p == 200 && t == 800L,
+            focusWindow: h => { focusedHwnd = h; return true; });
+        Assert.True(focusSuccess);
+        Assert.Equal(hwnd200, focusedHwnd);
+    }
+
+    [Fact]
     public void AgentDetailToast_SingleInstanceReplacement_RaceSafety()
     {
         var snap1 = new AgentSnapshot("t1", "Agent One", AgentRole.Leader, "kakashi", AgentState.Working);

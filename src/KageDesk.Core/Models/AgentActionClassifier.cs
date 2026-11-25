@@ -126,10 +126,26 @@ public static class AgentActionClassifier
         if (input.IsEmpty)
             return null;
 
-        Span<Range> tokens = stackalloc Range[32];
         int tokenCount = 0;
         int start = 0;
         int n = input.Length;
+
+        bool hasTesting = false;
+        bool hasReviewing = false;
+        bool hasGitOps = false;
+        bool hasBuilding = false;
+        bool hasCoding = false;
+        bool hasSearching = false;
+        bool hasResolve = false;
+        bool hasLibrary = false;
+        bool hasQuery = false;
+        bool hasDocs = false;
+        bool hasWeb = false;
+        bool hasReadingPrimary = false;
+        bool hasList = false;
+        bool hasFileDirResources = false;
+        bool hasExecuting = false;
+        bool hasThinking = false;
 
         for (int i = 0; i <= n; i++)
         {
@@ -143,10 +159,25 @@ public static class AgentActionClassifier
                 int tokenEnd = isAcronymTransition ? i - 1 : i;
                 if (tokenEnd > start)
                 {
-                    if (tokenCount < tokens.Length)
-                    {
-                        tokens[tokenCount++] = new Range(start, tokenEnd);
-                    }
+                    tokenCount++;
+                    ReadOnlySpan<char> token = input.Slice(start, tokenEnd - start);
+
+                    if (MatchesAny(token, TestingTokens)) hasTesting = true;
+                    if (MatchesAny(token, ReviewingTokens)) hasReviewing = true;
+                    if (MatchesAny(token, GitOpsTokens)) hasGitOps = true;
+                    if (MatchesAny(token, BuildingTokens)) hasBuilding = true;
+                    if (MatchesAny(token, CodingTokens)) hasCoding = true;
+                    if (MatchesAny(token, SearchingTokens)) hasSearching = true;
+                    if (token.Equals("resolve", StringComparison.OrdinalIgnoreCase)) hasResolve = true;
+                    if (token.Equals("library", StringComparison.OrdinalIgnoreCase)) hasLibrary = true;
+                    if (token.Equals("query", StringComparison.OrdinalIgnoreCase)) hasQuery = true;
+                    if (token.Equals("docs", StringComparison.OrdinalIgnoreCase)) hasDocs = true;
+                    if (token.Equals("web", StringComparison.OrdinalIgnoreCase)) hasWeb = true;
+                    if (MatchesAny(token, ReadingTokens)) hasReadingPrimary = true;
+                    if (token.Equals("list", StringComparison.OrdinalIgnoreCase)) hasList = true;
+                    if (MatchesAny(token, FileDirResourceTokens)) hasFileDirResources = true;
+                    if (MatchesAny(token, ExecutingTokens)) hasExecuting = true;
+                    if (MatchesAny(token, ThinkingTokens)) hasThinking = true;
                 }
 
                 if (isAcronymTransition)
@@ -167,66 +198,57 @@ public static class AgentActionClassifier
         if (tokenCount == 0)
             return null;
 
-        ReadOnlySpan<Range> validTokens = tokens.Slice(0, tokenCount);
-
         // Precedence 1: Testing (test, tests, vitest, jest, pytest, vstest, xunit, nunit)
-        if (HasAnyToken(input, validTokens, TestingTokens))
+        if (hasTesting)
         {
             return (AgentActionKind.Testing, "TEST");
         }
 
         // Precedence 2: Reviewing (review, diff, audit, lint, inspect)
-        if (HasAnyToken(input, validTokens, ReviewingTokens))
+        if (hasReviewing)
         {
             return (AgentActionKind.Reviewing, "REVIEW");
         }
 
         // Precedence 3: GitOps (git, gh, commit, push, merge, pr)
-        if (HasAnyToken(input, validTokens, GitOpsTokens))
+        if (hasGitOps)
         {
             return (AgentActionKind.GitOps, "GIT");
         }
 
         // Precedence 4: Building (build, compile, dotnet, msbuild, tsc, webpack, vite, cargo, gradle, npm, pnpm)
-        if (HasAnyToken(input, validTokens, BuildingTokens))
+        if (hasBuilding)
         {
             return (AgentActionKind.Building, "BUILD");
         }
 
         // Precedence 5: Coding (edit, write, patch, replace, code, create)
-        if (HasAnyToken(input, validTokens, CodingTokens))
+        if (hasCoding)
         {
             return (AgentActionKind.Coding, "CODE");
         }
 
         // Precedence 6: Searching (search, grep, rg, find, glob, fd, findstr, docs, web, resolve-library)
-        if (HasAnyToken(input, validTokens, SearchingTokens) ||
-            (HasToken(input, validTokens, "resolve") && HasToken(input, validTokens, "library")) ||
-            (HasToken(input, validTokens, "query") && HasToken(input, validTokens, "docs")) ||
-            HasToken(input, validTokens, "web"))
+        if (hasSearching || (hasResolve && hasLibrary) || (hasQuery && hasDocs) || hasWeb)
         {
             return (AgentActionKind.Searching, "SCAN");
         }
 
         // Precedence 7: Reading (read, cat, view, open, dir, files, resources)
         // Note: resources / dir / files when paired with read/view/list or exact file-reading tool — NOT list_threads!
-        bool hasReadingPrimary = HasAnyToken(input, validTokens, ReadingTokens);
-        bool hasList = HasToken(input, validTokens, "list");
-        bool hasFileDirResources = HasAnyToken(input, validTokens, FileDirResourceTokens);
-
         if (hasReadingPrimary || (hasList && hasFileDirResources))
         {
             return (AgentActionKind.Reading, "READ");
         }
 
         // Precedence 8: Executing (exec, execute, command, bash, pwsh, powershell, cmd, shell, terminal, run)
-        if (HasAnyToken(input, validTokens, ExecutingTokens))
+        if (hasExecuting)
         {
             return (AgentActionKind.Executing, "EXEC");
         }
 
         // Precedence 9: Explicit Thinking tokens
-        if (HasAnyToken(input, validTokens, ThinkingTokens))
+        if (hasThinking)
         {
             return (AgentActionKind.Thinking, "THINK");
         }
@@ -245,29 +267,13 @@ public static class AgentActionClassifier
     private static readonly string[] ExecutingTokens = { "exec", "execute", "executing", "execution", "command", "bash", "pwsh", "powershell", "cmd", "shell", "terminal", "run", "running" };
     private static readonly string[] ThinkingTokens = { "think", "thinking", "plan", "planning", "chat", "stream", "subagent", "orchestration", "ask" };
 
-    private static bool HasToken(ReadOnlySpan<char> span, ReadOnlySpan<Range> tokens, string match)
+    private static bool MatchesAny(ReadOnlySpan<char> token, string[] matches)
     {
-        for (int i = 0; i < tokens.Length; i++)
+        for (int i = 0; i < matches.Length; i++)
         {
-            if (span[tokens[i]].Equals(match, StringComparison.OrdinalIgnoreCase))
+            if (token.Equals(matches[i], StringComparison.OrdinalIgnoreCase))
             {
                 return true;
-            }
-        }
-        return false;
-    }
-
-    private static bool HasAnyToken(ReadOnlySpan<char> span, ReadOnlySpan<Range> tokens, string[] matches)
-    {
-        for (int i = 0; i < tokens.Length; i++)
-        {
-            ReadOnlySpan<char> token = span[tokens[i]];
-            for (int m = 0; m < matches.Length; m++)
-            {
-                if (token.Equals(matches[m], StringComparison.OrdinalIgnoreCase))
-                {
-                    return true;
-                }
             }
         }
         return false;

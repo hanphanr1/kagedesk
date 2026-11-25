@@ -51,11 +51,13 @@ public class ConfigStore
                 using var doc = JsonDocument.Parse(json);
                 foreach (var prop in doc.RootElement.EnumerateObject())
                 {
-                    if (string.Equals(prop.Name, "ConfigVersion", StringComparison.OrdinalIgnoreCase) && prop.Value.TryGetInt32(out var v))
+                    if (string.Equals(prop.Name, "ConfigVersion", StringComparison.OrdinalIgnoreCase))
                     {
                         hasExplicitVersion = true;
-                        fileVersion = v;
-                        break;
+                        if (prop.Value.TryGetInt32(out var v))
+                        {
+                            fileVersion = v;
+                        }
                     }
                 }
             }
@@ -63,6 +65,11 @@ public class ConfigStore
 
             var config = JsonSerializer.Deserialize<AppConfig>(json, JsonOptions);
             if (config == null) return new AppConfig();
+
+            if (hasExplicitVersion)
+            {
+                fileVersion = config.ConfigVersion;
+            }
 
             if (!hasExplicitVersion || fileVersion < 2)
             {

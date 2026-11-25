@@ -39,23 +39,72 @@ public class ProcessAgentCollector
     private readonly HashSet<string> _usedTokens = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _lock = new();
 
+    private long _generation;
     private bool _enabled;
+
+    public long Generation
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _generation;
+            }
+        }
+    }
+
+    internal int HistoryCount
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _history.Count;
+            }
+        }
+    }
+
+    internal int OpaqueTokensCount
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _opaqueTokens.Count;
+            }
+        }
+    }
+
     public bool Enabled
     {
-        get => _enabled;
+        get
+        {
+            lock (_lock)
+            {
+                return _enabled;
+            }
+        }
         set
         {
-            if (_enabled && !value)
+            bool shouldClearInspector = false;
+            lock (_lock)
             {
-                lock (_lock)
+                if (_enabled == value) return;
+                _enabled = value;
+                if (!value)
                 {
+                    _generation++;
                     _history.Clear();
                     _opaqueTokens.Clear();
                     _usedTokens.Clear();
+                    shouldClearInspector = true;
                 }
+            }
+
+            if (shouldClearInspector)
+            {
                 _inspector.ClearCache();
             }
-            _enabled = value;
         }
     }
 
@@ -68,7 +117,7 @@ public class ProcessAgentCollector
         _aggregator = aggregator ?? throw new ArgumentNullException(nameof(aggregator));
         _inspector = inspector ?? Win32ProcessInspector.Instance;
         _timeProvider = timeProvider ?? (() => DateTimeOffset.UtcNow);
-        Enabled = enabled;
+        _enabled = enabled;
     }
 
     private string GetOrCreateOpaqueToken(int pid, long startTicks)
@@ -90,20 +139,39 @@ public class ProcessAgentCollector
 
     public IReadOnlyList<AgentSnapshot> DetectProcesses()
     {
-        if (!Enabled)
-            return Array.Empty<AgentSnapshot>();
+        long capturedGen;
+        lock (_lock)
+        {
+            if (!_enabled)
+                return Array.Empty<AgentSnapshot>();
+            capturedGen = _generation;
+        }
 
         try
         {
             var processes = _inspector.InspectProcesses();
-            if (processes.Count == 0)
+            if (processes == null || processes.Count == 0)
             {
+                bool clearInspector = false;
                 lock (_lock)
                 {
-                    _history.Clear();
-                    _opaqueTokens.Clear();
-                    _usedTokens.Clear();
+                    if (!_enabled || _generation != capturedGen)
+                    {
+                        clearInspector = !_enabled;
+                    }
+                    else
+                    {
+                        _history.Clear();
+                        _opaqueTokens.Clear();
+                        _usedTokens.Clear();
+                    }
                 }
+
+                if (clearInspector)
+                {
+                    _inspector.ClearCache();
+                }
+
                 return Array.Empty<AgentSnapshot>();
             }
 
@@ -193,10 +261,19 @@ public class ProcessAgentCollector
             }
 
             var detected = new List<AgentSnapshot>(candidates.Count);
+            bool clearInspectorOnDisabled = false;
+            bool generationMismatch = false;
 
             lock (_lock)
             {
-                var liveCandidatePids = new HashSet<int>(candidates.Count);
+                if (!_enabled || _generation != capturedGen)
+                {
+                    generationMismatch = true;
+                    clearInspectorOnDisabled = !_enabled;
+                }
+                else
+                {
+                    var liveCandidatePids = new HashSet<int>(candidates.Count);
                 var liveKeys = new HashSet<(int Pid, long StartTicks)>(candidates.Count);
 
                 // Group by Provider to number multiple instances stably
@@ -361,6 +438,17 @@ public class ProcessAgentCollector
                     }
                 }
             }
+        }
+
+            if (clearInspectorOnDisabled)
+            {
+                _inspector.ClearCache();
+            }
+
+            if (generationMismatch)
+            {
+                return Array.Empty<AgentSnapshot>();
+            }
 
             return detected;
         }
@@ -488,8 +576,20 @@ public class ProcessAgentCollector
 
     public void CollectOnce()
     {
-        if (!Enabled) return;
+        long capturedGen;
+        lock (_lock)
+        {
+            if (!_enabled) return;
+            capturedGen = _generation;
+        }
+
         var detected = DetectProcesses();
+
+        lock (_lock)
+        {
+            if (!_enabled || _generation != capturedGen) return;
+        }
+
         _aggregator.UpdateProcessAgents(detected);
     }
 }

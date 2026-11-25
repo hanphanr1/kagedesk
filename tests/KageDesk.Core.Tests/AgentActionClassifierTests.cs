@@ -82,4 +82,29 @@ public class AgentActionClassifierTests
         Assert.Equal(AgentActionKind.Building, kind);
         Assert.Equal("BUILD", label);
     }
+
+    [Fact]
+    public void Classify_MoreThan32Tokens_DecisiveTokenPastCutoffIsRecognized()
+    {
+        // 38 dummy neutral tokens followed by "read" and "file" at tokens #39 and #40
+        var tokens = Enumerable.Range(1, 38).Select(i => $"dummytoken{i}").ToList();
+        tokens.Add("read");
+        tokens.Add("file");
+        string longTaskTitle = string.Join(" ", tokens);
+
+        var (kind, label) = AgentActionClassifier.Classify(AgentState.Working, null, longTaskTitle);
+        Assert.Equal(AgentActionKind.Reading, kind);
+        Assert.Equal("READ", label);
+
+        // Another test with "edit" appearing past token #36
+        var tokensEdit = Enumerable.Range(1, 36).Select(i => $"item{i}").ToList();
+        tokensEdit.Add("edit");
+        tokensEdit.Add("source");
+        tokensEdit.Add("code");
+        string longEditTask = string.Join(" ", tokensEdit);
+
+        var (kindEdit, labelEdit) = AgentActionClassifier.Classify(AgentState.Working, null, longEditTask);
+        Assert.Equal(AgentActionKind.Coding, kindEdit);
+        Assert.Equal("CODE", labelEdit);
+    }
 }

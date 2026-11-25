@@ -348,33 +348,41 @@ public sealed class HqWallpaperRenderer
 
     private void DrawRoomBackdrop(PixelBuffer buf, float timeSeconds, bool hasExtraRow)
     {
-        if (hasExtraRow)
+        if (buf.Width == CanvasWidth && buf.Height == CanvasHeight)
         {
-            if (_backdropWithExtraValid && ReferenceEquals(_backdropTheme, _cachedTheme))
+            if (hasExtraRow)
             {
-                _cachedBackdropWithExtra.AsSpan().CopyTo(buf.Pixels);
+                if (_backdropWithExtraValid && ReferenceEquals(_backdropTheme, _cachedTheme))
+                {
+                    _cachedBackdropWithExtra.AsSpan().CopyTo(buf.Pixels);
+                }
+                else
+                {
+                    DrawRoomBackdropCore(buf, hasExtraRow: true);
+                    buf.ReadOnlyPixels.CopyTo(_cachedBackdropWithExtra);
+                    _backdropWithExtraValid = true;
+                    _backdropTheme = _cachedTheme;
+                }
             }
             else
             {
-                RenderStaticBackdropTo(buf, hasExtraRow: true);
-                buf.ReadOnlyPixels.CopyTo(_cachedBackdropWithExtra);
-                _backdropWithExtraValid = true;
-                _backdropTheme = _cachedTheme;
+                if (_backdropNoExtraValid && ReferenceEquals(_backdropTheme, _cachedTheme))
+                {
+                    _cachedBackdropNoExtra.AsSpan().CopyTo(buf.Pixels);
+                }
+                else
+                {
+                    DrawRoomBackdropCore(buf, hasExtraRow: false);
+                    buf.ReadOnlyPixels.CopyTo(_cachedBackdropNoExtra);
+                    _backdropNoExtraValid = true;
+                    _backdropTheme = _cachedTheme;
+                }
             }
         }
         else
         {
-            if (_backdropNoExtraValid && ReferenceEquals(_backdropTheme, _cachedTheme))
-            {
-                _cachedBackdropNoExtra.AsSpan().CopyTo(buf.Pixels);
-            }
-            else
-            {
-                RenderStaticBackdropTo(buf, hasExtraRow: false);
-                buf.ReadOnlyPixels.CopyTo(_cachedBackdropNoExtra);
-                _backdropNoExtraValid = true;
-                _backdropTheme = _cachedTheme;
-            }
+            // Bypass the exact-size backdrop cache for non-matching or oversized buffers
+            DrawRoomBackdropCore(buf, hasExtraRow);
         }
 
         if (_palette.SkylineStyle == "cyber")
@@ -388,7 +396,7 @@ public sealed class HqWallpaperRenderer
         }
     }
 
-    private void RenderStaticBackdropTo(PixelBuffer buf, bool hasExtraRow)
+    private void DrawRoomBackdropCore(PixelBuffer buf, bool hasExtraRow)
     {
         // Upper wall (y: 0..71)
         buf.FillVerticalGradient(0, 0, CanvasWidth, 72, _palette.WallTop, _palette.WallBottom);

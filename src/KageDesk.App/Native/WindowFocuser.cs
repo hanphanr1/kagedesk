@@ -25,11 +25,36 @@ public static class WindowFocuser
 
     public static bool TryFocusProcessWindow(int pid, long? expectedStartTicks = null)
     {
+        return TryFocusProcessWindowCore(
+            pid,
+            expectedStartTicks,
+            getStartTime: GetLiveProcessStartTimeTicks,
+            getAncestry: Win32ProcessInspector.GetProcessAncestrySnapshot,
+            findWindow: FindTopLevelWindowForProcess,
+            verifyOwnership: (h, p, t) => VerifyHwndOwnership(h, p, t),
+            focusWindow: FocusHwnd);
+    }
+
+    public static bool TryFocusProcessWindowCore(
+        int pid,
+        long? expectedStartTicks = null,
+        Func<int, long?>? getStartTime = null,
+        Func<IReadOnlyDictionary<int, int>>? getAncestry = null,
+        Func<int, IntPtr>? findWindow = null,
+        Func<IntPtr, int, long, bool>? verifyOwnership = null,
+        Func<IntPtr, bool>? focusWindow = null)
+    {
         if (pid <= 0) return false;
+
+        getStartTime ??= GetLiveProcessStartTimeTicks;
+        getAncestry ??= Win32ProcessInspector.GetProcessAncestrySnapshot;
+        findWindow ??= FindTopLevelWindowForProcess;
+        verifyOwnership ??= (h, p, t) => VerifyHwndOwnership(h, p, t);
+        focusWindow ??= FocusHwnd;
 
         try
         {
-            long? targetStartTicks = GetLiveProcessStartTimeTicks(pid);
+            long? targetStartTicks = getStartTime(pid);
             if (!targetStartTicks.HasValue) return false;
 
             if (expectedStartTicks.HasValue && !IsPidAgeValid(targetStartTicks.Value, expectedStartTicks.Value))
@@ -37,17 +62,28 @@ public static class WindowFocuser
                 return false;
             }
 
+            long verifiedTargetTicks = targetStartTicks.Value;
+
             // 1. Direct check on target PID
-            IntPtr directHwnd = FindTopLevelWindowForProcess(pid);
-            if (directHwnd != IntPtr.Zero && VerifyHwndOwnership(directHwnd, pid, targetStartTicks.Value))
+            IntPtr directHwnd = findWindow(pid);
+            if (directHwnd != IntPtr.Zero && verifyOwnership(directHwnd, pid, verifiedTargetTicks))
             {
-                return FocusHwnd(directHwnd);
+                return focusWindow(directHwnd);
             }
 
             // 2. Walk up parent process chain via lightweight GetProcessAncestrySnapshot
-            var parentMap = Win32ProcessInspector.GetProcessAncestrySnapshot();
+            var parentMap = getAncestry();
+
+            // Immediately after capturing ancestry snapshot, re-verify starting PID's live StartTimeUtcTicks
+            long? postSnapshotStartTicks = getStartTime(pid);
+            if (!postSnapshotStartTicks.HasValue || postSnapshotStartTicks.Value != verifiedTargetTicks)
+            {
+                return false;
+            }
+
             int currentPid = pid;
-            long currentStartTicks = targetStartTicks.Value;
+            long currentStartTicks = verifiedTargetTicks;
+            var visited = new HashSet<int> { pid };
 
             for (int depth = 0; depth < 10; depth++)
             {
@@ -56,22 +92,31 @@ public static class WindowFocuser
                     break;
                 }
 
-                long? parentStartTicks = GetLiveProcessStartTimeTicks(parentPid);
-                if (!parentStartTicks.HasValue)
+                // Cycle protection
+                if (!visited.Add(parentPid))
                 {
                     break;
                 }
 
-                if (!IsParentAgeValid(parentStartTicks.Value, currentStartTicks))
+                // On EVERY hop child -> parent, re-verify the child's live StartTimeUtcTicks matches previous verified hop's start ticks
+                long? liveChildTicks = getStartTime(currentPid);
+                if (!liveChildTicks.HasValue || liveChildTicks.Value != currentStartTicks)
                 {
-                    // Parent created after child -> recycled PID
                     break;
                 }
 
-                IntPtr parentHwnd = FindTopLevelWindowForProcess(parentPid);
-                if (parentHwnd != IntPtr.Zero && VerifyHwndOwnership(parentHwnd, parentPid, parentStartTicks.Value))
+                // Verify parentStartTicks > 0 && parentStartTicks <= childStartTicks
+                long? parentStartTicks = getStartTime(parentPid);
+                if (!parentStartTicks.HasValue || parentStartTicks.Value <= 0 || !IsParentAgeValid(parentStartTicks.Value, currentStartTicks))
                 {
-                    return FocusHwnd(parentHwnd);
+                    break;
+                }
+
+                // Before activating any HWND, re-verify IsWindow && IsWindowVisible and GetWindowThreadProcessId + StartTimeUtcTicks match
+                IntPtr parentHwnd = findWindow(parentPid);
+                if (parentHwnd != IntPtr.Zero && verifyOwnership(parentHwnd, parentPid, parentStartTicks.Value))
+                {
+                    return focusWindow(parentHwnd);
                 }
 
                 currentPid = parentPid;

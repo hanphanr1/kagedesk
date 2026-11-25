@@ -96,13 +96,91 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
     // Cache ONLY derived ProcessClassification by (PID, StartTimeTicks)
     private readonly Dictionary<(int Pid, long StartTimeTicks), ProcessClassification> _classificationCache = new();
     private readonly object _lock = new();
+    private long _cacheGeneration;
+
+    public long CacheGeneration => Interlocked.Read(ref _cacheGeneration);
+
+    public int CacheCount
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _classificationCache.Count;
+            }
+        }
+    }
 
     public void ClearCache()
     {
         lock (_lock)
         {
+            Interlocked.Increment(ref _cacheGeneration);
             _classificationCache.Clear();
         }
+    }
+
+    public static bool RequiresCommandLineClassification(string exeName)
+    {
+        if (string.IsNullOrEmpty(exeName)) return false;
+        string name = exeName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+            ? exeName[..^4].ToLowerInvariant()
+            : exeName.ToLowerInvariant();
+
+        return name is "node" or "bun" or "omp" or "agy" or "antigravity" or "claude" or "codex" or "opencode" or "gemini";
+    }
+
+    internal bool TryGetCachedClassification(int pid, long startTicks, out ProcessClassification? classification)
+    {
+        lock (_lock)
+        {
+            return _classificationCache.TryGetValue((pid, startTicks), out classification);
+        }
+    }
+
+    internal ProcessClassification ResolveClassification(
+        int pid,
+        long startTicks,
+        string exeName,
+        Func<string?> readCommandLine,
+        long capturedGen)
+    {
+        if (startTicks <= 0)
+        {
+            // Never cache when startTicks <= 0
+            string? cmdLine = readCommandLine();
+            return ClassifyProcess(exeName, cmdLine);
+        }
+
+        var key = (pid, startTicks);
+        lock (_lock)
+        {
+            if (_classificationCache.TryGetValue(key, out var cached))
+            {
+                return cached;
+            }
+        }
+
+        bool requiresCmd = RequiresCommandLineClassification(exeName);
+        string? cmd = readCommandLine();
+
+        if (requiresCmd && cmd == null)
+        {
+            // Exe-only fallback for THIS poll; do NOT poison cache!
+            return ClassifyProcess(exeName, null);
+        }
+
+        var classification = ClassifyProcess(exeName, cmd);
+
+        lock (_lock)
+        {
+            if (Interlocked.Read(ref _cacheGeneration) == capturedGen)
+            {
+                _classificationCache[key] = classification;
+            }
+        }
+
+        return classification;
     }
 
     public static Dictionary<int, int> GetProcessAncestrySnapshot()
@@ -146,6 +224,7 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
 
     public IReadOnlyList<ProcessItem> InspectProcesses()
     {
+        long capturedGen = Interlocked.Read(ref _cacheGeneration);
         var rawEntries = new List<(int Pid, int ParentPid, string ExeName)>(256);
 
         IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -184,74 +263,78 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
         var results = new List<ProcessItem>(rawEntries.Count);
         var activeKeys = new HashSet<(int Pid, long StartTimeTicks)>(rawEntries.Count);
 
+        foreach (var (pid, parentPid, exeName) in rawEntries)
+        {
+            if (!IsRelevantExecutable(exeName))
+            {
+                results.Add(new ProcessItem(pid, parentPid, exeName, null, 0, 0, null));
+                continue;
+            }
+
+            IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (hProcess == IntPtr.Zero)
+            {
+                results.Add(new ProcessItem(pid, parentPid, exeName, null, 0, 0, null));
+                continue;
+            }
+
+            try
+            {
+                long startTicks = 0;
+                long totalCpuMs = 0;
+
+                if (GetProcessTimes(hProcess, out var createTime, out _, out var kernelTime, out var userTime))
+                {
+                    long ft = ((long)createTime.dwHighDateTime << 32) | (uint)createTime.dwLowDateTime;
+                    try
+                    {
+                        startTicks = DateTime.FromFileTimeUtc(ft).Ticks;
+                    }
+                    catch
+                    {
+                        startTicks = ft;
+                    }
+                    long kTicks = ((long)kernelTime.dwHighDateTime << 32) | (uint)kernelTime.dwLowDateTime;
+                    long uTicks = ((long)userTime.dwHighDateTime << 32) | (uint)userTime.dwLowDateTime;
+                    totalCpuMs = (kTicks + uTicks) / 10000; // 100-ns ticks to ms
+                }
+
+                if (startTicks > 0)
+                {
+                    activeKeys.Add((pid, startTicks));
+                }
+
+                var classification = ResolveClassification(
+                    pid,
+                    startTicks,
+                    exeName,
+                    () => ReadProcessCommandLine(hProcess),
+                    capturedGen);
+
+                results.Add(new ProcessItem(pid, parentPid, exeName, null, startTicks, totalCpuMs, classification));
+            }
+            finally
+            {
+                CloseHandle(hProcess);
+            }
+        }
+
         lock (_lock)
         {
-            foreach (var (pid, parentPid, exeName) in rawEntries)
+            if (Interlocked.Read(ref _cacheGeneration) == capturedGen)
             {
-                if (!IsRelevantExecutable(exeName))
+                var staleKeys = new List<(int Pid, long StartTimeTicks)>();
+                foreach (var k in _classificationCache.Keys)
                 {
-                    results.Add(new ProcessItem(pid, parentPid, exeName, null, 0, 0, null));
-                    continue;
-                }
-
-                IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-                if (hProcess == IntPtr.Zero)
-                {
-                    results.Add(new ProcessItem(pid, parentPid, exeName, null, 0, 0, null));
-                    continue;
-                }
-
-                try
-                {
-                    long startTicks = 0;
-                    long totalCpuMs = 0;
-
-                    if (GetProcessTimes(hProcess, out var createTime, out _, out var kernelTime, out var userTime))
+                    if (!activeKeys.Contains(k))
                     {
-                        long ft = ((long)createTime.dwHighDateTime << 32) | (uint)createTime.dwLowDateTime;
-                        try
-                        {
-                            startTicks = DateTime.FromFileTimeUtc(ft).Ticks;
-                        }
-                        catch
-                        {
-                            startTicks = ft;
-                        }
-                        long kTicks = ((long)kernelTime.dwHighDateTime << 32) | (uint)kernelTime.dwLowDateTime;
-                        long uTicks = ((long)userTime.dwHighDateTime << 32) | (uint)userTime.dwLowDateTime;
-                        totalCpuMs = (kTicks + uTicks) / 10000; // 100-ns ticks to ms
+                        staleKeys.Add(k);
                     }
-
-                    var key = (pid, startTicks);
-                    activeKeys.Add(key);
-
-                    if (!_classificationCache.TryGetValue(key, out var classification))
-                    {
-                        string? cmdLine = ReadProcessCommandLine(hProcess);
-                        classification = ClassifyProcess(exeName, cmdLine);
-                        _classificationCache[key] = classification;
-                    }
-
-                    results.Add(new ProcessItem(pid, parentPid, exeName, null, startTicks, totalCpuMs, classification));
                 }
-                finally
+                foreach (var k in staleKeys)
                 {
-                    CloseHandle(hProcess);
+                    _classificationCache.Remove(k);
                 }
-            }
-
-            // Strictly evict stale entries not in activeKeys (never rely on count heuristics)
-            var staleKeys = new List<(int Pid, long StartTimeTicks)>();
-            foreach (var k in _classificationCache.Keys)
-            {
-                if (!activeKeys.Contains(k))
-                {
-                    staleKeys.Add(k);
-                }
-            }
-            foreach (var k in staleKeys)
-            {
-                _classificationCache.Remove(k);
             }
         }
 

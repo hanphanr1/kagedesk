@@ -256,16 +256,29 @@ public class AgentDetailToast : Form
                 catch { }
             }
 
+            AgentDetailToast? newToast = null;
             try
             {
-                var toast = new AgentDetailToast(agent);
-                _activeToast = toast;
-                toast.Show();
-                toast.StartDismissTimer();
+                newToast = new AgentDetailToast(agent);
+                _activeToast = newToast;
+                newToast.Show();
+                newToast.StartDismissTimer();
             }
             catch
             {
-                _activeToast = null;
+                if (ReferenceEquals(_activeToast, newToast))
+                {
+                    _activeToast = null;
+                }
+
+                if (newToast != null)
+                {
+                    try
+                    {
+                        newToast.Dispose();
+                    }
+                    catch { }
+                }
             }
         }
     }

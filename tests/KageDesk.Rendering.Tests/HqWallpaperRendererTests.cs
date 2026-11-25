@@ -405,4 +405,35 @@ public class HqWallpaperRendererTests
         }
         return set.Count;
     }
+
+    [Fact]
+    public void Render_OversizedPixelBuffer_RendersWithoutExceptionAndDrawsPixels()
+    {
+        var renderer = new HqWallpaperRenderer();
+        var state = CreateState();
+        var theme = ThemePackLoader.BuiltInFallback;
+
+        using var oversizedBuf = new PixelBuffer(420, 250);
+        oversizedBuf.ClearTransparent();
+
+        // Must not throw ArgumentException and must render scene
+        var ex = Record.Exception(() => renderer.Render(oversizedBuf, state, theme, 1.0f));
+        Assert.Null(ex);
+
+        // Verify pixels are rendered
+        bool hasNonZeroPixel = false;
+        foreach (int pixel in oversizedBuf.ReadOnlyPixels)
+        {
+            if (pixel != 0)
+            {
+                hasNonZeroPixel = true;
+                break;
+            }
+        }
+        Assert.True(hasNonZeroPixel);
+
+        // Verify second render (validating any caching edge case on subsequent frames)
+        var ex2 = Record.Exception(() => renderer.Render(oversizedBuf, state, theme, 2.0f));
+        Assert.Null(ex2);
+    }
 }

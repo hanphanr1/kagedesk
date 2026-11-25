@@ -210,5 +210,68 @@ public class ConfigStoreTests
             }
         }
     }
+
+    [Fact]
+    public void Load_DuplicateConfigVersionProperties_LastWinsWithoutRewriting()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "kagedesk_cfg_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var tempFile = Path.Combine(dir, "config.json");
+
+        try
+        {
+            string duplicateJson = "{\"ConfigVersion\":1,\"configVersion\":2,\"enableProcessAgentCollector\":false}";
+            File.WriteAllText(tempFile, duplicateJson);
+
+            var store = new ConfigStore(tempFile);
+            var loaded = store.Load();
+
+            Assert.Equal(2, loaded.ConfigVersion);
+            Assert.False(loaded.EnableProcessAgentCollector);
+
+            // Verify file was NOT rewritten/migrated
+            string contentOnDisk = File.ReadAllText(tempFile);
+            Assert.Equal(duplicateJson, contentOnDisk);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+            {
+                try { Directory.Delete(dir, recursive: true); } catch { }
+            }
+        }
+    }
+
+    [Fact]
+    public void Load_DuplicateConfigVersionProperties_LastWinsV1_MigratesAndRewrites()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "kagedesk_cfg_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var tempFile = Path.Combine(dir, "config.json");
+
+        try
+        {
+            string duplicateJson = "{\"ConfigVersion\":2,\"configVersion\":1,\"enableProcessAgentCollector\":false}";
+            File.WriteAllText(tempFile, duplicateJson);
+
+            var store = new ConfigStore(tempFile);
+            var loaded = store.Load();
+
+            Assert.Equal(2, loaded.ConfigVersion);
+            Assert.True(loaded.EnableProcessAgentCollector);
+
+            // Verify file was rewritten with v2
+            string contentOnDisk = File.ReadAllText(tempFile);
+            Assert.Contains("\"ConfigVersion\": 2", contentOnDisk);
+            Assert.Contains("\"EnableProcessAgentCollector\": true", contentOnDisk);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+            {
+                try { Directory.Delete(dir, recursive: true); } catch { }
+            }
+        }
+    }
 }
 
