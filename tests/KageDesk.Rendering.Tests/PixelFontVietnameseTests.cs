@@ -248,7 +248,10 @@ public class PixelFontVietnameseTests
     [Theory]
     [InlineData("\n")]
     [InlineData("\r\n")]
-    public void PixelFont_DrawWrappedText_ExplicitNewlines_BreaksAcrossLines(string newline)
+    [InlineData("\n\n")]
+    [InlineData("\r\n\r\n")]
+    [InlineData(" \n ")]
+    public void PixelFont_DrawWrappedText_ApprovalPrompt_WithConsecutiveNewlines_RendersBothPartsCleanly(string newline)
     {
         const int maxWidthPx = 192;
         const int maxLines = 2;
@@ -257,9 +260,125 @@ public class PixelFontVietnameseTests
         int lineStep = PixelFont.LineHeight(size) + lineSpacing;
         int color = ColorUtil.White;
 
-        string line1 = "Approval requested:";
-        string line2 = "Deploy to production environment";
-        string prompt = line1 + newline + line2;
+        string prompt = "Approval requested:" + newline + "Deploy service";
+
+        using var bufWrapped = new PixelBuffer(200, lineStep * maxLines + 4);
+        using var bufExpected = new PixelBuffer(200, lineStep * maxLines + 4);
+
+        PixelFont.DrawWrappedText(bufWrapped, 0, 0, maxWidthPx, maxLines, prompt, color, size, lineSpacing);
+
+        // Normalized layout matches "Approval requested: Deploy service"
+        PixelFont.DrawWrappedText(bufExpected, 0, 0, maxWidthPx, maxLines, "Approval requested: Deploy service", color, size, lineSpacing);
+
+        var wrappedPixels = bufWrapped.ReadOnlyPixels;
+        var expectedPixels = bufExpected.ReadOnlyPixels;
+        Assert.Equal(expectedPixels.Length, wrappedPixels.Length);
+        for (int i = 0; i < expectedPixels.Length; i++)
+        {
+            Assert.Equal(expectedPixels[i], wrappedPixels[i]);
+        }
+
+        // Concretely verify "Deploy service" is visibly rendered (not dropped)
+        // "Deploy service" starts at char index 20 (x = 20 * 4 = 80)
+        int deployServiceLitPixels = CountLitPixels(bufWrapped, 20 * 4, 0, 14 * 4, PixelFont.LineHeight(size));
+        Assert.True(deployServiceLitPixels > 0, "Deploy service must be visibly rendered and not dropped!");
+    }
+
+    [Theory]
+    [InlineData("\n")]
+    [InlineData("\r\n")]
+    [InlineData("\n\n")]
+    [InlineData("\r\n\r\n")]
+    public void PixelFont_DrawWrappedText_ApprovalPrompt_WrapsToRow2_DoesNotWasteRowOnBlankLine(string newline)
+    {
+        const int maxWidthPx = 80; // 20 chars per line
+        const int maxLines = 2;
+        const PixelFontSize size = PixelFontSize.Small;
+        const int lineSpacing = 4;
+        int lineStep = PixelFont.LineHeight(size) + lineSpacing;
+        int color = ColorUtil.White;
+
+        string prompt = "Approval requested:" + newline + "Deploy service";
+
+        using var bufWrapped = new PixelBuffer(100, lineStep * maxLines + 4);
+        using var bufExpected = new PixelBuffer(100, lineStep * maxLines + 4);
+
+        PixelFont.DrawWrappedText(bufWrapped, 0, 0, maxWidthPx, maxLines, prompt, color, size, lineSpacing);
+
+        // Row 1: "Approval requested:" (19 chars)
+        // Row 2: "Deploy service" (14 chars)
+        PixelFont.DrawText(bufExpected, 0, 0, "Approval requested:", color, size);
+        PixelFont.DrawText(bufExpected, 0, lineStep, "Deploy service", color, size);
+
+        var wrappedPixels = bufWrapped.ReadOnlyPixels;
+        var expectedPixels = bufExpected.ReadOnlyPixels;
+        Assert.Equal(expectedPixels.Length, wrappedPixels.Length);
+        for (int i = 0; i < expectedPixels.Length; i++)
+        {
+            Assert.Equal(expectedPixels[i], wrappedPixels[i]);
+        }
+
+        // Row 2 MUST NOT be a blank line: verify non-empty glyphs for "Deploy service" on row 2
+        int row2LitPixels = CountLitPixels(bufWrapped, 0, lineStep, 14 * 4, PixelFont.LineHeight(size));
+        Assert.True(row2LitPixels > 0, "Row 2 must render 'Deploy service' and not be wasted on a blank line!");
+    }
+
+    [Theory]
+    [InlineData("\n")]
+    [InlineData("\r\n")]
+    public void PixelFont_DrawWrappedText_ThreeLinePrompt_ExceedingMaxLines_RendersTruncationEllipsis(string newline)
+    {
+        const int maxWidthPx = 80; // 20 chars per line
+        const int maxLines = 2;
+        const PixelFontSize size = PixelFontSize.Small;
+        const int lineSpacing = 4;
+        int lineStep = PixelFont.LineHeight(size) + lineSpacing;
+        int color = ColorUtil.White;
+
+        string p1 = "First line here";     // 15 chars (< 20)
+        string p2 = "Second line here";    // 16 chars (< 20)
+        string p3 = "Third line overflow"; // 19 chars
+        string prompt = p1 + newline + p2 + newline + p3;
+
+        using var bufWrapped = new PixelBuffer(100, lineStep * maxLines + 4);
+        using var bufExpected = new PixelBuffer(100, lineStep * maxLines + 4);
+
+        PixelFont.DrawWrappedText(bufWrapped, 0, 0, maxWidthPx, maxLines, prompt, color, size, lineSpacing);
+
+        // Expected:
+        // Row 0: "First line here"
+        // Row 1: DrawTextTruncated for "Second line here Third line overflow"
+        PixelFont.DrawText(bufExpected, 0, 0, p1, color, size);
+        PixelFont.DrawTextTruncated(bufExpected, 0, lineStep, maxWidthPx, p2 + " " + p3, color, size);
+
+        var wrappedPixels = bufWrapped.ReadOnlyPixels;
+        var expectedPixels = bufExpected.ReadOnlyPixels;
+        Assert.Equal(expectedPixels.Length, wrappedPixels.Length);
+        for (int i = 0; i < expectedPixels.Length; i++)
+        {
+            Assert.Equal(expectedPixels[i], wrappedPixels[i]);
+        }
+
+        // Exact pixel/glyph verification of truncation ellipsis indicator on row 1:
+        // maxCharsPerLine = 20, keepVisible = 18. Ellipsis ".." is drawn at x = 18 * 4 = 72
+        int ellipsisLitPixels = CountLitPixels(bufWrapped, 18 * 4, lineStep, 2 * 4, PixelFont.LineHeight(size));
+        Assert.True(ellipsisLitPixels > 0, "Truncation ellipsis indicator '..' must be rendered on the final row!");
+    }
+
+    [Fact]
+    public void PixelFont_DrawWrappedText_ThreeLinePrompt_192px_ExceedingMaxLines_RendersTruncationEllipsis()
+    {
+        const int maxWidthPx = 192; // 48 chars per line
+        const int maxLines = 2;
+        const PixelFontSize size = PixelFontSize.Small;
+        const int lineSpacing = 4;
+        int lineStep = PixelFont.LineHeight(size) + lineSpacing;
+        int color = ColorUtil.White;
+
+        string line1 = "This is a test of the emergency broadcast system"; // 48 chars
+        string line2 = "Please respond immediately to approve this task."; // 48 chars
+        string line3 = "Extra line 3 that must trigger truncation dots!!"; // 48 chars
+        string prompt = line1 + "\n" + line2 + "\n" + line3;
 
         using var bufWrapped = new PixelBuffer(200, lineStep * maxLines + 4);
         using var bufExpected = new PixelBuffer(200, lineStep * maxLines + 4);
@@ -267,14 +386,79 @@ public class PixelFontVietnameseTests
         PixelFont.DrawWrappedText(bufWrapped, 0, 0, maxWidthPx, maxLines, prompt, color, size, lineSpacing);
 
         PixelFont.DrawText(bufExpected, 0, 0, line1, color, size);
-        PixelFont.DrawText(bufExpected, 0, lineStep, line2, color, size);
+        PixelFont.DrawTextTruncated(bufExpected, 0, lineStep, maxWidthPx, line2 + " " + line3, color, size);
 
         var wrappedPixels = bufWrapped.ReadOnlyPixels;
         var expectedPixels = bufExpected.ReadOnlyPixels;
+        Assert.Equal(expectedPixels.Length, wrappedPixels.Length);
         for (int i = 0; i < expectedPixels.Length; i++)
         {
             Assert.Equal(expectedPixels[i], wrappedPixels[i]);
         }
+
+        // Ellipsis ".." at x = (48 - 2) * 4 = 46 * 4 = 184
+        int ellipsisLitPixels = CountLitPixels(bufWrapped, 46 * 4, lineStep, 2 * 4, PixelFont.LineHeight(size));
+        Assert.True(ellipsisLitPixels > 0, "Line 2 must render truncation ellipsis '..' when line 3 causes overflow!");
+    }
+
+    [Fact]
+    public void PixelFont_DrawWrappedText_LeadingAndTrailingNewlines_CollapseCleanly()
+    {
+        const int maxWidthPx = 192;
+        const int maxLines = 2;
+        const PixelFontSize size = PixelFontSize.Small;
+        const int lineSpacing = 4;
+        int color = ColorUtil.White;
+
+        string prompt = "\r\n\n   Approval requested:\n\nDeploy service   \r\n\n";
+
+        using var bufWrapped = new PixelBuffer(200, 30);
+        using var bufExpected = new PixelBuffer(200, 30);
+
+        PixelFont.DrawWrappedText(bufWrapped, 0, 0, maxWidthPx, maxLines, prompt, color, size, lineSpacing);
+        PixelFont.DrawWrappedText(bufExpected, 0, 0, maxWidthPx, maxLines, "Approval requested: Deploy service", color, size, lineSpacing);
+
+        var wrappedPixels = bufWrapped.ReadOnlyPixels;
+        var expectedPixels = bufExpected.ReadOnlyPixels;
+        Assert.Equal(expectedPixels.Length, wrappedPixels.Length);
+        for (int i = 0; i < expectedPixels.Length; i++)
+        {
+            Assert.Equal(expectedPixels[i], wrappedPixels[i]);
+        }
+    }
+
+    [Fact]
+    public void PixelFont_DrawWrappedText_FinalRowOverflow_AfterNewline_RendersTruncationEllipsis()
+    {
+        const int maxWidthPx = 80; // 20 chars
+        const int maxLines = 2;
+        const PixelFontSize size = PixelFontSize.Small;
+        const int lineSpacing = 4;
+        int lineStep = PixelFont.LineHeight(size) + lineSpacing;
+        int color = ColorUtil.White;
+
+        string line1 = "Approval requested:";
+        string line2 = "Deploy service to the multi-region production cluster immediately";
+        string prompt = line1 + "\n" + line2;
+
+        using var bufWrapped = new PixelBuffer(100, lineStep * maxLines + 4);
+        using var bufExpected = new PixelBuffer(100, lineStep * maxLines + 4);
+
+        PixelFont.DrawWrappedText(bufWrapped, 0, 0, maxWidthPx, maxLines, prompt, color, size, lineSpacing);
+
+        PixelFont.DrawText(bufExpected, 0, 0, line1, color, size);
+        PixelFont.DrawTextTruncated(bufExpected, 0, lineStep, maxWidthPx, line2, color, size);
+
+        var wrappedPixels = bufWrapped.ReadOnlyPixels;
+        var expectedPixels = bufExpected.ReadOnlyPixels;
+        Assert.Equal(expectedPixels.Length, wrappedPixels.Length);
+        for (int i = 0; i < expectedPixels.Length; i++)
+        {
+            Assert.Equal(expectedPixels[i], wrappedPixels[i]);
+        }
+
+        int ellipsisLitPixels = CountLitPixels(bufWrapped, 18 * 4, lineStep, 2 * 4, PixelFont.LineHeight(size));
+        Assert.True(ellipsisLitPixels > 0, "Line 2 must render truncation indicator '..'!");
     }
 
     private static int CountLitPixels(PixelBuffer buf, int startX, int startY, int width, int height)

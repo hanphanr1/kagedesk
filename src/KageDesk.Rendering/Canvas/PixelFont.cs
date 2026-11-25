@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Globalization;
 
 namespace KageDesk.Rendering.Canvas;
@@ -358,6 +359,82 @@ public static class PixelFont
     {
         if (text.Length == 0 || maxLines <= 0 || maxWidthPx <= 0) return;
 
+        bool hasNewline = false;
+        for (int i = 0; i < text.Length; i++)
+        {
+            if (text[i] is '\r' or '\n')
+            {
+                hasNewline = true;
+                break;
+            }
+        }
+
+        if (!hasNewline)
+        {
+            DrawWrappedTextCore(buf, x, y, maxWidthPx, maxLines, text, color, size, lineSpacing, shadowColor);
+            return;
+        }
+
+        Span<char> buffer = text.Length <= 512 ? stackalloc char[512] : default;
+        char[]? rented = null;
+        if (text.Length > 512)
+        {
+            rented = ArrayPool<char>.Shared.Rent(text.Length);
+            buffer = rented.AsSpan(0, text.Length);
+        }
+
+        try
+        {
+            int writeIdx = 0;
+            bool lastWasSpace = true;
+            for (int i = 0; i < text.Length; i++)
+            {
+                char c = text[i];
+                if (c is ' ' or '\r' or '\n' or '\t')
+                {
+                    if (!lastWasSpace)
+                    {
+                        buffer[writeIdx++] = ' ';
+                        lastWasSpace = true;
+                    }
+                }
+                else
+                {
+                    buffer[writeIdx++] = c;
+                    lastWasSpace = false;
+                }
+            }
+
+            if (writeIdx > 0 && lastWasSpace)
+            {
+                writeIdx--;
+            }
+
+            if (writeIdx == 0) return;
+
+            DrawWrappedTextCore(buf, x, y, maxWidthPx, maxLines, buffer.Slice(0, writeIdx), color, size, lineSpacing, shadowColor);
+        }
+        finally
+        {
+            if (rented != null)
+            {
+                ArrayPool<char>.Shared.Return(rented);
+            }
+        }
+    }
+
+    private static void DrawWrappedTextCore(
+        PixelBuffer buf,
+        int x,
+        int y,
+        int maxWidthPx,
+        int maxLines,
+        ReadOnlySpan<char> text,
+        int color,
+        PixelFontSize size,
+        int lineSpacing,
+        int shadowColor)
+    {
         int advance = CharAdvance(size);
         int maxCharsPerLine = (maxWidthPx + 1) / advance;
         if (maxCharsPerLine <= 0) return;
@@ -370,38 +447,6 @@ public static class PixelFont
         {
             while (start < len && text[start] == ' ') start++;
             if (start >= len) break;
-
-            int newlineIdx = -1;
-            for (int i = start; i < len; i++)
-            {
-                if (text[i] is '\r' or '\n')
-                {
-                    newlineIdx = i;
-                    break;
-                }
-            }
-
-            if (newlineIdx >= start)
-            {
-                int visibleBeforeNl = CountVisibleChars(text.Slice(start, newlineIdx - start));
-                if (visibleBeforeNl <= maxCharsPerLine)
-                {
-                    bool isLast = line == maxLines - 1;
-                    if (isLast)
-                    {
-                        DrawTextTruncated(buf, x, y + line * lineStep, maxWidthPx, text.Slice(start, newlineIdx - start), color, size, shadowColor);
-                    }
-                    else
-                    {
-                        DrawText(buf, x, y + line * lineStep, text.Slice(start, newlineIdx - start), color, size, shadowColor);
-                    }
-
-                    start = newlineIdx;
-                    if (start < len && text[start] == '\r') start++;
-                    if (start < len && text[start] == '\n') start++;
-                    continue;
-                }
-            }
 
             int remainingVisible = CountVisibleChars(text.Slice(start));
             bool isLastLine = line == maxLines - 1;
