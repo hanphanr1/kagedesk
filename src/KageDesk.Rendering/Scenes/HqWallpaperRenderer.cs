@@ -44,6 +44,8 @@ public sealed class HqWallpaperRenderer
         public int BadgeBg;
         public int BadgeFg;
         public DateTimeOffset? WorkStartedAt;
+        public DeskRigKind DeskRig;
+        public int BehaviorVariant;
     }
 
     private readonly StationSlot[] _coreSlots = new StationSlot[4];
@@ -243,7 +245,7 @@ public sealed class HqWallpaperRenderer
                 {
                     Occupied = true,
                     AgentId = ag.Id,
-                    Name = ShortenDisplayName(ag.Name),
+                    Name = ShortenDisplayName(ag.Name, ag.Id),
                     SpriteKey = ShinobiSpriteRenderer.NormalizeSpriteKey(ag.SpriteKey),
                     StationType = CoreDefaultSprites[coreIndex],
                     State = ag.State,
@@ -251,7 +253,9 @@ public sealed class HqWallpaperRenderer
                     VariantSeed = HashString(ag.Id),
                     ActionKind = actionKind,
                     BadgeLabel = badgeLabel,
-                    WorkStartedAt = ag.WorkStartedAt
+                    WorkStartedAt = ag.WorkStartedAt,
+                    DeskRig = ag.DeskRig,
+                    BehaviorVariant = ag.BehaviorVariant
                 };
             }
             else
@@ -268,14 +272,13 @@ public sealed class HqWallpaperRenderer
         {
             AgentSnapshot ag = _extraCandidates[i];
             string sprite = ShinobiSpriteRenderer.NormalizeSpriteKey(ag.SpriteKey);
-            if (ag.Role == AgentRole.Clone) sprite = "clone";
 
             var (actionKind, badgeLabel) = AgentActionClassifier.Classify(ag.State, ag.ToolName, ag.TaskTitle);
             _extraSlots[i] = new StationSlot
             {
                 Occupied = true,
                 AgentId = ag.Id,
-                Name = ShortenDisplayName(ag.Name),
+                Name = ShortenDisplayName(ag.Name, ag.Id),
                 SpriteKey = sprite,
                 StationType = "clone",
                 State = ag.State,
@@ -283,7 +286,9 @@ public sealed class HqWallpaperRenderer
                 VariantSeed = HashString(ag.Id),
                 ActionKind = actionKind,
                 BadgeLabel = badgeLabel,
-                WorkStartedAt = ag.WorkStartedAt
+                WorkStartedAt = ag.WorkStartedAt,
+                DeskRig = ag.DeskRig,
+                BehaviorVariant = ag.BehaviorVariant
             };
         }
 
@@ -1286,7 +1291,8 @@ public sealed class HqWallpaperRenderer
             actionKind: actionKind,
             isWalking: isWalking,
             carryingScroll: carryingScroll,
-            facingRight: facingRight);
+            facingRight: facingRight,
+            behaviorVariant: slot.BehaviorVariant);
 
         // Desk & interactive station props
         ShinobiSpriteRenderer.DrawDesk(
@@ -1298,7 +1304,9 @@ public sealed class HqWallpaperRenderer
             _palette.DeskFront,
             slot.State,
             timeSeconds,
-            actionKind: actionKind);
+            actionKind: actionKind,
+            deskRig: slot.DeskRig,
+            behaviorVariant: slot.BehaviorVariant);
 
         // Floating status bubble above head (for alert/done/fail)
         int bubbleY = deskY - 22;
@@ -1402,15 +1410,15 @@ public sealed class HqWallpaperRenderer
         buf.FillRect(CanvasWidth - 3, CanvasHeight - 12, 3, 12, ColorAmberBright);
     }
 
-    private static string ShortenDisplayName(string name)
+    private static string ShortenDisplayName(string name, string? id = null)
     {
-        if (string.IsNullOrWhiteSpace(name)) return "AGENT";
-        int parenIdx = name.IndexOf('(');
+        string clean = AgentAppearanceRegistry.SanitizeDisplayName(name, id);
+        int parenIdx = clean.IndexOf('(');
         if (parenIdx > 0)
         {
-            name = name[..parenIdx];
+            clean = clean[..parenIdx];
         }
-        return name.Trim();
+        return clean.Trim();
     }
 
     private static void FormatClock(int hour, int minute, char[] dest)

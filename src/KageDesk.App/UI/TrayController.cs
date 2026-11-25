@@ -254,7 +254,8 @@ public class TrayController : IDisposable
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Needs Approval", null, (_, _) => OnDemoTrigger?.Invoke("approve")));
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Done (Celebration)", null, (_, _) => OnDemoTrigger?.Invoke("done")));
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Failure Alert", null, (_, _) => OnDemoTrigger?.Invoke("fail")));
-        demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger 4 Clones", null, (_, _) => OnDemoTrigger?.Invoke("clone")));
+        demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Multi-Terminal Variety", null, (_, _) => OnDemoTrigger?.Invoke("clone")));
+        demoMenu.DropDownItems.Add(new ToolStripMenuItem("Preview \u0110\u1ed9 Mixi Gaming & Variety", null, (_, _) => OnDemoTrigger?.Invoke("variety")));
         demoMenu.DropDownItems.Add(new ToolStripSeparator());
         _exportGifMenuItem = new ToolStripMenuItem("Export 6s Demo GIF...", null, (_, _) => OnExportGif?.Invoke());
         demoMenu.DropDownItems.Add(_exportGifMenuItem);

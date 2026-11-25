@@ -45,6 +45,22 @@ public class AgentDetailToastAndOverlayClickTests
     }
 
     [Fact]
+    public void AgentDetailToast_RandomizedSpriteKeys_StillResolveCleanTerminalProviderAndNeverUseClone()
+    {
+        var mixiOmp = new AgentSnapshot("proc:omp:abcd1234", "OMP", AgentRole.Coder, "mixi", AgentState.Working, Source: "process", ProcessId: 6660, DeskRig: DeskRigKind.RgbStreamerRig);
+        Assert.Equal("OMP", AgentDetailToast.ResolveTerminalProvider(mixiOmp));
+        Assert.Equal("OMP Terminal  |  PID: 6660", AgentDetailToast.FormatSourceLabel(mixiOmp));
+
+        var nekoClaude = new AgentSnapshot("proc:claude:ef567890", "Claude 2", AgentRole.Coder, "neko-dev", AgentState.Idle, Source: "process", ProcessId: 7770, DeskRig: DeskRigKind.CozyLofiRig);
+        Assert.Equal("Claude", AgentDetailToast.ResolveTerminalProvider(nekoClaude));
+        Assert.Equal("Claude Terminal  |  PID: 7770", AgentDetailToast.FormatSourceLabel(nekoClaude));
+
+        var sanitized = AgentAppearanceRegistry.SanitizeDisplayName("Clone H1", "proc:omp:abcd1234", "process");
+        Assert.Equal("OMP", sanitized);
+        Assert.DoesNotContain("clone", sanitized, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void AgentDetailToast_SingleInstanceReplacement_AndLifecycle()
     {
         var snap1 = new AgentSnapshot("t1", "Agent One", AgentRole.Leader, "kakashi", AgentState.Working);

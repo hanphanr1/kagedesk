@@ -54,6 +54,17 @@ public enum HqMood
     Celebrating
 }
 
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum DeskRigKind
+{
+    Default,
+    DualMonitorRig,
+    RgbStreamerRig,
+    CozyLofiRig,
+    RetroCrtRig,
+    CyberConsoleRig
+}
+
 public record AgentSnapshot(
     string Id,
     string Name,
@@ -75,7 +86,9 @@ public record AgentSnapshot(
     string? Source = null,
     DateTimeOffset? WorkStartedAt = null,
     [property: JsonIgnore] int? ProcessId = null,
-    [property: JsonIgnore] long? ProcessStartTicks = null
+    [property: JsonIgnore] long? ProcessStartTicks = null,
+    DeskRigKind DeskRig = DeskRigKind.Default,
+    int BehaviorVariant = 0
 );
 
 public record AccountInfo(

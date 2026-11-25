@@ -309,4 +309,60 @@ public class TaskbarPetRendererTests
         Assert.Null(ex);
         Assert.NotEmpty(renderer.HitRegions);
     }
+
+    [Fact]
+    public void Render_WorkingMode_AllFiveMiniDeskRigs_ProduceDistinctFrames()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var checksums = new HashSet<long>();
+
+        foreach (DeskRigKind rig in AgentAppearanceRegistry.RandomizableDeskRigs)
+        {
+            var state = MakeState(
+                new AgentSnapshot("proc:omp:petrig", "OMP", AgentRole.External, "mixi", AgentState.Working, ToolName: "edit", Source: "process", DeskRig: rig));
+
+            renderer.ResetEffects();
+            renderer.Render(buf, state, theme, 1.0f);
+            checksums.Add(ComputeChecksum(buf));
+        }
+
+        Assert.Equal(5, checksums.Count);
+    }
+
+    [Fact]
+    public void Render_WorkingMode_AllEightNewCharacters_ProduceDistinctFrames()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var checksums = new HashSet<long>();
+
+        foreach (string sprite in AgentAppearanceRegistry.RandomizableSprites)
+        {
+            var state = MakeState(
+                new AgentSnapshot($"proc:omp:{sprite}", "OMP", AgentRole.External, sprite, AgentState.Working, ToolName: "edit", Source: "process", DeskRig: DeskRigKind.DualMonitorRig));
+
+            renderer.ResetEffects();
+            renderer.Render(buf, state, theme, 1.0f);
+            checksums.Add(ComputeChecksum(buf));
+        }
+
+        Assert.Equal(8, checksums.Count);
+    }
+
+    private static long ComputeChecksum(PixelBuffer buf)
+    {
+        unchecked
+        {
+            long hash = 1469598103934665603L;
+            var pixels = buf.ReadOnlyPixels;
+            for (int i = 0; i < pixels.Length; i++)
+            {
+                hash = (hash ^ pixels[i]) * 1099511628211L;
+            }
+            return hash;
+        }
+    }
 }

@@ -5,6 +5,7 @@ using KageDesk.Core.Themes;
 using KageDesk.Rendering.Canvas;
 using KageDesk.Rendering.Scenes;
 using KageDesk.Rendering.Snapshots;
+using KageDesk.Rendering.Sprites;
 using Xunit.Abstractions;
 
 namespace KageDesk.Rendering.Tests;
@@ -470,5 +471,141 @@ public class HqWallpaperRendererTests
         var ex = Record.Exception(() => renderer.Render(buf, state, theme, 1.0f));
         Assert.Null(ex);
     }
-}
 
+    [Fact]
+    public void Render_AllEightNewRandomizableCharacters_ProduceDistinctChecksums()
+    {
+        var renderer = new HqWallpaperRenderer();
+        using var buf = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var checksums = new HashSet<long>();
+
+        foreach (string sprite in AgentAppearanceRegistry.RandomizableSprites)
+        {
+            Assert.Equal(sprite, ShinobiSpriteRenderer.NormalizeSpriteKey(sprite));
+
+            var state = new HqState(
+                Agents: new[]
+                {
+                    new AgentSnapshot($"proc:omp:{sprite}", "OMP", AgentRole.External, sprite, AgentState.Working, ToolName: "edit", Source: "process", DeskRig: DeskRigKind.DualMonitorRig)
+                },
+                Accounts: Array.Empty<AccountInfo>(),
+                Builds: Array.Empty<BuildInfo>(),
+                Weather: EffectiveWeather.Day,
+                Mood: HqMood.Busy,
+                PendingVisualEvents: Array.Empty<HqEvent>(),
+                Timestamp: DateTimeOffset.UtcNow);
+
+            renderer.ResetEffects();
+            renderer.Render(buf, state, theme, 1.2f);
+            checksums.Add(ComputeFrameChecksum(buf));
+        }
+
+        Assert.Equal(8, checksums.Count);
+    }
+
+    [Fact]
+    public void Render_AllFiveDeskRigs_ProduceDistinctFrames()
+    {
+        var renderer = new HqWallpaperRenderer();
+        using var buf = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var checksums = new HashSet<long>();
+
+        foreach (DeskRigKind rig in AgentAppearanceRegistry.RandomizableDeskRigs)
+        {
+            var state = new HqState(
+                Agents: new[]
+                {
+                    new AgentSnapshot("proc:omp:rigtest", "OMP", AgentRole.External, "mixi", AgentState.Working, ToolName: "edit", Source: "process", DeskRig: rig)
+                },
+                Accounts: Array.Empty<AccountInfo>(),
+                Builds: Array.Empty<BuildInfo>(),
+                Weather: EffectiveWeather.Day,
+                Mood: HqMood.Busy,
+                PendingVisualEvents: Array.Empty<HqEvent>(),
+                Timestamp: DateTimeOffset.UtcNow);
+
+            renderer.ResetEffects();
+            renderer.Render(buf, state, theme, 1.0f);
+            checksums.Add(ComputeFrameChecksum(buf));
+        }
+
+        Assert.Equal(5, checksums.Count);
+    }
+
+    [Fact]
+    public void Render_BehaviorVariants012_ProduceDistinctFramesForCodingThinkingAndIdle()
+    {
+        using var buf = new PixelBuffer(96, 96);
+
+        void AssertThreeDistinct(AgentState state, AgentActionKind action)
+        {
+            var hashes = new HashSet<long>();
+            for (int v = 0; v < 3; v++)
+            {
+                buf.ClearTransparent();
+                ShinobiSpriteRenderer.DrawCharacter(buf, "mixi", state, 48, 68, 1.25f, actionKind: action, behaviorVariant: v);
+                ShinobiSpriteRenderer.DrawDesk(buf, "clone", 48, 65, ColorUtil.FromRgb(80, 60, 45), ColorUtil.FromRgb(50, 38, 28), state, 1.25f, actionKind: action, deskRig: DeskRigKind.DualMonitorRig, behaviorVariant: v);
+                hashes.Add(ComputeFrameChecksum(buf));
+            }
+            Assert.Equal(3, hashes.Count);
+        }
+
+        AssertThreeDistinct(AgentState.Working, AgentActionKind.Coding);
+        AssertThreeDistinct(AgentState.Working, AgentActionKind.Thinking);
+        AssertThreeDistinct(AgentState.Idle, AgentActionKind.None);
+    }
+
+    [Fact]
+    public void Render_FullVarietyScene_MeetsPerformanceBudgetUnder1Point2MsPerFrame()
+    {
+        var renderer = new HqWallpaperRenderer();
+        using var buf = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        var state = new HqState(
+            Agents: new[]
+            {
+                new AgentSnapshot("o1", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "plan", Source: "orca", IsBotHome: true, WorkStartedAt: now.AddSeconds(-40)),
+                new AgentSnapshot("o2", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", Source: "orca", IsBotHome: true, WorkStartedAt: now.AddSeconds(-80)),
+                new AgentSnapshot("o3", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test", Source: "orca", IsBotHome: true, WorkStartedAt: now.AddSeconds(-20)),
+                new AgentSnapshot("o4", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("p1", "OMP", AgentRole.External, "mixi", AgentState.Working, ToolName: "edit", Source: "process", DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0, WorkStartedAt: now.AddSeconds(-30)),
+                new AgentSnapshot("p2", "Claude", AgentRole.External, "neko-dev", AgentState.Working, ToolName: "think", Source: "process", DeskRig: DeskRigKind.CozyLofiRig, BehaviorVariant: 1, WorkStartedAt: now.AddSeconds(-25)),
+                new AgentSnapshot("p3", "Codex", AgentRole.External, "cyber-hacker", AgentState.Working, ToolName: "build", Source: "process", DeskRig: DeskRigKind.CyberConsoleRig, BehaviorVariant: 2, WorkStartedAt: now.AddSeconds(-15)),
+                new AgentSnapshot("p4", "AGY", AgentRole.External, "ronin-dev", AgentState.Working, ToolName: "search", Source: "process", DeskRig: DeskRigKind.RetroCrtRig, BehaviorVariant: 0, WorkStartedAt: now.AddSeconds(-10)),
+                new AgentSnapshot("p5", "OMP 2", AgentRole.External, "astro-dev", AgentState.Working, ToolName: "execute", Source: "process", DeskRig: DeskRigKind.DualMonitorRig, BehaviorVariant: 1, WorkStartedAt: now.AddSeconds(-5))
+            },
+            Accounts: new[] { new AccountInfo("anthropic", "main", "Pro", true, 75) },
+            Builds: new[] { new BuildInfo("b1", "kagedesk", "CI", "main", "Build", "completed", "success", UpdatedAt: now) },
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: Array.Empty<HqEvent>(),
+            Timestamp: now);
+
+        // Warmup JIT
+        for (int i = 0; i < 30; i++)
+        {
+            renderer.Render(buf, state, theme, i * 0.08f, now.AddSeconds(i * 0.08f));
+        }
+
+        const int frames = 100;
+        var frameTimesMs = new double[frames];
+        var sw = new Stopwatch();
+        for (int i = 0; i < frames; i++)
+        {
+            sw.Restart();
+            renderer.Render(buf, state, theme, 3.0f + i * 0.08f, now.AddSeconds(3.0 + i * 0.08));
+            sw.Stop();
+            frameTimesMs[i] = sw.Elapsed.TotalMilliseconds;
+        }
+
+        Array.Sort(frameTimesMs);
+        double medianMs = frameTimesMs[frames / 2];
+        double avgMs = frameTimesMs.Average();
+        _output.WriteLine($"Full 9-agent variety scene: median={medianMs:F3} ms/frame, avg={avgMs:F3} ms/frame");
+        Assert.True(medianMs < 1.2, $"Expected full 9-agent variety scene median < 1.2 ms/frame, got median={medianMs:F3} ms/frame (avg={avgMs:F3} ms)");
+    }
+}

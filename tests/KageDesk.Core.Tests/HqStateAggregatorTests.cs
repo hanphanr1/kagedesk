@@ -897,7 +897,94 @@ public class HqStateAggregatorTests
             Assert.True(revisions[i] > revisions[i - 1], $"Revision {revisions[i]} was not strictly greater than {revisions[i - 1]}");
         }
     }
+
+    [Fact]
+    public void AppearancePolicy_OrcaBotsKeepFixedShinobi_NonOrcaGetRandomizedDistinctCharactersAndCleanNames()
+    {
+        var agg = new HqStateAggregator(appearanceSeed: 42);
+
+        agg.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("orca-1", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, IsBotHome: true, Source: "orca"),
+            new AgentSnapshot("orca-2", "Minato", AgentRole.Coder, "minato", AgentState.Working, IsBotHome: true, Source: "orca"),
+            new AgentSnapshot("orca-3", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Idle, IsBotHome: true, Source: "orca"),
+            new AgentSnapshot("orca-4", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle, IsBotHome: true, Source: "orca")
+        }, Array.Empty<AccountInfo>());
+
+        agg.UpdateProcessAgents(new[]
+        {
+            new AgentSnapshot("proc:omp:0001", "Clone H1", AgentRole.Coder, "omp", AgentState.Working, Source: "process", ProcessId: 101),
+            new AgentSnapshot("proc:omp:0002", "Shadow Clone #2", AgentRole.Coder, "omp", AgentState.Idle, Source: "process", ProcessId: 102),
+            new AgentSnapshot("proc:claude:0003", "Claude", AgentRole.Coder, "claude", AgentState.Working, Source: "process", ProcessId: 103)
+        });
+
+        var state = agg.GetState();
+        Assert.Equal("shikamaru", state.Agents.Single(a => a.Id == "orca-1").SpriteKey);
+        Assert.Equal("minato", state.Agents.Single(a => a.Id == "orca-2").SpriteKey);
+        Assert.Equal("tsunade", state.Agents.Single(a => a.Id == "orca-3").SpriteKey);
+        Assert.Equal("kakashi", state.Agents.Single(a => a.Id == "orca-4").SpriteKey);
+
+        var procAgents = state.Agents.Where(a => a.Source == "process").ToList();
+        Assert.Equal(3, procAgents.Count);
+        Assert.All(procAgents, a => Assert.DoesNotContain("clone", a.Name, StringComparison.OrdinalIgnoreCase));
+        Assert.Equal("OMP", procAgents.Single(a => a.Id == "proc:omp:0001").Name);
+        Assert.Equal("OMP", procAgents.Single(a => a.Id == "proc:omp:0002").Name);
+        Assert.Equal("Claude", procAgents.Single(a => a.Id == "proc:claude:0003").Name);
+        Assert.Equal(3, procAgents.Select(a => a.SpriteKey).Distinct(StringComparer.OrdinalIgnoreCase).Count());
+        Assert.All(procAgents, a => Assert.True(AgentAppearanceRegistry.IsRandomizableSprite(a.SpriteKey)));
+        Assert.All(procAgents, a => Assert.NotEqual(DeskRigKind.Default, a.DeskRig));
+    }
+
+    [Theory]
+    [InlineData("variety")]
+    [InlineData("mixi")]
+    [InlineData("clone")]
+    public void DemoScenario_VarietyMixiClone_IncludesMixiRgbRigAndZeroCloneNames(string scenario)
+    {
+        var agg = new HqStateAggregator(appearanceSeed: 7);
+        agg.SetDemoScenario(scenario);
+
+        var state = agg.GetState();
+        Assert.Equal(scenario, state.DemoScenario);
+        Assert.All(state.Agents, a => Assert.DoesNotContain("clone", a.Name, StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(state.Agents, a => a.SpriteKey == "mixi" && a.DeskRig == DeskRigKind.RgbStreamerRig);
+
+        if (scenario is "variety" or "mixi")
+        {
+            var rigs = state.Agents.Where(a => a.DeskRig != DeskRigKind.Default).Select(a => a.DeskRig).Distinct().ToList();
+            Assert.Equal(5, rigs.Count);
+        }
+    }
+
+    [Fact]
+    public void ProcessAgent_DoneCelebrationExpiry_TransitionsToIdleAndClearsWorkStartedAtAndToolName()
+    {
+        var now = new DateTimeOffset(2026, 11, 25, 12, 0, 0, TimeSpan.Zero);
+        var agg = new HqStateAggregator(timeProvider: () => now);
+
+        agg.UpdateProcessAgents(new[]
+        {
+            new AgentSnapshot("proc:omp:aaaa1111", "OMP", AgentRole.Coder, "mixi", AgentState.Working, ToolName: "thinking", Source: "process", WorkStartedAt: now)
+        });
+        var working = agg.GetState().Agents.Single();
+        Assert.Equal(AgentState.Working, working.State);
+        Assert.NotNull(working.WorkStartedAt);
+
+        now = now.AddSeconds(5);
+        agg.UpdateProcessAgents(new[]
+        {
+            new AgentSnapshot("proc:omp:aaaa1111", "OMP", AgentRole.Coder, "mixi", AgentState.Done, ToolName: "thinking", UpdatedAt: now, Source: "process")
+        });
+        var done = agg.GetState().Agents.Single();
+        Assert.Equal(AgentState.Done, done.State);
+        Assert.Null(done.WorkStartedAt);
+
+        // Advance past 5-second celebration expiry
+        now = now.AddSeconds(7);
+        agg.Reevaluate();
+        var idle = agg.GetState().Agents.Single();
+        Assert.Equal(AgentState.Idle, idle.State);
+        Assert.Null(idle.WorkStartedAt);
+        Assert.Null(idle.ToolName);
+    }
 }
-
-
-

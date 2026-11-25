@@ -52,6 +52,7 @@ public class HqStateAggregator
     private readonly Dictionary<string, DateTimeOffset> _workStartedAt = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _lastWorkingFinishedAt = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _lastWorkingStartedAt = new(StringComparer.OrdinalIgnoreCase);
+    private readonly AgentAppearanceRegistry _appearanceRegistry;
 
     private string? _demoScenario;
     private bool _demoHandoffEmitted;
@@ -60,10 +61,11 @@ public class HqStateAggregator
 
     public event EventHandler<HqState>? StateChanged;
 
-    public HqStateAggregator(AppConfig? config = null, Func<DateTimeOffset>? timeProvider = null)
+    public HqStateAggregator(AppConfig? config = null, Func<DateTimeOffset>? timeProvider = null, int? appearanceSeed = null)
     {
         _config = config ?? new AppConfig();
         _timeProvider = timeProvider ?? (() => DateTimeOffset.UtcNow);
+        _appearanceRegistry = new AgentAppearanceRegistry(appearanceSeed);
 
         _currentState = new HqState(
             Agents: Array.Empty<AgentSnapshot>(),
@@ -115,7 +117,7 @@ public class HqStateAggregator
             else
             {
                 var lower = scenario.Trim().ToLowerInvariant();
-                if (lower is not ("working" or "approve" or "done" or "fail" or "clone" or "handoff"))
+                if (lower is not ("working" or "approve" or "done" or "fail" or "clone" or "handoff" or "variety" or "mixi"))
                 {
                     throw new ArgumentException($"Unknown demo scenario: '{scenario}'", nameof(scenario));
                 }
@@ -385,8 +387,13 @@ public class HqStateAggregator
                 if (!string.IsNullOrEmpty(payload.AgentId) || !string.IsNullOrEmpty(payload.Name))
                 {
                     var id = payload.AgentId ?? payload.Name!;
-                    var name = payload.Name ?? payload.AgentId!;
+                    var rawName = !string.IsNullOrWhiteSpace(payload.Name)
+                        ? payload.Name
+                        : (!string.IsNullOrWhiteSpace(payload.Provider)
+                            ? AgentAppearanceRegistry.FormatProviderDisplayName(payload.Provider)
+                            : payload.AgentId);
                     var role = payload.Role ?? AgentRole.External;
+                    var name = AgentAppearanceRegistry.SanitizeDisplayName(rawName, id, "bridge", role);
 
                     // Resolve AgentState: explicit State wins, otherwise map from Type
                     AgentState state = payload.State ?? ResolveStateFromType(payload.Type);
@@ -400,7 +407,6 @@ public class HqStateAggregator
                         AgentRole.Coder => "minato",
                         AgentRole.Tester => "tsunade",
                         AgentRole.Reviewer => "kakashi",
-                        AgentRole.Clone => "clone",
                         _ => "generic"
                     };
 
@@ -601,8 +607,8 @@ public class HqStateAggregator
 
                 if ((now - enteredAt).TotalSeconds > celebrationSeconds)
                 {
-                    // Live agent celebration expired: relax to Idle
-                    finalAgents.Add(a with { State = AgentState.Idle });
+                    // Live agent celebration expired: relax to Idle and clear stale tool/work timer
+                    finalAgents.Add(a with { State = AgentState.Idle, ToolName = null, WorkStartedAt = null });
                 }
                 else
                 {
@@ -679,6 +685,9 @@ public class HqStateAggregator
             }
         }
 
+        // 4c. Apply clean names, Orca-fixed vs non-Orca randomized character variety & desk rigs
+        _appearanceRegistry.ApplyToAgents(finalAgents);
+
         var liveIds = finalAgents.Select(a => a.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var staleWorkKeys = _workStartedAt.Keys.Where(k => !liveIds.Contains(k)).ToList();
         foreach (var k in staleWorkKeys)
@@ -744,7 +753,7 @@ public class HqStateAggregator
             if (!prevClones.ContainsKey(id))
             {
                 var seq = Interlocked.Increment(ref _sequenceCounter);
-                _visualEvents.Add(new HqEvent(seq, "CloneSpawned", $"Clone {clone.Name} spawned", now, id, 8.0));
+                _visualEvents.Add(new HqEvent(seq, "CloneSpawned", $"{clone.Name} joined", now, id, 8.0));
             }
         }
 
@@ -753,7 +762,7 @@ public class HqStateAggregator
             if (!currClones.ContainsKey(id))
             {
                 var seq = Interlocked.Increment(ref _sequenceCounter);
-                _visualEvents.Add(new HqEvent(seq, "CloneDespawned", $"Clone {clone.Name} despawned", now, id, 8.0));
+                _visualEvents.Add(new HqEvent(seq, "CloneDespawned", $"{clone.Name} exited", now, id, 8.0));
             }
         }
 
@@ -909,9 +918,26 @@ public class HqStateAggregator
                 break;
 
             case "clone":
-                agents.Add(new AgentSnapshot("demo-leader", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Working, IsBotHome: true));
-                agents.Add(new AgentSnapshot("demo-clone-1", "Shadow Clone #1", AgentRole.Clone, "clone", AgentState.Working, WorktreeId: "wt:worker-1"));
-                agents.Add(new AgentSnapshot("demo-clone-2", "Shadow Clone #2", AgentRole.Clone, "clone", AgentState.Working, WorktreeId: "wt:worker-2"));
+                var cloneAnchor = _demoAnchorTime == default ? now : _demoAnchorTime;
+                agents.Add(new AgentSnapshot("demo-leader", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "execute", IsBotHome: true, Source: "orca", WorkStartedAt: cloneAnchor.AddSeconds(-40)));
+                agents.Add(new AgentSnapshot("demo-term-1", "OMP", AgentRole.External, "mixi", AgentState.Working, ToolName: "edit", Source: "process", WorkStartedAt: cloneAnchor.AddSeconds(-30), DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0));
+                agents.Add(new AgentSnapshot("demo-term-2", "Claude", AgentRole.External, "neko-dev", AgentState.Working, ToolName: "test", Source: "process", WorkStartedAt: cloneAnchor.AddSeconds(-20), DeskRig: DeskRigKind.CozyLofiRig, BehaviorVariant: 1));
+                agents.Add(new AgentSnapshot("demo-term-3", "Codex", AgentRole.External, "cyber-hacker", AgentState.Working, ToolName: "build", Source: "process", WorkStartedAt: cloneAnchor.AddSeconds(-15), DeskRig: DeskRigKind.CyberConsoleRig, BehaviorVariant: 2));
+                agents.Add(new AgentSnapshot("demo-term-4", "AGY", AgentRole.External, "ronin-dev", AgentState.Working, ToolName: "search", Source: "process", WorkStartedAt: cloneAnchor.AddSeconds(-10), DeskRig: DeskRigKind.RetroCrtRig, BehaviorVariant: 0));
+                break;
+
+            case "variety":
+            case "mixi":
+                var mixiAnchor = _demoAnchorTime == default ? now : _demoAnchorTime;
+                agents.Add(new AgentSnapshot("demo-leader", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Idle, IsBotHome: true, Source: "orca", BehaviorVariant: 0));
+                agents.Add(new AgentSnapshot("demo-coder", "Minato (Senior Coder)", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", TaskTitle: "Core engine", IsBotHome: true, Source: "orca", WorkStartedAt: mixiAnchor.AddSeconds(-75), BehaviorVariant: 1));
+                agents.Add(new AgentSnapshot("demo-tester", "Tsunade (QA Lead)", AgentRole.Tester, "tsunade", AgentState.Idle, IsBotHome: true, Source: "orca", BehaviorVariant: 2));
+                agents.Add(new AgentSnapshot("demo-reviewer", "Kakashi (Code Reviewer)", AgentRole.Reviewer, "kakashi", AgentState.Idle, IsBotHome: true, Source: "orca", BehaviorVariant: 0));
+                agents.Add(new AgentSnapshot("demo-mixi", "OMP", AgentRole.Coder, "mixi", AgentState.Working, ToolName: "edit", TaskTitle: "Do Mixi Gaming stream setup", Source: "process", WorkStartedAt: mixiAnchor.AddSeconds(-55), DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0));
+                agents.Add(new AgentSnapshot("demo-var-2", "OMP 2", AgentRole.Coder, "neko-dev", AgentState.Working, ToolName: "thinking", TaskTitle: "Lo-fi shader tuning", Source: "process", WorkStartedAt: mixiAnchor.AddSeconds(-35), DeskRig: DeskRigKind.CozyLofiRig, BehaviorVariant: 1));
+                agents.Add(new AgentSnapshot("demo-var-3", "Claude", AgentRole.Coder, "cyber-hacker", AgentState.Working, ToolName: "exec", TaskTitle: "Running benchmarks", Source: "process", WorkStartedAt: mixiAnchor.AddSeconds(-25), DeskRig: DeskRigKind.CyberConsoleRig, BehaviorVariant: 2));
+                agents.Add(new AgentSnapshot("demo-var-4", "Codex", AgentRole.Coder, "astro-dev", AgentState.Working, ToolName: "git", TaskTitle: "Branch sync", Source: "process", WorkStartedAt: mixiAnchor.AddSeconds(-15), DeskRig: DeskRigKind.RetroCrtRig, BehaviorVariant: 1));
+                agents.Add(new AgentSnapshot("demo-var-5", "AGY", AgentRole.External, "mecha-droid", AgentState.Idle, TaskTitle: "Standby console", Source: "process", DeskRig: DeskRigKind.DualMonitorRig, BehaviorVariant: 2));
                 break;
 
             case "handoff":

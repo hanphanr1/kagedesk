@@ -116,7 +116,7 @@ internal static class Program
 
         var validScenarios = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            "showcase", "working", "handoff", "approve", "done", "fail", "clone"
+            "showcase", "working", "handoff", "approve", "done", "fail", "clone", "variety", "mixi"
         };
 
         for (int i = 1; i < args.Length; i++)
@@ -193,7 +193,7 @@ internal static class Program
 
         if (!validScenarios.Contains(scenario))
         {
-            Console.Error.WriteLine($"[KageDesk] Error: Unknown scenario '{scenario}'. Valid scenarios: showcase, working, handoff, approve, done, fail, clone.");
+            Console.Error.WriteLine($"[KageDesk] Error: Unknown scenario '{scenario}'. Valid scenarios: showcase, working, handoff, approve, done, fail, clone, variety, mixi.");
             return 2;
         }
 

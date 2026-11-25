@@ -7,7 +7,8 @@ public record ProcessClassification(
     string? Provider,
     bool IsInternalDaemon,
     bool IsElectronHelper,
-    string? RoleHint
+    string? RoleHint,
+    bool IsPersistentDaemon = false
 );
 
 public record ProcessItem(
@@ -17,7 +18,10 @@ public record ProcessItem(
     string? CommandLine,
     long StartTimeTicks,
     long TotalCpuTimeMs,
-    ProcessClassification? Classification = null
+    ProcessClassification? Classification = null,
+    bool HasIoCounters = false,
+    long ReadTransferBytes = 0,
+    long OtherTransferBytes = 0
 );
 
 public interface IProcessInspectionProvider
@@ -62,6 +66,17 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
         public IntPtr Buffer;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
 
@@ -84,6 +99,11 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
         out System.Runtime.InteropServices.ComTypes.FILETIME lpExitTime,
         out System.Runtime.InteropServices.ComTypes.FILETIME lpKernelTime,
         out System.Runtime.InteropServices.ComTypes.FILETIME lpUserTime);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetProcessIoCounters(
+        IntPtr hProcess,
+        out IO_COUNTERS lpIoCounters);
 
     [DllImport("ntdll.dll", SetLastError = true)]
     private static extern int NtQueryInformationProcess(
@@ -281,6 +301,9 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
             {
                 long startTicks = 0;
                 long totalCpuMs = 0;
+                bool hasIoCounters = false;
+                long readTransferBytes = 0;
+                long otherTransferBytes = 0;
 
                 if (GetProcessTimes(hProcess, out var createTime, out _, out var kernelTime, out var userTime))
                 {
@@ -298,6 +321,13 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
                     totalCpuMs = (kTicks + uTicks) / 10000; // 100-ns ticks to ms
                 }
 
+                if (GetProcessIoCounters(hProcess, out var ioCounters))
+                {
+                    hasIoCounters = true;
+                    readTransferBytes = ioCounters.ReadTransferCount > long.MaxValue ? long.MaxValue : (long)ioCounters.ReadTransferCount;
+                    otherTransferBytes = ioCounters.OtherTransferCount > long.MaxValue ? long.MaxValue : (long)ioCounters.OtherTransferCount;
+                }
+
                 if (startTicks > 0)
                 {
                     activeKeys.Add((pid, startTicks));
@@ -310,7 +340,17 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
                     () => ReadProcessCommandLine(hProcess),
                     capturedGen);
 
-                results.Add(new ProcessItem(pid, parentPid, exeName, null, startTicks, totalCpuMs, classification));
+                results.Add(new ProcessItem(
+                    pid,
+                    parentPid,
+                    exeName,
+                    null,
+                    startTicks,
+                    totalCpuMs,
+                    classification,
+                    hasIoCounters,
+                    readTransferBytes,
+                    otherTransferBytes));
             }
             finally
             {
@@ -463,6 +503,20 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
         bool isElectronHelper = cmd.Contains("--type=") ||
                                 cmd.Contains("--crashpad") ||
                                 cmd.Contains("crashpad-handler");
+        bool isPersistentDaemon = isInternalDaemon ||
+                                  cmd.Contains("mcp-server") ||
+                                  cmd.Contains("mcp_server") ||
+                                  cmd.Contains("@modelcontextprotocol") ||
+                                  cmd.Contains("language-server") ||
+                                  cmd.Contains("languageserver") ||
+                                  cmd.Contains("tsserver") ||
+                                  cmd.Contains("pyright") ||
+                                  cmd.Contains("rust-analyzer") ||
+                                  cmd.Contains("omnisharp") ||
+                                  cmd.Contains("clangd") ||
+                                  cmd.Contains("--service") ||
+                                  (cmd.Contains("mcp") && (name is "node" or "bun" or "python" or "python3" or "uvx" or "npx")) ||
+                                  (cmd.Contains("lsp") && (name is "node" or "bun" or "python" or "python3"));
 
         string? provider = null;
 
@@ -542,7 +596,7 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
             roleHint = "execute";
         }
 
-        return new ProcessClassification(provider, isInternalDaemon, isElectronHelper, roleHint);
+        return new ProcessClassification(provider, isInternalDaemon, isElectronHelper, roleHint, isPersistentDaemon);
     }
 
     public static int? FindAncestorWithVisibleWindow(

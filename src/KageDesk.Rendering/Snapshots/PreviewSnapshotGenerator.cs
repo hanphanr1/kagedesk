@@ -135,17 +135,17 @@ public static class PreviewSnapshotGenerator
             Timestamp: fixedNow);
         written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, failState, shinobi, outputDir, "shinobi-hq-fail.png", warmupTicks: 10));
 
-        // 5. shinobi-hq-clone.png
+        // 5. shinobi-hq-clone.png (multi-terminal variety showcase)
         var cloneState = new HqState(
             Agents: new List<AgentSnapshot>
             {
-                new("a-shika", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "execute", Repo: "kagedesk"),
-                new("a-minato", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", Repo: "kagedesk"),
-                new("a-tsunade", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test", Repo: "kagedesk"),
-                new("a-kakashi", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Working, ToolName: "review", Repo: "kagedesk"),
-                new("clone-1", "Clone #1", AgentRole.Clone, "clone", AgentState.Working, ToolName: "edit", WorktreeId: "wt-1"),
-                new("clone-2", "Clone #2", AgentRole.Clone, "clone", AgentState.Working, ToolName: "test", WorktreeId: "wt-2"),
-                new("ext-1", "Claude CLI", AgentRole.External, "generic", AgentState.Working, ToolName: "exec")
+                new("a-shika", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "execute", Repo: "kagedesk", Source: "orca", IsBotHome: true),
+                new("a-minato", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", Repo: "kagedesk", Source: "orca", IsBotHome: true),
+                new("a-tsunade", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test", Repo: "kagedesk", Source: "orca", IsBotHome: true),
+                new("a-kakashi", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Working, ToolName: "review", Repo: "kagedesk", Source: "orca", IsBotHome: true),
+                new("proc:omp:1001", "OMP", AgentRole.External, "mixi", AgentState.Working, ToolName: "edit", Source: "process", DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0),
+                new("proc:claude:1002", "Claude", AgentRole.External, "neko-dev", AgentState.Working, ToolName: "test", Source: "process", DeskRig: DeskRigKind.CozyLofiRig, BehaviorVariant: 1),
+                new("proc:codex:1003", "Codex", AgentRole.External, "cyber-hacker", AgentState.Working, ToolName: "exec", Source: "process", DeskRig: DeskRigKind.CyberConsoleRig, BehaviorVariant: 2)
             },
             Accounts: sampleAccounts,
             Builds: passingBuild,
@@ -153,7 +153,7 @@ public static class PreviewSnapshotGenerator
             Mood: HqMood.Busy,
             PendingVisualEvents: new List<HqEvent>
             {
-                new(1, "CloneSpawned", "Shadow clones deployed", fixedNow, "clone-1")
+                new(1, "CloneSpawned", "Multi-terminal agents active", fixedNow, "proc:omp:1001")
             },
             Timestamp: fixedNow);
         written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, cloneState, shinobi, outputDir, "shinobi-hq-clone.png", warmupTicks: 6));

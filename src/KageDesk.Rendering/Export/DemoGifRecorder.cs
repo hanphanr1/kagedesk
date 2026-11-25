@@ -160,12 +160,15 @@ public static class DemoGifRecorder
             }
 
             case "clone":
+            case "variety":
+            case "mixi":
             {
-                agents.Add(new AgentSnapshot("demo-leader", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "command", TaskTitle: "Leader", IsBotHome: true, WorkStartedAt: baseTime.AddSeconds(-40)));
-                agents.Add(new AgentSnapshot("demo-clone-1", "Shadow Clone #1", AgentRole.Clone, "clone", AgentState.Working, ToolName: "worker", WorktreeId: "wt:worker-1", WorkStartedAt: baseTime.AddSeconds(-30)));
-                agents.Add(new AgentSnapshot("demo-clone-2", "Shadow Clone #2", AgentRole.Clone, "clone", AgentState.Working, ToolName: "worker", WorktreeId: "wt:worker-2", WorkStartedAt: baseTime.AddSeconds(-20)));
-                agents.Add(new AgentSnapshot("demo-clone-3", "Shadow Clone #3", AgentRole.Clone, "clone", AgentState.Working, ToolName: "worker", WorktreeId: "wt:worker-3", WorkStartedAt: baseTime.AddSeconds(-15)));
-                agents.Add(new AgentSnapshot("demo-clone-4", "Shadow Clone #4", AgentRole.Clone, "clone", AgentState.Working, ToolName: "worker", WorktreeId: "wt:worker-4", WorkStartedAt: baseTime.AddSeconds(-10)));
+                agents.Add(new AgentSnapshot("demo-leader", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "command", TaskTitle: "Leader", IsBotHome: true, Source: "orca", WorkStartedAt: baseTime.AddSeconds(-40)));
+                agents.Add(new AgentSnapshot("demo-term-1", "OMP", AgentRole.External, "mixi", AgentState.Working, ToolName: "edit", Source: "process", WorkStartedAt: baseTime.AddSeconds(-30), DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0));
+                agents.Add(new AgentSnapshot("demo-term-2", "Claude", AgentRole.External, "neko-dev", AgentState.Working, ToolName: "test", Source: "process", WorkStartedAt: baseTime.AddSeconds(-20), DeskRig: DeskRigKind.CozyLofiRig, BehaviorVariant: 1));
+                agents.Add(new AgentSnapshot("demo-term-3", "Codex", AgentRole.External, "cyber-hacker", AgentState.Working, ToolName: "build", Source: "process", WorkStartedAt: baseTime.AddSeconds(-15), DeskRig: DeskRigKind.CyberConsoleRig, BehaviorVariant: 2));
+                agents.Add(new AgentSnapshot("demo-term-4", "AGY", AgentRole.External, "ronin-dev", AgentState.Working, ToolName: "search", Source: "process", WorkStartedAt: baseTime.AddSeconds(-10), DeskRig: DeskRigKind.RetroCrtRig, BehaviorVariant: 0));
+                agents.Add(new AgentSnapshot("demo-term-5", "OMP 2", AgentRole.External, "astro-dev", AgentState.Working, ToolName: "execute", Source: "process", WorkStartedAt: baseTime.AddSeconds(-8), DeskRig: DeskRigKind.DualMonitorRig, BehaviorVariant: 1));
                 mood = HqMood.Busy;
                 break;
             }

@@ -73,12 +73,16 @@ public class ProcessAgentCollectorTests
         Assert.Equal(17, single.Id.Length);
         Assert.Equal("OMP", single.Name);
         Assert.Equal(AgentRole.Coder, single.Role);
-        Assert.Equal("omp", single.SpriteKey);
+        Assert.Contains(single.SpriteKey, AgentAppearanceRegistry.RandomizableSprites);
+        Assert.NotEqual(DeskRigKind.Default, single.DeskRig);
         Assert.Equal(100, single.ProcessId);
 
-        // Stable identity across polls
+        // Stable identity and character assignment across polls
         var secondPoll = collector.DetectProcesses();
         Assert.Equal(single.Id, secondPoll[0].Id);
+        Assert.Equal(single.SpriteKey, secondPoll[0].SpriteKey);
+        Assert.Equal(single.DeskRig, secondPoll[0].DeskRig);
+        Assert.Equal(single.BehaviorVariant, secondPoll[0].BehaviorVariant);
     }
 
     [Fact]
@@ -99,10 +103,13 @@ public class ProcessAgentCollectorTests
         var detected = collector.DetectProcesses();
 
         Assert.Equal(2, detected.Count);
-        Assert.Equal("OMP #1", detected[0].Name);
+        Assert.Equal("OMP", detected[0].Name);
         Assert.Equal(100, detected[0].ProcessId);
-        Assert.Equal("OMP #2", detected[1].Name);
+        Assert.Equal("OMP 2", detected[1].Name);
         Assert.Equal(200, detected[1].ProcessId);
+        Assert.NotEqual(detected[0].SpriteKey, detected[1].SpriteKey);
+        Assert.DoesNotContain("clone", detected[0].Name, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("clone", detected[1].Name, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -130,11 +137,12 @@ public class ProcessAgentCollectorTests
         Assert.NotEqual("proc:agy:81", agent.Id);
         Assert.Equal(17, agent.Id.Length);
         Assert.Equal("AGY", agent.Name);
-        Assert.Equal("agy", agent.SpriteKey);
+        Assert.Contains(agent.SpriteKey, AgentAppearanceRegistry.RandomizableSprites);
 
         // Stable identity across polls
         var secondPoll = collector.DetectProcesses();
         Assert.Equal(agent.Id, secondPoll[0].Id);
+        Assert.Equal(agent.SpriteKey, secondPoll[0].SpriteKey);
     }
 
     [Fact]
@@ -160,10 +168,11 @@ public class ProcessAgentCollectorTests
         var detected = collector.DetectProcesses();
 
         Assert.Equal(4, detected.Count);
-        Assert.Contains(detected, a => a.Name == "CLAUDE" && a.SpriteKey == "claude" && a.Role == AgentRole.Coder);
-        Assert.Contains(detected, a => a.Name == "CODEX" && a.SpriteKey == "codex" && a.Role == AgentRole.Coder);
-        Assert.Contains(detected, a => a.Name == "OPENCODE" && a.SpriteKey == "generic" && a.Role == AgentRole.External);
-        Assert.Contains(detected, a => a.Name == "GEMINI" && a.SpriteKey == "agy" && a.Role == AgentRole.External);
+        Assert.Contains(detected, a => a.Name == "Claude" && AgentAppearanceRegistry.IsRandomizableSprite(a.SpriteKey) && a.Role == AgentRole.Coder);
+        Assert.Contains(detected, a => a.Name == "Codex" && AgentAppearanceRegistry.IsRandomizableSprite(a.SpriteKey) && a.Role == AgentRole.Coder);
+        Assert.Contains(detected, a => a.Name == "OpenCode" && AgentAppearanceRegistry.IsRandomizableSprite(a.SpriteKey) && a.Role == AgentRole.External);
+        Assert.Contains(detected, a => a.Name == "Gemini" && AgentAppearanceRegistry.IsRandomizableSprite(a.SpriteKey) && a.Role == AgentRole.External);
+        Assert.Equal(4, detected.Select(a => a.SpriteKey).Distinct(StringComparer.OrdinalIgnoreCase).Count());
     }
 
     [Fact]
@@ -253,6 +262,240 @@ public class ProcessAgentCollectorTests
         };
         detected = collector.DetectProcesses();
         Assert.Equal(AgentState.Done, detected[0].State);
+    }
+
+    [Fact]
+    public void DetectProcesses_IdleOmpWithPersistentIdleChildren_ReportsIdleNotWorking()
+    {
+        var time = new DateTimeOffset(2026, 11, 25, 12, 0, 0, TimeSpan.Zero);
+        var mock = new MockProcessInspector
+        {
+            Processes = new List<ProcessItem>
+            {
+                new(500, 10, "omp.exe", "omp.exe", 1000, 100, HasIoCounters: true, ReadTransferBytes: 50_000, OtherTransferBytes: 20_000),
+                // Console host & long-lived idle MCP server child & background omp worker daemon
+                new(501, 500, "conhost.exe", "conhost.exe 0x4", 1005, 10),
+                new(502, 500, "OpenConsole.exe", "OpenConsole.exe", 1006, 15),
+                new(503, 500, "node.exe", "node.exe C:\\mcp\\filesystem-mcp-server.js", 1010, 40),
+                new(504, 500, "node.exe", "node.exe C:\\scripts\\persistent-helper.js", 1015, 25),
+                new(505, 500, "omp.exe", "omp.exe --__omp_worker_daemon", 1020, 80)
+            }
+        };
+
+        var aggregator = new HqStateAggregator();
+        var collector = new ProcessAgentCollector(aggregator, enabled: true, inspector: mock, timeProvider: () => time);
+
+        // Poll 1: initial baseline
+        var poll1 = collector.DetectProcesses();
+        var ag1 = Assert.Single(poll1);
+        Assert.Equal(AgentState.Idle, ag1.State);
+        Assert.Null(ag1.ToolName);
+        Assert.Null(ag1.WorkStartedAt);
+
+        // Poll 2 & 3: persistent children sit at 0% CPU while __omp_worker_daemon ticks slightly
+        for (int p = 0; p < 3; p++)
+        {
+            time = time.AddSeconds(2.5);
+            mock.Processes = new List<ProcessItem>
+            {
+                new(500, 10, "omp.exe", "omp.exe", 1000, 100 + (p + 1) * 5, HasIoCounters: true, ReadTransferBytes: 50_000, OtherTransferBytes: 20_000 + (p + 1) * 150),
+                new(501, 500, "conhost.exe", "conhost.exe 0x4", 1005, 10),
+                new(502, 500, "OpenConsole.exe", "OpenConsole.exe", 1006, 15),
+                new(503, 500, "node.exe", "node.exe C:\\mcp\\filesystem-mcp-server.js", 1010, 40),
+                new(504, 500, "node.exe", "node.exe C:\\scripts\\persistent-helper.js", 1015, 25),
+                new(505, 500, "omp.exe", "omp.exe --__omp_worker_daemon", 1020, 80 + (p + 1) * 90)
+            };
+
+            var next = collector.DetectProcesses();
+            var ag = Assert.Single(next);
+            Assert.Equal(AgentState.Idle, ag.State);
+            Assert.Null(ag.ToolName);
+            Assert.Null(ag.WorkStartedAt);
+        }
+    }
+
+    [Fact]
+    public void DetectProcesses_IdleOmpWithTuiRedrawJitter_StaysIdleAndTransitionsCleanlyAfterRealWork()
+    {
+        var time = new DateTimeOffset(2026, 11, 25, 12, 0, 0, TimeSpan.Zero);
+        var mock = new MockProcessInspector();
+        var aggregator = new HqStateAggregator();
+        var collector = new ProcessAgentCollector(aggregator, enabled: true, inspector: mock, timeProvider: () => time);
+
+        long cpu = 1000;
+        long readBytes = 500_000;
+        long otherBytes = 100_000;
+
+        // Poll 1: baseline
+        mock.Processes = new List<ProcessItem>
+        {
+            new(600, 10, "omp.exe", "omp.exe", 1000, cpu, HasIoCounters: true, ReadTransferBytes: readBytes, OtherTransferBytes: otherBytes)
+        };
+        Assert.Equal(AgentState.Idle, collector.DetectProcesses()[0].State);
+
+        // Polls 2..5: Realistic live Bun/OMP idle TUI (steady ~220ms CPU per 2s redraw loop, 0 read bytes, ~180 B/s console ioctl otherBytes) -> MUST stay Idle!
+        for (int i = 0; i < 4; i++)
+        {
+            time = time.AddSeconds(2.0);
+            cpu += 220;
+            otherBytes += 280; // 140 B/s (below 512 B/s real socket/IO threshold)
+            mock.Processes = new List<ProcessItem>
+            {
+                new(600, 10, "omp.exe", "omp.exe", 1000, cpu, HasIoCounters: true, ReadTransferBytes: readBytes, OtherTransferBytes: otherBytes)
+            };
+            var idleRes = collector.DetectProcesses()[0];
+            Assert.Equal(AgentState.Idle, idleRes.State);
+            Assert.Null(idleRes.WorkStartedAt);
+            Assert.Null(idleRes.ToolName);
+        }
+
+        // Polls 6 & 7: Real LLM response streaming (CPU + HTTPS socket OtherTransferBytes += 12KB) -> MUST report Working ("thinking")!
+        for (int i = 0; i < 2; i++)
+        {
+            time = time.AddSeconds(2.0);
+            cpu += 260;
+            otherBytes += 12_000;
+            mock.Processes = new List<ProcessItem>
+            {
+                new(600, 10, "omp.exe", "omp.exe", 1000, cpu, HasIoCounters: true, ReadTransferBytes: readBytes, OtherTransferBytes: otherBytes)
+            };
+            var workRes = collector.DetectProcesses()[0];
+            Assert.Equal(AgentState.Working, workRes.State);
+            Assert.Equal("thinking", workRes.ToolName);
+            Assert.NotNull(workRes.WorkStartedAt);
+        }
+
+        // Poll 8: Quiet poll 1 (back to idle TUI redraw) -> 1-poll hysteresis holds Working
+        time = time.AddSeconds(2.0);
+        cpu += 220;
+        otherBytes += 200;
+        mock.Processes = new List<ProcessItem>
+        {
+            new(600, 10, "omp.exe", "omp.exe", 1000, cpu, HasIoCounters: true, ReadTransferBytes: readBytes, OtherTransferBytes: otherBytes)
+        };
+        Assert.Equal(AgentState.Working, collector.DetectProcesses()[0].State);
+
+        // Poll 9: Quiet poll 2 -> transitions cleanly to Done (clearing WorkStartedAt & ToolName)
+        time = time.AddSeconds(2.0);
+        cpu += 220;
+        otherBytes += 200;
+        mock.Processes = new List<ProcessItem>
+        {
+            new(600, 10, "omp.exe", "omp.exe", 1000, cpu, HasIoCounters: true, ReadTransferBytes: readBytes, OtherTransferBytes: otherBytes)
+        };
+        var doneRes = collector.DetectProcesses()[0];
+        Assert.Equal(AgentState.Done, doneRes.State);
+        Assert.Null(doneRes.WorkStartedAt);
+        Assert.Null(doneRes.ToolName);
+
+        // Poll 10: After celebration window (> 5s) -> transitions to Idle (resting!)
+        time = time.AddSeconds(5.5);
+        cpu += 500;
+        otherBytes += 500;
+        mock.Processes = new List<ProcessItem>
+        {
+            new(600, 10, "omp.exe", "omp.exe", 1000, cpu, HasIoCounters: true, ReadTransferBytes: readBytes, OtherTransferBytes: otherBytes)
+        };
+        var restedRes = collector.DetectProcesses()[0];
+        Assert.Equal(AgentState.Idle, restedRes.State);
+        Assert.Null(restedRes.WorkStartedAt);
+        Assert.Null(restedRes.ToolName);
+    }
+
+    [Fact]
+    public void DetectProcesses_ActiveOmpWithTransientOrCpuConsumingChild_ReportsWorkingWithAccurateTool()
+    {
+        var time = new DateTimeOffset(2026, 11, 25, 12, 0, 0, TimeSpan.Zero);
+        var mock = new MockProcessInspector
+        {
+            Processes = new List<ProcessItem>
+            {
+                new(700, 10, "omp.exe", "omp.exe", 1000, 50, HasIoCounters: true, ReadTransferBytes: 10_000, OtherTransferBytes: 5_000),
+                new(701, 700, "node.exe", "node.exe persistent-shell.js", 1005, 10)
+            }
+        };
+
+        var aggregator = new HqStateAggregator();
+        var collector = new ProcessAgentCollector(aggregator, enabled: true, inspector: mock, timeProvider: () => time);
+
+        // Baseline: persistent node child at 0% CPU -> Idle
+        Assert.Equal(AgentState.Idle, collector.DetectProcesses()[0].State);
+
+        // Spawn transient rg.exe -> Working ("search")
+        time = time.AddSeconds(2.0);
+        mock.Processes = new List<ProcessItem>
+        {
+            new(700, 10, "omp.exe", "omp.exe", 1000, 60, HasIoCounters: true, ReadTransferBytes: 10_000, OtherTransferBytes: 5_100),
+            new(701, 700, "node.exe", "node.exe persistent-shell.js", 1005, 10),
+            new(702, 700, "rg.exe", "rg.exe DrawCharacter src/", 2000, 15)
+        };
+        var rgRes = collector.DetectProcesses()[0];
+        Assert.Equal(AgentState.Working, rgRes.State);
+        Assert.Equal("search", rgRes.ToolName);
+
+        // Persistent node child suddenly burns real CPU (delta = 150ms in 2s = 7.5%) -> Working ("execute")
+        time = time.AddSeconds(2.0);
+        mock.Processes = new List<ProcessItem>
+        {
+            new(700, 10, "omp.exe", "omp.exe", 1000, 70, HasIoCounters: true, ReadTransferBytes: 10_000, OtherTransferBytes: 5_200),
+            new(701, 700, "node.exe", "node.exe persistent-shell.js", 1005, 160)
+        };
+        var nodeRes = collector.DetectProcesses()[0];
+        Assert.Equal(AgentState.Working, nodeRes.State);
+        Assert.Equal("execute", nodeRes.ToolName);
+    }
+
+    [Fact]
+    public void DetectProcesses_MultipleUnnamedSessions_NeverUseCloneNamesAndAssignDistinctStableAppearances()
+    {
+        var mock = new MockProcessInspector
+        {
+            Processes = new List<ProcessItem>
+            {
+                new(1001, 1, "omp.exe", "omp.exe", 1001, 10),
+                new(1002, 1, "omp.exe", "omp.exe", 1002, 10),
+                new(1003, 1, "omp.exe", "omp.exe", 1003, 10),
+                new(1004, 1, "omp.exe", "omp.exe", 1004, 10),
+                new(1005, 1, "claude.exe", "claude.exe", 1005, 10),
+                new(1006, 1, "claude.exe", "claude.exe", 1006, 10),
+                new(1007, 1, "codex.exe", "codex.exe", 1007, 10),
+                new(1008, 1, "agy.exe", "agy.exe", 1008, 10)
+            }
+        };
+
+        var aggregator = new HqStateAggregator();
+        var collector = new ProcessAgentCollector(aggregator, enabled: true, inspector: mock);
+
+        var first = collector.DetectProcesses();
+        Assert.Equal(8, first.Count);
+
+        // Clean names, zero "Clone" anywhere
+        Assert.All(first, a => Assert.DoesNotContain("clone", a.Name, StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(first, a => a.Name == "OMP");
+        Assert.Contains(first, a => a.Name == "OMP 2");
+        Assert.Contains(first, a => a.Name == "OMP 3");
+        Assert.Contains(first, a => a.Name == "OMP 4");
+        Assert.Contains(first, a => a.Name == "Claude");
+        Assert.Contains(first, a => a.Name == "Claude 2");
+        Assert.Contains(first, a => a.Name == "Codex");
+        Assert.Contains(first, a => a.Name == "AGY");
+
+        // All 8 concurrent sessions receive all 8 distinct characters (zero duplicates until roster exhausted!)
+        Assert.Equal(8, first.Select(a => a.SpriteKey).Distinct(StringComparer.OrdinalIgnoreCase).Count());
+        Assert.All(first, a => Assert.True(AgentAppearanceRegistry.IsRandomizableSprite(a.SpriteKey)));
+        // All 5 desk rigs are used across the 8 sessions
+        Assert.Equal(5, first.Select(a => a.DeskRig).Distinct().Count());
+        Assert.All(first, a => Assert.NotEqual(DeskRigKind.Default, a.DeskRig));
+
+        // Stable across subsequent polls
+        var second = collector.DetectProcesses();
+        for (int i = 0; i < first.Count; i++)
+        {
+            var match = second.Single(a => a.Id == first[i].Id);
+            Assert.Equal(first[i].SpriteKey, match.SpriteKey);
+            Assert.Equal(first[i].DeskRig, match.DeskRig);
+            Assert.Equal(first[i].BehaviorVariant, match.BehaviorVariant);
+        }
     }
 
     [Theory]
@@ -416,7 +659,7 @@ public class ProcessAgentCollectorTests
         // Verify re-enabling publishes normally under the new generation
         var finalState = aggregator.GetState();
         Assert.Single(finalState.Agents);
-        Assert.Equal("CLAUDE", finalState.Agents[0].Name);
+        Assert.Equal("Claude", finalState.Agents[0].Name);
         Assert.Equal("process", finalState.Agents[0].Source);
     }
 }

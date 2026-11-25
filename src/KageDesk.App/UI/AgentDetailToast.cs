@@ -139,7 +139,8 @@ public class AgentDetailToast : Form
 
         using var textBrush = new SolidBrush(Color.White);
         var titleRect = new RectangleF(24, 5, Width - 110, 20);
-        g.DrawString(_agent.Name, TitleFont, textBrush, titleRect, sf);
+        string cleanName = AgentAppearanceRegistry.SanitizeDisplayName(_agent.Name, _agent.Id, _agent.Source, _agent.Role);
+        g.DrawString(cleanName, TitleFont, textBrush, titleRect, sf);
 
         // Action badge (from AgentActionClassifier, NEVER READ_FIL!)
         var (actionKind, actionLabel) = AgentActionClassifier.Classify(_agent.State, _agent.ToolName, _agent.TaskTitle);
@@ -227,13 +228,26 @@ public class AgentDetailToast : Form
 
     public static string ResolveTerminalProvider(AgentSnapshot agent)
     {
-        string key = (agent.SpriteKey ?? agent.Name ?? agent.Id ?? "").ToLowerInvariant();
-        if (key.Contains("omp")) return "OMP";
-        if (key.Contains("agy") || key.Contains("antigravity")) return "AGY";
-        if (key.Contains("claude")) return "Claude";
-        if (key.Contains("codex")) return "Codex";
-        if (key.Contains("opencode")) return "OpenCode";
-        if (key.Contains("gemini")) return "Gemini";
+        // Inspect Id and Name BEFORE SpriteKey so randomized visual sprites (e.g. "mixi", "neko-dev")
+        // still accurately identify the underlying terminal CLI provider.
+        string[] candidates =
+        {
+            agent.Id ?? string.Empty,
+            agent.Name ?? string.Empty,
+            agent.SpriteKey ?? string.Empty
+        };
+
+        for (int i = 0; i < candidates.Length; i++)
+        {
+            string key = candidates[i].ToLowerInvariant();
+            if (key.Contains("omp")) return "OMP";
+            if (key.Contains("agy") || key.Contains("antigravity")) return "AGY";
+            if (key.Contains("claude")) return "Claude";
+            if (key.Contains("codex")) return "Codex";
+            if (key.Contains("opencode")) return "OpenCode";
+            if (key.Contains("gemini")) return "Gemini";
+        }
+
         return "Terminal Agent";
     }
 

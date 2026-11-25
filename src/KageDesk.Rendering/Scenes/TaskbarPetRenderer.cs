@@ -151,7 +151,7 @@ public sealed class TaskbarPetRenderer
             }
             if (workingCount == 1)
             {
-                _cachedSingleWorkingShortName = ShortenName(_workingScratch[0].Name);
+                _cachedSingleWorkingShortName = ShortenName(_workingScratch[0].Name, _workingScratch[0].Id);
                 _cachedSingleWorkingFocusActionId = string.Equals(_workingScratch[0].Source, "process", StringComparison.OrdinalIgnoreCase)
                     ? $"focus_agent:{_workingScratch[0].Id}"
                     : "open_orca";
@@ -200,7 +200,7 @@ public sealed class TaskbarPetRenderer
             if (_idleTerminalCount > 0)
             {
                 _cachedIdleTopText = _idleTerminalCount == 1
-                    ? $"{ShortenName(_idleScratch[0].Name)} READY"
+                    ? $"{ShortenName(_idleScratch[0].Name, _idleScratch[0].Id)} READY"
                     : $"{_idleTerminalCount} TERMINALS";
             }
             else
@@ -249,7 +249,7 @@ public sealed class TaskbarPetRenderer
         const int charX = 344;
         string sprite = ShinobiSpriteRenderer.NormalizeSpriteKey(agent.SpriteKey);
 
-        ShinobiSpriteRenderer.DrawCharacter(buf, sprite, AgentState.NeedsApproval, charX, GroundY, timeSeconds);
+        ShinobiSpriteRenderer.DrawCharacter(buf, sprite, AgentState.NeedsApproval, charX, GroundY, timeSeconds, behaviorVariant: agent.BehaviorVariant);
         _hitRegions.Add(new PetHitRegion($"agent:{agent.Id}", charX - 16, GroundY - 32, 32, 34, agent.Name));
 
         // Amber card bubble
@@ -270,7 +270,7 @@ public sealed class TaskbarPetRenderer
         buf.FillRect(cardX + 7, cardY + 5, 7, 7, ColorAmberCardBg);
         PixelFont.DrawTextCentered(buf, cardX + 10, cardY + 6, "!", ColorAmberBright, PixelFontSize.Small);
 
-        string shortName = ShortenName(agent.Name);
+        string shortName = ShortenName(agent.Name, agent.Id);
         int written = 0;
         ReadOnlySpan<char> snSpan = shortName.AsSpan();
         int toCopy = Math.Min(snSpan.Length, _textScratch.Length);
@@ -316,7 +316,7 @@ public sealed class TaskbarPetRenderer
         string sprite = ShinobiSpriteRenderer.NormalizeSpriteKey(agent.SpriteKey);
 
         ShinobiSpriteRenderer.DrawBurningLaptop(buf, laptopX, GroundY, timeSeconds);
-        ShinobiSpriteRenderer.DrawCharacter(buf, sprite, AgentState.Failed, charX, GroundY, timeSeconds);
+        ShinobiSpriteRenderer.DrawCharacter(buf, sprite, AgentState.Failed, charX, GroundY, timeSeconds, behaviorVariant: agent.BehaviorVariant);
         _hitRegions.Add(new PetHitRegion($"agent:{agent.Id}", charX - 16, GroundY - 30, 32, 32, agent.Name));
 
         if (emitTick)
@@ -334,7 +334,7 @@ public sealed class TaskbarPetRenderer
         buf.FillRect(cardX + cardW - 1, cardY + 34, 4, 5, border);
         buf.FillRect(cardX + cardW - 1, cardY + 35, 3, 3, ColorCrimsonCardBg);
 
-        string shortName = ShortenName(agent.Name);
+        string shortName = ShortenName(agent.Name, agent.Id);
         int written = 0;
         "FAIL \u2022 ".AsSpan().CopyTo(_textScratch.AsSpan());
         written += 7;
@@ -361,7 +361,7 @@ public sealed class TaskbarPetRenderer
         const int charX = 342;
         string sprite = ShinobiSpriteRenderer.NormalizeSpriteKey(agent.SpriteKey);
 
-        ShinobiSpriteRenderer.DrawCharacter(buf, sprite, AgentState.Done, charX, GroundY, timeSeconds);
+        ShinobiSpriteRenderer.DrawCharacter(buf, sprite, AgentState.Done, charX, GroundY, timeSeconds, behaviorVariant: agent.BehaviorVariant);
         _hitRegions.Add(new PetHitRegion($"agent:{agent.Id}", charX - 16, GroundY - 32, 32, 34, agent.Name));
 
         if (emitTick)
@@ -378,7 +378,7 @@ public sealed class TaskbarPetRenderer
         buf.FillRect(cardX + cardW - 1, cardY + 27, 3, 3, ColorEmeraldCardBg);
 
         PixelFont.DrawText(buf, cardX + 8, cardY + 8, "PASS", ColorEmerald, PixelFontSize.Regular);
-        PixelFont.DrawTextTruncated(buf, cardX + 42, cardY + 10, cardW - 50, ShortenName(agent.Name), ColorWhite, PixelFontSize.Small);
+        PixelFont.DrawTextTruncated(buf, cardX + 42, cardY + 10, cardW - 50, ShortenName(agent.Name, agent.Id), ColorWhite, PixelFontSize.Small);
         string msg = !string.IsNullOrWhiteSpace(agent.TaskTitle) ? agent.TaskTitle! : "TASK COMPLETE!";
         PixelFont.DrawTextTruncated(buf, cardX + 8, cardY + 24, cardW - 16, msg, ColorUtil.FromRgb(167, 243, 208), PixelFontSize.Small);
 
@@ -407,7 +407,8 @@ public sealed class TaskbarPetRenderer
                 timeSeconds,
                 phaseOffset: i,
                 behindDesk: true,
-                actionKind: actionKind);
+                actionKind: actionKind,
+                behaviorVariant: ag.BehaviorVariant);
 
             ShinobiSpriteRenderer.DrawMiniTaskbarDesk(
                 buf,
@@ -416,7 +417,9 @@ public sealed class TaskbarPetRenderer
                 _palette.DeskTop,
                 AgentState.Working,
                 timeSeconds,
-                actionKind: actionKind);
+                actionKind: actionKind,
+                deskRig: ag.DeskRig,
+                behaviorVariant: ag.BehaviorVariant);
 
             _hitRegions.Add(new PetHitRegion(_cachedWorkingItems[i].HitRegionAction, cx - 18, GroundY - 36, 36, 38, ag.Name));
 
@@ -432,7 +435,7 @@ public sealed class TaskbarPetRenderer
         if (workingCount == 1)
         {
             AgentSnapshot a = _workingScratch[0];
-            string shortName = _cachedSingleWorkingShortName ?? ShortenName(a.Name);
+            string shortName = _cachedSingleWorkingShortName ?? ShortenName(a.Name, a.Id);
             string shortLabel = _cachedWorkingItems[0].ShortLabel;
             int written = 0;
             ReadOnlySpan<char> sn = shortName.AsSpan();
@@ -516,9 +519,10 @@ public sealed class TaskbarPetRenderer
         }
         string primaryName = _idlePrimaryNonProcess?.Name ?? primarySprite;
         string primaryActionId = _cachedIdlePrimaryActionId ?? $"agent:{primarySprite}";
+        int primaryVariant = _idlePrimaryNonProcess?.BehaviorVariant ?? 0;
 
         // Draw primary idle agent
-        ShinobiSpriteRenderer.DrawCharacter(buf, primarySprite, AgentState.Idle, primaryX, GroundY, timeSeconds);
+        ShinobiSpriteRenderer.DrawCharacter(buf, primarySprite, AgentState.Idle, primaryX, GroundY, timeSeconds, behaviorVariant: primaryVariant);
         _hitRegions.Add(new PetHitRegion(primaryActionId, primaryX - 16, GroundY - 30, 32, 32, primaryName));
 
         if (primarySprite == "shikamaru")
@@ -535,7 +539,7 @@ public sealed class TaskbarPetRenderer
             string tSprite = ShinobiSpriteRenderer.NormalizeSpriteKey(tAg.SpriteKey);
             string actionId = _cachedIdleTerminalActionIds[i] ?? $"agent:{tAg.Id}";
 
-            ShinobiSpriteRenderer.DrawCharacter(buf, tSprite, AgentState.Idle, tx, GroundY, timeSeconds, phaseOffset: i + 1);
+            ShinobiSpriteRenderer.DrawCharacter(buf, tSprite, AgentState.Idle, tx, GroundY, timeSeconds, phaseOffset: i + 1, behaviorVariant: tAg.BehaviorVariant);
             _hitRegions.Add(new PetHitRegion(actionId, tx - 16, GroundY - 30, 32, 32, tAg.Name));
         }
 
@@ -550,7 +554,7 @@ public sealed class TaskbarPetRenderer
 
         if (_idleTerminalCount > 0)
         {
-            string topText = _cachedIdleTopText ?? (_idleTerminalCount == 1 ? $"{ShortenName(_idleScratch[0].Name)} READY" : $"{_idleTerminalCount} TERMINALS");
+            string topText = _cachedIdleTopText ?? (_idleTerminalCount == 1 ? $"{ShortenName(_idleScratch[0].Name, _idleScratch[0].Id)} READY" : $"{_idleTerminalCount} TERMINALS");
             PixelFont.DrawTextCentered(buf, bX + bW / 2, bY + 5, topText, ColorUtil.FromRgb(203, 213, 225), PixelFontSize.Small);
             PixelFont.DrawTextCentered(buf, bX + bW / 2, bY + 13, "HQ IDLE", ColorSlate, PixelFontSize.Small);
         }
@@ -561,11 +565,11 @@ public sealed class TaskbarPetRenderer
         }
     }
 
-    private static string ShortenName(string name)
+    private static string ShortenName(string name, string? id = null)
     {
-        if (string.IsNullOrWhiteSpace(name)) return "AGENT";
-        int idx = name.IndexOf('(');
-        if (idx > 0) name = name[..idx];
-        return name.Trim();
+        string clean = AgentAppearanceRegistry.SanitizeDisplayName(name, id);
+        int idx = clean.IndexOf('(');
+        if (idx > 0) clean = clean[..idx];
+        return clean.Trim();
     }
 }

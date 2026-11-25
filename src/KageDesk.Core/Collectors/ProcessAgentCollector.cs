@@ -26,15 +26,27 @@ public class ProcessAgentCollector
         public DateTimeOffset? WorkingStartedAt { get; set; }
         public DateTimeOffset? DoneStartedAt { get; set; }
         public long LastCpuTimeMs { get; set; }
+        public long LastReadBytes { get; set; }
+        public long LastOtherBytes { get; set; }
         public DateTimeOffset LastSampleAt { get; set; }
         public int QuietPollCount { get; set; }
+        public bool IsFirstSample { get; set; } = true;
+    }
+
+    private class ChildPidState
+    {
+        public long LastCpuTimeMs { get; set; }
+        public DateTimeOffset FirstSeenAt { get; set; }
+        public DateTimeOffset LastSampleAt { get; set; }
         public bool IsFirstSample { get; set; } = true;
     }
 
     private readonly HqStateAggregator _aggregator;
     private readonly IProcessInspectionProvider _inspector;
     private readonly Func<DateTimeOffset> _timeProvider;
+    private readonly AgentAppearanceRegistry _appearanceRegistry;
     private readonly Dictionary<int, AgentPidState> _history = new();
+    private readonly Dictionary<(int Pid, long StartTicks), ChildPidState> _childHistory = new();
     private readonly Dictionary<(int Pid, long StartTicks), string> _opaqueTokens = new();
     private readonly HashSet<string> _usedTokens = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _lock = new();
@@ -95,8 +107,10 @@ public class ProcessAgentCollector
                 {
                     _generation++;
                     _history.Clear();
+                    _childHistory.Clear();
                     _opaqueTokens.Clear();
                     _usedTokens.Clear();
+                    _appearanceRegistry.Clear();
                     shouldClearInspector = true;
                 }
             }
@@ -113,11 +127,13 @@ public class ProcessAgentCollector
         HqStateAggregator aggregator,
         bool enabled = true,
         IProcessInspectionProvider? inspector = null,
-        Func<DateTimeOffset>? timeProvider = null)
+        Func<DateTimeOffset>? timeProvider = null,
+        int? appearanceSeed = null)
     {
         _aggregator = aggregator ?? throw new ArgumentNullException(nameof(aggregator));
         _inspector = inspector ?? Win32ProcessInspector.Instance;
         _timeProvider = timeProvider ?? (() => DateTimeOffset.UtcNow);
+        _appearanceRegistry = new AgentAppearanceRegistry(appearanceSeed);
         _enabled = enabled;
     }
 
@@ -163,8 +179,10 @@ public class ProcessAgentCollector
                     else
                     {
                         _history.Clear();
+                        _childHistory.Clear();
                         _opaqueTokens.Clear();
                         _usedTokens.Clear();
+                        _appearanceRegistry.Clear();
                     }
                 }
 
@@ -275,172 +293,233 @@ public class ProcessAgentCollector
                 else
                 {
                     var liveCandidatePids = new HashSet<int>(candidates.Count);
-                var liveKeys = new HashSet<(int Pid, long StartTicks)>(candidates.Count);
+                    var liveKeys = new HashSet<(int Pid, long StartTicks)>(candidates.Count);
+                    var liveChildKeys = new HashSet<(int Pid, long StartTicks)>();
+                    var liveAgentIds = new HashSet<string>(candidates.Count, StringComparer.OrdinalIgnoreCase);
 
-                // Group by Provider to number multiple instances stably
-                var byProvider = candidates.GroupBy(c => c.Provider, StringComparer.OrdinalIgnoreCase);
-
-                foreach (var group in byProvider)
-                {
-                    // Sort stably by start time, then PID
-                    var sorted = group.OrderBy(c => c.StartTimeTicks).ThenBy(c => c.Pid).ToList();
-                    bool multi = sorted.Count > 1;
-
-                    for (int i = 0; i < sorted.Count; i++)
+                    // Pre-compute live agent IDs so appearance registry only evicts truly departed sessions
+                    foreach (var cand in candidates)
                     {
-                        var cand = sorted[i];
-                        liveCandidatePids.Add(cand.Pid);
-                        liveKeys.Add((cand.Pid, cand.StartTimeTicks));
+                        string tok = GetOrCreateOpaqueToken(cand.Pid, cand.StartTimeTicks);
+                        liveAgentIds.Add($"proc:{cand.ProviderLower}:{tok}");
+                    }
 
-                        string name = multi ? $"{cand.Provider} #{i + 1}" : cand.Provider;
-                        string opaqueToken = GetOrCreateOpaqueToken(cand.Pid, cand.StartTimeTicks);
-                        string id = $"proc:{cand.ProviderLower}:{opaqueToken}";
+                    // Group by Provider to number multiple instances cleanly (OMP, OMP 2, Claude, Claude 2)
+                    var byProvider = candidates.GroupBy(c => c.Provider, StringComparer.OrdinalIgnoreCase);
 
-                        if (!_history.TryGetValue(cand.Pid, out var stateEntry) || stateEntry.StartTimeTicks != cand.StartTimeTicks)
+                    foreach (var group in byProvider)
+                    {
+                        // Sort stably by start time, then PID
+                        var sorted = group.OrderBy(c => c.StartTimeTicks).ThenBy(c => c.Pid).ToList();
+
+                        for (int i = 0; i < sorted.Count; i++)
                         {
-                            stateEntry = new AgentPidState
+                            var cand = sorted[i];
+                            liveCandidatePids.Add(cand.Pid);
+                            liveKeys.Add((cand.Pid, cand.StartTimeTicks));
+
+                            string name = AgentAppearanceRegistry.FormatIndexedProviderName(cand.Provider, i, sorted.Count);
+                            string opaqueToken = GetOrCreateOpaqueToken(cand.Pid, cand.StartTimeTicks);
+                            string id = $"proc:{cand.ProviderLower}:{opaqueToken}";
+
+                            if (!_history.TryGetValue(cand.Pid, out var stateEntry) || stateEntry.StartTimeTicks != cand.StartTimeTicks)
                             {
-                                Pid = cand.Pid,
-                                StartTimeTicks = cand.StartTimeTicks,
-                                FirstSeenAt = now,
-                                LastSampleAt = now,
-                                IsFirstSample = true
-                            };
-                            _history[cand.Pid] = stateEntry;
-                        }
-
-                        // 1. Detect Active Tool Child
-                        string? detectedTool = DetectActiveToolChild(cand.Pid, childrenMap, procByPid);
-
-                        // 2. Compute Aggregated CPU Time (agent + __omp_worker_* children)
-                        long totalCpuMs = ComputeAggregatedCpu(cand.Pid, childrenMap, procByPid);
-
-                        double elapsedWallMs = (now - stateEntry.LastSampleAt).TotalMilliseconds;
-                        long cpuDeltaMs = totalCpuMs - stateEntry.LastCpuTimeMs;
-                        if (cpuDeltaMs < 0) cpuDeltaMs = 0;
-                        double cpuRatio = elapsedWallMs > 0 ? (double)cpuDeltaMs / elapsedWallMs : 0;
-
-                        if (stateEntry.IsFirstSample)
-                        {
-                            stateEntry.IsFirstSample = false;
-                            stateEntry.LastCpuTimeMs = totalCpuMs;
-                            stateEntry.LastSampleAt = now;
-
-                            if (detectedTool != null)
-                            {
-                                stateEntry.State = AgentState.Working;
-                                stateEntry.ToolName = detectedTool;
-                                stateEntry.WorkingStartedAt = now;
-                            }
-                            else
-                            {
-                                stateEntry.State = AgentState.Idle;
-                                stateEntry.ToolName = null;
-                            }
-                        }
-                        else
-                        {
-                            stateEntry.LastCpuTimeMs = totalCpuMs;
-                            stateEntry.LastSampleAt = now;
-
-                            bool isActive = detectedTool != null || cpuDeltaMs >= 18.0 || cpuRatio >= 0.008;
-
-                            if (isActive)
-                            {
-                                stateEntry.QuietPollCount = 0;
-                                if (stateEntry.State != AgentState.Working)
+                                stateEntry = new AgentPidState
                                 {
+                                    Pid = cand.Pid,
+                                    StartTimeTicks = cand.StartTimeTicks,
+                                    FirstSeenAt = now,
+                                    LastSampleAt = now,
+                                    IsFirstSample = true
+                                };
+                                _history[cand.Pid] = stateEntry;
+                            }
+
+                            bool wasAgentFirstSample = stateEntry.IsFirstSample;
+
+                            // 1. Detect Active Tool Child (ignores console hosts, internal/MCP/LSP daemons, and idle children)
+                            string? detectedTool = DetectActiveToolChild(
+                                cand.Pid,
+                                wasAgentFirstSample,
+                                now,
+                                childrenMap,
+                                procByPid,
+                                liveChildKeys);
+
+                            // 2. Read agent's own CPU and IO counters (exclude background __omp_worker_* daemon CPU)
+                            procByPid.TryGetValue(cand.Pid, out var agentProc);
+                            long totalCpuMs = agentProc?.TotalCpuTimeMs ?? 0;
+                            bool hasIoCounters = agentProc?.HasIoCounters ?? false;
+                            long readBytes = agentProc?.ReadTransferBytes ?? 0;
+                            long otherBytes = agentProc?.OtherTransferBytes ?? 0;
+
+                            double elapsedWallMs = (now - stateEntry.LastSampleAt).TotalMilliseconds;
+                            long cpuDeltaMs = Math.Max(0, totalCpuMs - stateEntry.LastCpuTimeMs);
+                            double cpuRatio = elapsedWallMs > 0 ? (double)cpuDeltaMs / elapsedWallMs : 0;
+
+                            long readBytesDelta = Math.Max(0, readBytes - stateEntry.LastReadBytes);
+                            long otherBytesDelta = Math.Max(0, otherBytes - stateEntry.LastOtherBytes);
+                            double elapsedSec = elapsedWallMs / 1000.0;
+                            double otherBytesPerSec = elapsedSec > 0 ? otherBytesDelta / elapsedSec : 0;
+
+                            if (stateEntry.IsFirstSample)
+                            {
+                                stateEntry.IsFirstSample = false;
+                                stateEntry.LastCpuTimeMs = totalCpuMs;
+                                stateEntry.LastReadBytes = readBytes;
+                                stateEntry.LastOtherBytes = otherBytes;
+                                stateEntry.LastSampleAt = now;
+
+                                if (detectedTool != null)
+                                {
+                                    stateEntry.State = AgentState.Working;
+                                    stateEntry.ToolName = detectedTool;
                                     stateEntry.WorkingStartedAt = now;
                                 }
-                                stateEntry.State = AgentState.Working;
-                                stateEntry.ToolName = detectedTool ?? "thinking";
-                                stateEntry.DoneStartedAt = null;
+                                else
+                                {
+                                    stateEntry.State = AgentState.Idle;
+                                    stateEntry.ToolName = null;
+                                    stateEntry.WorkingStartedAt = null;
+                                }
                             }
                             else
                             {
-                                // Quiet poll (cpuDeltaMs < 8 ms and no active tool child)
-                                stateEntry.QuietPollCount++;
+                                stateEntry.LastCpuTimeMs = totalCpuMs;
+                                stateEntry.LastReadBytes = readBytes;
+                                stateEntry.LastOtherBytes = otherBytes;
+                                stateEntry.LastSampleAt = now;
 
-                                if (stateEntry.State == AgentState.Working && stateEntry.QuietPollCount == 1)
+                                bool isCpuActive;
+                                if (hasIoCounters)
                                 {
-                                    // 1-poll hysteresis holds Working
-                                    stateEntry.ToolName = "thinking";
+                                    // Real Win32 processes (notably interactive OMP's Bun TUI) can redraw continuously
+                                    // while sitting idle at the prompt with ~0 read/socket IO. Require real read/socket
+                                    // transfer activity or a heavy local CPU burst (>= 35% core) when no tool child runs.
+                                    bool hasMeaningfulIo = readBytesDelta >= 256 || otherBytesPerSec >= 512.0;
+                                    bool hasHeavyIo = readBytesDelta >= 1024 || otherBytesPerSec >= 1024.0;
+                                    isCpuActive = (cpuDeltaMs >= 45.0 && cpuRatio >= 0.02 && (hasMeaningfulIo || cpuRatio >= 0.35))
+                                               || (hasHeavyIo && cpuDeltaMs >= 15.0);
                                 }
-                                else if (stateEntry.QuietPollCount >= 2)
+                                else
                                 {
-                                    bool wasWorkingLongEnough = stateEntry.WorkingStartedAt.HasValue &&
-                                        (now - stateEntry.WorkingStartedAt.Value).TotalSeconds >= 2.0;
+                                    // Reject small TUI blink/timer CPU ripples (< 45ms or < 2.0% core)
+                                    isCpuActive = cpuDeltaMs >= 45.0 && cpuRatio >= 0.02;
+                                }
 
-                                    if (wasWorkingLongEnough && stateEntry.State == AgentState.Working)
+                                bool isActive = detectedTool != null || isCpuActive;
+
+                                if (isActive)
+                                {
+                                    stateEntry.QuietPollCount = 0;
+                                    if (stateEntry.State != AgentState.Working)
                                     {
-                                        // Transition to Done!
-                                        stateEntry.State = AgentState.Done;
-                                        stateEntry.DoneStartedAt = now;
-                                        stateEntry.WorkingStartedAt = null;
-                                        stateEntry.ToolName = null;
+                                        stateEntry.WorkingStartedAt = now;
                                     }
-                                    else if (stateEntry.State == AgentState.Done)
+                                    stateEntry.State = AgentState.Working;
+                                    stateEntry.ToolName = detectedTool ?? "thinking";
+                                    stateEntry.DoneStartedAt = null;
+                                }
+                                else
+                                {
+                                    stateEntry.QuietPollCount++;
+
+                                    if (stateEntry.State == AgentState.Working && stateEntry.QuietPollCount == 1)
                                     {
-                                        if (stateEntry.DoneStartedAt.HasValue &&
-                                            (now - stateEntry.DoneStartedAt.Value).TotalSeconds < 6.0)
+                                        // 1-poll hysteresis bridges short gaps between bursts
+                                        stateEntry.ToolName = "thinking";
+                                    }
+                                    else if (stateEntry.QuietPollCount >= 2)
+                                    {
+                                        bool wasWorkingLongEnough = stateEntry.WorkingStartedAt.HasValue &&
+                                            (now - stateEntry.WorkingStartedAt.Value).TotalSeconds >= 2.0;
+
+                                        if (wasWorkingLongEnough && stateEntry.State == AgentState.Working)
                                         {
+                                            // Transition cleanly to brief Done celebration, clearing work timer
                                             stateEntry.State = AgentState.Done;
+                                            stateEntry.DoneStartedAt = now;
+                                            stateEntry.WorkingStartedAt = null;
+                                            stateEntry.ToolName = null;
+                                        }
+                                        else if (stateEntry.State == AgentState.Done)
+                                        {
+                                            if (stateEntry.DoneStartedAt.HasValue &&
+                                                (now - stateEntry.DoneStartedAt.Value).TotalSeconds < 5.0)
+                                            {
+                                                stateEntry.State = AgentState.Done;
+                                            }
+                                            else
+                                            {
+                                                stateEntry.State = AgentState.Idle;
+                                                stateEntry.DoneStartedAt = null;
+                                                stateEntry.WorkingStartedAt = null;
+                                                stateEntry.ToolName = null;
+                                            }
                                         }
                                         else
                                         {
                                             stateEntry.State = AgentState.Idle;
+                                            stateEntry.DoneStartedAt = null;
                                             stateEntry.WorkingStartedAt = null;
                                             stateEntry.ToolName = null;
                                         }
                                     }
-                                    else
-                                    {
-                                        stateEntry.State = AgentState.Idle;
-                                        stateEntry.WorkingStartedAt = null;
-                                        stateEntry.ToolName = null;
-                                    }
                                 }
                             }
+
+                            var appearance = _appearanceRegistry.GetOrAssignForNonOrca(id, liveAgentIds);
+
+                            detected.Add(new AgentSnapshot(
+                                Id: id,
+                                Name: name,
+                                Role: cand.Role,
+                                SpriteKey: appearance.SpriteKey,
+                                State: stateEntry.State,
+                                ToolName: stateEntry.ToolName,
+                                Source: "process",
+                                WorkStartedAt: stateEntry.State == AgentState.Working ? stateEntry.WorkingStartedAt : null,
+                                ProcessId: cand.Pid,
+                                ProcessStartTicks: cand.StartTimeTicks,
+                                LastActivityAt: stateEntry.WorkingStartedAt ?? stateEntry.FirstSeenAt,
+                                UpdatedAt: now,
+                                DeskRig: appearance.DeskRig,
+                                BehaviorVariant: appearance.BehaviorVariant
+                            ));
                         }
-
-                        detected.Add(new AgentSnapshot(
-                            Id: id,
-                            Name: name,
-                            Role: cand.Role,
-                            SpriteKey: cand.SpriteKey,
-                            State: stateEntry.State,
-                            ToolName: stateEntry.ToolName,
-                            Source: "process",
-                            WorkStartedAt: stateEntry.State == AgentState.Working ? stateEntry.WorkingStartedAt : null,
-                            ProcessId: cand.Pid,
-                            ProcessStartTicks: cand.StartTimeTicks,
-                            LastActivityAt: stateEntry.WorkingStartedAt ?? stateEntry.FirstSeenAt,
-                            UpdatedAt: now
-                        ));
                     }
-                }
 
-                // Evict stale opaque tokens
-                var staleTokenKeys = _opaqueTokens.Keys.Where(k => !liveKeys.Contains(k)).ToList();
-                foreach (var k in staleTokenKeys)
-                {
-                    if (_opaqueTokens.Remove(k, out var token))
+                    // Evict stale opaque tokens
+                    var staleTokenKeys = _opaqueTokens.Keys.Where(k => !liveKeys.Contains(k)).ToList();
+                    foreach (var k in staleTokenKeys)
                     {
-                        _usedTokens.Remove(token);
+                        if (_opaqueTokens.Remove(k, out var token))
+                        {
+                            _usedTokens.Remove(token);
+                        }
                     }
-                }
 
-                // Evict exited PIDs cleanly
-                if (_history.Count > liveCandidatePids.Count)
-                {
-                    var stale = _history.Keys.Where(k => !liveCandidatePids.Contains(k)).ToList();
-                    foreach (var s in stale)
+                    // Evict exited PIDs cleanly
+                    if (_history.Count > liveCandidatePids.Count)
                     {
-                        _history.Remove(s);
+                        var stale = _history.Keys.Where(k => !liveCandidatePids.Contains(k)).ToList();
+                        foreach (var s in stale)
+                        {
+                            _history.Remove(s);
+                        }
+                    }
+
+                    // Evict exited child states cleanly
+                    if (_childHistory.Count > liveChildKeys.Count)
+                    {
+                        var staleChildren = _childHistory.Keys.Where(k => !liveChildKeys.Contains(k)).ToList();
+                        foreach (var sc in staleChildren)
+                        {
+                            _childHistory.Remove(sc);
+                        }
                     }
                 }
             }
-        }
 
             if (clearInspectorOnDisabled)
             {
@@ -460,10 +539,13 @@ public class ProcessAgentCollector
         }
     }
 
-    private static string? DetectActiveToolChild(
+    private string? DetectActiveToolChild(
         int agentPid,
+        bool agentIsFirstSample,
+        DateTimeOffset now,
         Dictionary<int, List<int>> childrenMap,
-        Dictionary<int, ProcessItem> procByPid)
+        Dictionary<int, ProcessItem> procByPid,
+        HashSet<(int Pid, long StartTicks)> liveChildKeys)
     {
         // Breadth-first walk up to depth 3
         var queue = new Queue<(int Pid, int Depth)>();
@@ -499,19 +581,72 @@ public class ProcessAgentCollector
 
                 if (cl.RoleHint != null)
                 {
-                    int priority = cl.RoleHint switch
+                    var childKey = (item.ProcessId, item.StartTimeTicks);
+                    liveChildKeys.Add(childKey);
+
+                    if (!_childHistory.TryGetValue(childKey, out var childState))
                     {
-                        "git" => 1,
-                        "test" => 2,
-                        "build" => 3,
-                        "search" => 4,
-                        "execute" => 5,
-                        _ => int.MaxValue
-                    };
-                    if (priority < bestPriority)
+                        childState = new ChildPidState
+                        {
+                            LastCpuTimeMs = item.TotalCpuTimeMs,
+                            FirstSeenAt = now,
+                            LastSampleAt = now,
+                            IsFirstSample = true
+                        };
+                        _childHistory[childKey] = childState;
+                    }
+
+                    bool isChildFirstSample = childState.IsFirstSample;
+                    double childElapsedMs = (now - childState.LastSampleAt).TotalMilliseconds;
+                    long childCpuDeltaMs = Math.Max(0, item.TotalCpuTimeMs - childState.LastCpuTimeMs);
+                    double childCpuRatio = childElapsedMs > 0 ? (double)childCpuDeltaMs / childElapsedMs : 0;
+
+                    childState.IsFirstSample = false;
+                    childState.LastCpuTimeMs = item.TotalCpuTimeMs;
+                    childState.LastSampleAt = now;
+
+                    bool isStrongTransientTool = cl.RoleHint is "git" or "test" or "build" or "search";
+                    bool isChildActive;
+
+                    if (cl.IsPersistentDaemon)
                     {
-                        bestPriority = priority;
-                        bestTool = cl.RoleHint;
+                        // Long-lived MCP/LSP servers only count if actively burning substantial CPU
+                        isChildActive = !isChildFirstSample && childCpuDeltaMs >= 30 && childCpuRatio >= 0.025;
+                    }
+                    else if (isStrongTransientTool)
+                    {
+                        // Transient dev tools (git, dotnet, rg, pytest, vitest): active when freshly spawned or burning CPU
+                        isChildActive = isChildFirstSample
+                            || (now - childState.FirstSeenAt).TotalSeconds < 8.0
+                            || childCpuDeltaMs >= 15
+                            || childCpuRatio >= 0.01;
+                    }
+                    else
+                    {
+                        // Generic shell/runtime child (node, pwsh, cmd, bash, python):
+                        // Do NOT mark idle parent Working for pre-existing idle shells/MCPs;
+                        // active only if newly spawned after agent tracking began OR actively consuming CPU.
+                        isChildActive = isChildFirstSample
+                            ? !agentIsFirstSample
+                            : (childCpuDeltaMs >= 20 && childCpuRatio >= 0.015);
+                    }
+
+                    if (isChildActive)
+                    {
+                        int priority = cl.RoleHint switch
+                        {
+                            "git" => 1,
+                            "test" => 2,
+                            "build" => 3,
+                            "search" => 4,
+                            "execute" => 5,
+                            _ => int.MaxValue
+                        };
+                        if (priority < bestPriority)
+                        {
+                            bestPriority = priority;
+                            bestTool = cl.RoleHint;
+                        }
                     }
                 }
             }
@@ -526,54 +661,6 @@ public class ProcessAgentCollector
         }
 
         return bestTool;
-    }
-
-    private static long ComputeAggregatedCpu(
-        int agentPid,
-        Dictionary<int, List<int>> childrenMap,
-        Dictionary<int, ProcessItem> procByPid)
-    {
-        long sum = 0;
-        if (procByPid.TryGetValue(agentPid, out var agentProc))
-        {
-            sum += agentProc.TotalCpuTimeMs;
-        }
-
-        // Sum direct/indirect __omp_worker_* helper children
-        var queue = new Queue<int>();
-        if (childrenMap.TryGetValue(agentPid, out var directChildren))
-        {
-            foreach (var c in directChildren)
-            {
-                queue.Enqueue(c);
-            }
-        }
-
-        var visited = new HashSet<int> { agentPid };
-        while (queue.Count > 0)
-        {
-            int cPid = queue.Dequeue();
-            if (!visited.Add(cPid)) continue;
-
-            if (procByPid.TryGetValue(cPid, out var childItem))
-            {
-                var cl = childItem.Classification ?? Win32ProcessInspector.ClassifyProcess(childItem.ExeName, childItem.CommandLine);
-                if (cl.IsInternalDaemon)
-                {
-                    sum += childItem.TotalCpuTimeMs;
-                }
-            }
-
-            if (childrenMap.TryGetValue(cPid, out var deeper))
-            {
-                foreach (var d in deeper)
-                {
-                    queue.Enqueue(d);
-                }
-            }
-        }
-
-        return sum;
     }
 
     internal Action? BeforePublishAction { get; set; }
