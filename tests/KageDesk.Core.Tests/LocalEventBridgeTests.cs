@@ -718,4 +718,128 @@ public class LocalEventBridgeTests
         string resolvedFallback = LocalEventBridge.ResolveCanonicalAgentId("minato", stateWithoutExactId);
         Assert.Equal("worker-1", resolvedFallback);
     }
+
+    [Fact]
+    public async Task PostEvent_Handoff_OriginalToQaWhenOriginalIsActiveTester_Returns400AndQueuesZeroHandoffs()
+    {
+        var port = GetAvailablePort();
+        var aggregator = new HqStateAggregator();
+        const string token = "test-token-qa-self-handoff";
+
+        aggregator.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("original", "Original Tester", AgentRole.Tester, "tsunade", AgentState.Working),
+            new AgentSnapshot("coder-1", "Minato", AgentRole.Coder, "minato", AgentState.Idle)
+        }, Array.Empty<AccountInfo>());
+
+        await using var bridge = new LocalEventBridge(aggregator, port, requiredToken: token);
+        bridge.Start();
+
+        using var client = new HttpClient();
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{port}/api/event")
+        {
+            Content = new StringContent(
+                """{"type":"handoff","fromAgentId":"original","toAgentId":"qa","message":"Self handoff via qa alias"}""",
+                Encoding.UTF8,
+                "application/json")
+        };
+        req.Headers.Add("X-KageDesk-Token", token);
+
+        var res = await client.SendAsync(req);
+        Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
+
+        var handoffs = aggregator.GetState().PendingVisualEvents
+            .Where(e => string.Equals(e.Type, "handoff", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        Assert.Empty(handoffs);
+    }
+
+    [Theory]
+    [InlineData("active-tester", AgentRole.Tester, "tsunade", "qa")]
+    [InlineData("active-tester", AgentRole.Tester, "tsunade", "tester")]
+    [InlineData("active-tester", AgentRole.Tester, "tsunade", "tsunade")]
+    [InlineData("active-coder", AgentRole.Coder, "minato", "coder")]
+    [InlineData("active-coder", AgentRole.Coder, "minato", "minato")]
+    [InlineData("active-reviewer", AgentRole.Reviewer, "kakashi", "reviewer")]
+    [InlineData("active-reviewer", AgentRole.Reviewer, "kakashi", "kakashi")]
+    [InlineData("active-leader", AgentRole.Leader, "shikamaru", "lead")]
+    [InlineData("active-leader", AgentRole.Leader, "shikamaru", "leader")]
+    [InlineData("active-leader", AgentRole.Leader, "shikamaru", "team-leader")]
+    [InlineData("active-leader", AgentRole.Leader, "shikamaru", "shikamaru")]
+    public async Task PostEvent_Handoff_ConcreteAgentToSharedRoleAlias_Returns400AndQueuesZeroHandoffs(
+        string concreteId,
+        AgentRole role,
+        string spriteKey,
+        string alias)
+    {
+        var port = GetAvailablePort();
+        var aggregator = new HqStateAggregator();
+        const string token = "test-token-shared-aliases";
+
+        aggregator.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot(concreteId, "Active Worker", role, spriteKey, AgentState.Working)
+        }, Array.Empty<AccountInfo>());
+
+        await using var bridge = new LocalEventBridge(aggregator, port, requiredToken: token);
+        bridge.Start();
+
+        using var client = new HttpClient();
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{port}/api/event")
+        {
+            Content = new StringContent(
+                $$"""{"type":"handoff","fromAgentId":"{{concreteId}}","toAgentId":"{{alias}}"}""",
+                Encoding.UTF8,
+                "application/json")
+        };
+        req.Headers.Add("X-KageDesk-Token", token);
+
+        var res = await client.SendAsync(req);
+        Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
+
+        var handoffs = aggregator.GetState().PendingVisualEvents
+            .Where(e => string.Equals(e.Type, "handoff", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        Assert.Empty(handoffs);
+    }
+
+    [Fact]
+    public async Task PostEvent_Handoff_ExactIdQaAlongsideTester_ResolvesExactIdFirstAndAllowsHandoff()
+    {
+        var port = GetAvailablePort();
+        var aggregator = new HqStateAggregator();
+        const string token = "test-token-exact-id-qa";
+
+        aggregator.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("original", "Original Tester", AgentRole.Tester, "tsunade", AgentState.Working),
+            new AgentSnapshot("qa", "Literal QA Worker", AgentRole.Clone, "clone", AgentState.Working)
+        }, Array.Empty<AccountInfo>());
+
+        var snapshot = aggregator.GetState();
+        Assert.Equal("qa", AgentAliasResolver.ResolveCanonicalAgentId("qa", snapshot));
+        Assert.Equal("qa", LocalEventBridge.ResolveCanonicalAgentId("qa", snapshot));
+
+        await using var bridge = new LocalEventBridge(aggregator, port, requiredToken: token);
+        bridge.Start();
+
+        using var client = new HttpClient();
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{port}/api/event")
+        {
+            Content = new StringContent(
+                """{"type":"handoff","fromAgentId":"original","toAgentId":"qa","message":"Handoff to literal qa"}""",
+                Encoding.UTF8,
+                "application/json")
+        };
+        req.Headers.Add("X-KageDesk-Token", token);
+
+        var res = await client.SendAsync(req);
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+
+        var handoff = aggregator.GetState().PendingVisualEvents
+            .Single(e => string.Equals(e.Type, "handoff", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal("original", handoff.AgentId);
+        Assert.Equal("qa", handoff.TargetAgentId);
+    }
 }
+

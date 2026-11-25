@@ -328,11 +328,7 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
 
                 // Capture ONE snapshot and resolve BOTH endpoints with strict 2-pass priority
                 HqState snapshot = _aggregator.GetState();
-                string resolvedFrom = ResolveCanonicalAgentId(fromId, snapshot);
-                string resolvedTo = ResolveCanonicalAgentId(toId, snapshot);
-
-                // AFTER resolving both canonical endpoints, reject with 400 if identical
-                if (string.Equals(resolvedFrom, resolvedTo, StringComparison.OrdinalIgnoreCase))
+                if (AgentAliasResolver.AreSameCanonicalEndpoint(fromId, toId, snapshot, out string resolvedFrom, out string resolvedTo))
                 {
                     await WriteJsonAsync(response, 400, new { ok = false, error = "fromAgentId and toAgentId cannot resolve to the same agent endpoint" }).ConfigureAwait(false);
                     return;
@@ -555,50 +551,6 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
 
     public static string ResolveCanonicalAgentId(string agentRef, HqState snapshot)
     {
-        if (string.IsNullOrWhiteSpace(agentRef)) return agentRef;
-        var trimmed = agentRef.Trim();
-        var agents = snapshot.Agents;
-        if (agents == null || agents.Count == 0) return trimmed;
-
-        // Pass 1: Strict exact OrdinalIgnoreCase match on agent.Id
-        for (int i = 0; i < agents.Count; i++)
-        {
-            if (string.Equals(agents[i].Id, trimmed, StringComparison.OrdinalIgnoreCase))
-            {
-                return agents[i].Id;
-            }
-        }
-
-        // Pass 2 (only if Pass 1 misses): Alias match on SpriteKey, shortened Name, or Role
-        for (int i = 0; i < agents.Count; i++)
-        {
-            var a = agents[i];
-            if (string.Equals(a.SpriteKey, trimmed, StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(a.Role.ToString(), trimmed, StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(a.Name, trimmed, StringComparison.OrdinalIgnoreCase) ||
-                MatchesShortenedName(a.Name, trimmed))
-            {
-                return a.Id;
-            }
-        }
-
-        return trimmed;
-    }
-
-    private static bool MatchesShortenedName(string? fullName, string agentRef)
-    {
-        if (string.IsNullOrWhiteSpace(fullName)) return false;
-        int paren = fullName.IndexOf('(');
-        string baseName = (paren > 0 ? fullName.Substring(0, paren) : fullName).Trim();
-        if (string.Equals(baseName, agentRef, StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-        int space = baseName.IndexOf(' ');
-        if (space > 0 && string.Equals(baseName.Substring(0, space).Trim(), agentRef, StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-        return false;
+        return AgentAliasResolver.ResolveCanonicalAgentId(agentRef, snapshot);
     }
 }

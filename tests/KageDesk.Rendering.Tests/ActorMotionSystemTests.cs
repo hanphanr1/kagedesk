@@ -313,5 +313,230 @@ public class ActorMotionSystemTests
         Assert.Equal(ActorMotionState.AtDesk, mFinal.State);
         Assert.True(mFinal.BehindDesk);
     }
+
+    [Fact]
+    public void Handoff_AliasBoundRecipientReplacedInSameSlot_TransitionsToWalkingBack_NeverDelivers()
+    {
+        var motionSystem = new ActorMotionSystem();
+        var now = DateTimeOffset.UtcNow;
+
+        var initialAgents = new[]
+        {
+            new AgentSnapshot("demo-leader", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle),
+            new AgentSnapshot("demo-coder", "Minato", AgentRole.Coder, "minato", AgentState.Working),
+            new AgentSnapshot("original", "Original Tester", AgentRole.Tester, "tsunade", AgentState.Working),
+            new AgentSnapshot("demo-reviewer", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle)
+        };
+
+        var events = new[]
+        {
+            new HqEvent(1, "handoff", "Scroll to QA", now, "demo-coder", 10.0, "qa")
+        };
+
+        var initialState = new HqState(
+            Agents: initialAgents,
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: events,
+            Timestamp: now
+        );
+
+        int coreDeskY = 126;
+        int extraDeskY = 168;
+
+        var slotsFrame0 = new SlotBinding[]
+        {
+            new(0, "demo-leader", "shikamaru", AgentState.Idle, true, 56, coreDeskY),
+            new(1, "demo-coder", "minato", AgentState.Working, true, 146, coreDeskY),
+            new(2, "original", "tsunade", AgentState.Working, true, 238, coreDeskY),
+            new(3, "demo-reviewer", "kakashi", AgentState.Idle, true, 328, coreDeskY)
+        };
+
+        // Frame 0: "qa" resolves to concrete agent "original" in tester slot 2
+        motionSystem.Update(0.016f, 0.016f, initialState, slotsFrame0, coreDeskY, extraDeskY);
+        ref readonly var m0 = ref motionSystem.GetMotion(1);
+        Assert.Equal(ActorMotionState.StepOut, m0.State);
+        Assert.Equal("original", m0.TargetAgentId);
+        Assert.Equal(2, m0.TargetSlotIndex);
+        Assert.False(m0.TargetBoundBySpriteKey);
+
+        // Advance past StepOut into WalkingToTarget while "original" is still present
+        motionSystem.Update(0.36f, 0.38f, initialState, slotsFrame0, coreDeskY, extraDeskY);
+        Assert.Equal(ActorMotionState.WalkingToTarget, motionSystem.GetMotion(1).State);
+
+        // Subsequent frames: "original" disappears and "replacement" takes the exact same tester slot
+        var replacedAgents = new[]
+        {
+            new AgentSnapshot("demo-leader", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle),
+            new AgentSnapshot("demo-coder", "Minato", AgentRole.Coder, "minato", AgentState.Working),
+            new AgentSnapshot("replacement", "Replacement Tester", AgentRole.Tester, "tsunade", AgentState.Working),
+            new AgentSnapshot("demo-reviewer", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle)
+        };
+        var replacedState = initialState with { Agents = replacedAgents };
+
+        var slotsReplaced = new SlotBinding[]
+        {
+            new(0, "demo-leader", "shikamaru", AgentState.Idle, true, 56, coreDeskY),
+            new(1, "demo-coder", "minato", AgentState.Working, true, 146, coreDeskY),
+            new(2, "replacement", "tsunade", AgentState.Working, true, 238, coreDeskY),
+            new(3, "demo-reviewer", "kakashi", AgentState.Idle, true, 328, coreDeskY)
+        };
+
+        bool everEnteredDelivering = false;
+        bool sawWalkingBack = false;
+
+        // Advance through arrival and return ticks
+        for (int step = 0; step < 40; step++)
+        {
+            float t = 0.43f + step * 0.05f;
+            motionSystem.Update(0.05f, t, replacedState, slotsReplaced, coreDeskY, extraDeskY);
+            ref readonly var current = ref motionSystem.GetMotion(1);
+
+            if (step == 0)
+            {
+                Assert.Equal(ActorMotionState.WalkingBack, current.State);
+                Assert.False(current.CarryingScroll);
+            }
+
+            if (current.State == ActorMotionState.WalkingBack)
+            {
+                sawWalkingBack = true;
+            }
+
+            if (current.State == ActorMotionState.Delivering)
+            {
+                everEnteredDelivering = true;
+            }
+        }
+
+        Assert.True(sawWalkingBack, "Sender should transition to WalkingBack when original recipient is replaced.");
+        Assert.False(everEnteredDelivering, "Sender must NEVER enter Delivering for a replacement agent.");
+        ref readonly var mFinal = ref motionSystem.GetMotion(1);
+        Assert.Equal(ActorMotionState.AtDesk, mFinal.State);
+        Assert.True(mFinal.BehindDesk);
+        Assert.False(motionSystem.IsHandoffActive);
+    }
+
+    [Fact]
+    public void Handoff_AliasBoundSameConcreteRecipientMovesSlot_ContinuesTrackingConcreteAgent()
+    {
+        var motionSystem = new ActorMotionSystem();
+        var now = DateTimeOffset.UtcNow;
+
+        var initialAgents = new[]
+        {
+            new AgentSnapshot("demo-leader", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle),
+            new AgentSnapshot("demo-coder", "Minato", AgentRole.Coder, "minato", AgentState.Working),
+            new AgentSnapshot("original", "Original Tester", AgentRole.Tester, "tsunade", AgentState.Working),
+            new AgentSnapshot("demo-reviewer", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle)
+        };
+
+        var events = new[]
+        {
+            new HqEvent(1, "handoff", "Scroll to QA", now, "demo-coder", 10.0, "qa")
+        };
+
+        var state = new HqState(
+            Agents: initialAgents,
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: events,
+            Timestamp: now
+        );
+
+        int coreDeskY = 126;
+        int extraDeskY = 168;
+
+        var slotsInitial = new SlotBinding[]
+        {
+            new(0, "demo-leader", "shikamaru", AgentState.Idle, true, 56, coreDeskY),
+            new(1, "demo-coder", "minato", AgentState.Working, true, 146, coreDeskY),
+            new(2, "original", "tsunade", AgentState.Working, true, 238, coreDeskY),
+            new(3, "demo-reviewer", "kakashi", AgentState.Idle, true, 328, coreDeskY),
+            new(4, null, "clone", AgentState.Idle, false, 192, extraDeskY)
+        };
+
+        motionSystem.Update(0.016f, 0.016f, state, slotsInitial, coreDeskY, extraDeskY);
+        motionSystem.Update(0.36f, 0.38f, state, slotsInitial, coreDeskY, extraDeskY);
+        Assert.Equal(ActorMotionState.WalkingToTarget, motionSystem.GetMotion(1).State);
+
+        // "original" moves to slot 4 while "replacement" takes slot 2
+        var slotsMoved = new SlotBinding[]
+        {
+            new(0, "demo-leader", "shikamaru", AgentState.Idle, true, 56, coreDeskY),
+            new(1, "demo-coder", "minato", AgentState.Working, true, 146, coreDeskY),
+            new(2, "replacement", "tsunade", AgentState.Working, true, 238, coreDeskY),
+            new(3, "demo-reviewer", "kakashi", AgentState.Idle, true, 328, coreDeskY),
+            new(4, "original", "tsunade", AgentState.Working, true, 192, extraDeskY)
+        };
+
+        motionSystem.Update(0.05f, 0.43f, state, slotsMoved, coreDeskY, extraDeskY);
+        ref readonly var mTracked = ref motionSystem.GetMotion(1);
+        Assert.Equal(ActorMotionState.WalkingToTarget, mTracked.State);
+        Assert.Equal(4, mTracked.TargetSlotIndex);
+        int expectedTargetX = 192 + (mTracked.DeskX < 192 ? -16 : 16);
+        Assert.Equal(expectedTargetX, mTracked.TargetX);
+        Assert.Equal(extraDeskY + 22, mTracked.TargetY);
+
+        // Advance to Delivering -> delivers to "original" at slot 4
+        motionSystem.Update(0.60f, 1.03f, state, slotsMoved, coreDeskY, extraDeskY);
+        ref readonly var mDelivered = ref motionSystem.GetMotion(1);
+        Assert.Equal(ActorMotionState.Delivering, mDelivered.State);
+        Assert.Equal(expectedTargetX, mDelivered.DeskX + mDelivered.OffsetX);
+        Assert.Equal(extraDeskY + 22, mDelivered.DeskY + mDelivered.OffsetY);
+    }
+
+    [Fact]
+    public void Handoff_ExactIdQaTakesPrecedenceOverTesterRoleAlias()
+    {
+        var motionSystem = new ActorMotionSystem();
+        var now = DateTimeOffset.UtcNow;
+
+        var agents = new[]
+        {
+            new AgentSnapshot("demo-leader", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle),
+            new AgentSnapshot("demo-coder", "Minato", AgentRole.Coder, "minato", AgentState.Working),
+            new AgentSnapshot("original", "Original Tester", AgentRole.Tester, "tsunade", AgentState.Working),
+            new AgentSnapshot("qa", "Literal QA Clone", AgentRole.Clone, "clone", AgentState.Working)
+        };
+
+        var events = new[]
+        {
+            new HqEvent(1, "handoff", "Scroll to literal qa agent", now, "demo-coder", 10.0, "qa")
+        };
+
+        var state = new HqState(
+            Agents: agents,
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: events,
+            Timestamp: now
+        );
+
+        int coreDeskY = 126;
+        int extraDeskY = 168;
+
+        var slots = new SlotBinding[]
+        {
+            new(0, "demo-leader", "shikamaru", AgentState.Idle, true, 56, coreDeskY),
+            new(1, "demo-coder", "minato", AgentState.Working, true, 146, coreDeskY),
+            new(2, "original", "tsunade", AgentState.Working, true, 238, coreDeskY),
+            new(3, null, "kakashi", AgentState.Idle, false, 328, coreDeskY),
+            new(4, "qa", "clone", AgentState.Working, true, 192, extraDeskY)
+        };
+
+        motionSystem.Update(0.016f, 0.016f, state, slots, coreDeskY, extraDeskY);
+        ref readonly var m0 = ref motionSystem.GetMotion(1);
+        Assert.Equal(ActorMotionState.StepOut, m0.State);
+        Assert.Equal("qa", m0.TargetAgentId);
+        Assert.Equal(4, m0.TargetSlotIndex);
+    }
 }
+
 

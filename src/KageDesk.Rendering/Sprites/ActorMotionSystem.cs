@@ -237,13 +237,21 @@ public sealed class ActorMotionSystem
             {
                 _lastHandledHandoffSeq = ev.SequenceId;
 
-                int fromStation = ResolveStationIndex(ev.AgentId, slots, out _, out _);
-                int toStation = ResolveStationIndex(ev.TargetAgentId, slots, out bool toBoundBySprite, out string? toSpriteKey);
+                int fromStation = ResolveStationIndex(ev.AgentId, state, slots);
+                int toStation = ResolveStationIndex(ev.TargetAgentId, state, slots);
 
                 if (fromStation >= 0 && toStation >= 0 && fromStation != toStation)
                 {
-                    StartHandoff(fromStation, toStation, slots, coreDeskY, extraDeskY, toBoundBySprite, toSpriteKey, ev.TargetAgentId);
-                    return fromStation;
+                    bool sameConcreteAgent =
+                        !string.IsNullOrWhiteSpace(slots[fromStation].AgentId) &&
+                        !string.IsNullOrWhiteSpace(slots[toStation].AgentId) &&
+                        string.Equals(slots[fromStation].AgentId, slots[toStation].AgentId, StringComparison.OrdinalIgnoreCase);
+
+                    if (!sameConcreteAgent)
+                    {
+                        StartHandoff(fromStation, toStation, slots, coreDeskY, extraDeskY);
+                        return fromStation;
+                    }
                 }
             }
         }
@@ -255,10 +263,7 @@ public sealed class ActorMotionSystem
         int toStation,
         ReadOnlySpan<SlotBinding> slots,
         int coreDeskY,
-        int extraDeskY,
-        bool toBoundBySprite = false,
-        string? toSpriteKey = null,
-        string? targetAgentIdRef = null)
+        int extraDeskY)
     {
         ref readonly var fromSlot = ref slots[fromStation];
         ref readonly var toSlot = ref slots[toStation];
@@ -291,10 +296,21 @@ public sealed class ActorMotionSystem
         m.IsFlashTrail = isMinato;
         m.BehindDesk = true;
         m.BoundAgentId = fromSlot.AgentId;
-        m.TargetAgentId = toSlot.AgentId ?? targetAgentIdRef;
         m.TargetSlotIndex = toStation;
-        m.TargetBoundBySpriteKey = toBoundBySprite || string.IsNullOrEmpty(toSlot.AgentId);
-        m.TargetSpriteKey = toSpriteKey ?? toSlot.SpriteKey;
+
+        if (!string.IsNullOrWhiteSpace(toSlot.AgentId))
+        {
+            // Concrete recipient bound: track ONLY this exact concrete agent ID on subsequent frames.
+            m.TargetAgentId = toSlot.AgentId;
+            m.TargetBoundBySpriteKey = false;
+            m.TargetSpriteKey = null;
+        }
+        else
+        {
+            m.TargetAgentId = null;
+            m.TargetBoundBySpriteKey = true;
+            m.TargetSpriteKey = toSlot.SpriteKey;
+        }
 
         _activeHandoffStation = fromStation;
     }
@@ -366,7 +382,7 @@ public sealed class ActorMotionSystem
     {
         ref var m = ref _motions[idx];
 
-        if (m.State is ActorMotionState.WalkingToTarget or ActorMotionState.Delivering)
+        if (m.State is ActorMotionState.StepOut or ActorMotionState.WalkingToTarget or ActorMotionState.Delivering)
         {
             // 1. Revalidate sender binding
             if (idx >= slots.Length || !slots[idx].Occupied ||
@@ -394,21 +410,25 @@ public sealed class ActorMotionSystem
 
                 if (!string.IsNullOrEmpty(m.TargetAgentId))
                 {
+                    // Concrete agent ID bound: track ONLY this exact concrete agent ID.
+                    // Never fall back to alias, role, or slot/sprite lookup.
                     for (int s = 0; s < slots.Length; s++)
                     {
-                        if (slots[s].Occupied && string.Equals(slots[s].AgentId, m.TargetAgentId, StringComparison.OrdinalIgnoreCase))
+                        if (slots[s].Occupied &&
+                            string.Equals(slots[s].AgentId, m.TargetAgentId, StringComparison.OrdinalIgnoreCase))
                         {
                             currentRecipientSlot = s;
                             break;
                         }
                     }
                 }
-
-                if (currentRecipientSlot < 0 && m.TargetBoundBySpriteKey && !string.IsNullOrEmpty(m.TargetSpriteKey))
+                else if (m.TargetBoundBySpriteKey && !string.IsNullOrEmpty(m.TargetSpriteKey))
                 {
                     for (int s = 0; s < slots.Length; s++)
                     {
-                        if (slots[s].Occupied && string.Equals(slots[s].SpriteKey, m.TargetSpriteKey, StringComparison.OrdinalIgnoreCase))
+                        if (slots[s].Occupied &&
+                            string.IsNullOrWhiteSpace(slots[s].AgentId) &&
+                            string.Equals(slots[s].SpriteKey, m.TargetSpriteKey, StringComparison.OrdinalIgnoreCase))
                         {
                             currentRecipientSlot = s;
                             break;
@@ -418,7 +438,7 @@ public sealed class ActorMotionSystem
 
                 if (currentRecipientSlot < 0)
                 {
-                    // Recipient disappeared: cleanly transition sender to WalkingBack (cancel delivery)
+                    // Recipient disappeared or was replaced by a different agent: cancel delivery and walk back
                     m.State = ActorMotionState.WalkingBack;
                     m.Elapsed = 0f;
                     m.TargetX = m.DeskX + m.OffsetX;
@@ -574,6 +594,11 @@ public sealed class ActorMotionSystem
                     m.CarryingScroll = false;
                     m.IsFlashTrail = false;
                     m.FacingRight = true;
+                    m.BoundAgentId = null;
+                    m.TargetAgentId = null;
+                    m.TargetSlotIndex = -1;
+                    m.TargetBoundBySpriteKey = false;
+                    m.TargetSpriteKey = null;
                     if (_activeHandoffStation == idx)
                     {
                         _activeHandoffStation = -1;
@@ -646,49 +671,58 @@ public sealed class ActorMotionSystem
         }
     }
 
-    private static int ResolveStationIndex(string? agentId, ReadOnlySpan<SlotBinding> slots)
+    private static int ResolveStationIndex(string? agentId, HqState state, ReadOnlySpan<SlotBinding> slots)
     {
-        return ResolveStationIndex(agentId, slots, out _, out _);
-    }
-
-    private static int ResolveStationIndex(string? agentId, ReadOnlySpan<SlotBinding> slots, out bool boundBySpriteKey, out string? spriteKey)
-    {
-        boundBySpriteKey = false;
-        spriteKey = null;
         if (string.IsNullOrWhiteSpace(agentId)) return -1;
         string trimmed = agentId.Trim();
 
-        // 1. Strict exact OrdinalIgnoreCase lookup against SlotBinding.AgentId
+        // Pass 1: Strict exact OrdinalIgnoreCase lookup against occupied SlotBinding.AgentId
         for (int i = 0; i < slots.Length; i++)
         {
             if (slots[i].Occupied && string.Equals(slots[i].AgentId, trimmed, StringComparison.OrdinalIgnoreCase))
             {
-                spriteKey = slots[i].SpriteKey;
                 return i;
             }
         }
 
-        // 2. Fallback to exact SpriteKey only if agentId matches a known role alias (e.g. "minato" -> slot whose SpriteKey == "minato" AND Occupied)
-        string? roleSprite = null;
-        if (string.Equals(trimmed, "shikamaru", StringComparison.OrdinalIgnoreCase) || string.Equals(trimmed, "leader", StringComparison.OrdinalIgnoreCase))
-            roleSprite = "shikamaru";
-        else if (string.Equals(trimmed, "minato", StringComparison.OrdinalIgnoreCase) || string.Equals(trimmed, "coder", StringComparison.OrdinalIgnoreCase))
-            roleSprite = "minato";
-        else if (string.Equals(trimmed, "tsunade", StringComparison.OrdinalIgnoreCase) || string.Equals(trimmed, "tester", StringComparison.OrdinalIgnoreCase) || string.Equals(trimmed, "qa", StringComparison.OrdinalIgnoreCase))
-            roleSprite = "tsunade";
-        else if (string.Equals(trimmed, "kakashi", StringComparison.OrdinalIgnoreCase) || string.Equals(trimmed, "reviewer", StringComparison.OrdinalIgnoreCase))
-            roleSprite = "kakashi";
-        else if (string.Equals(trimmed, "clone", StringComparison.OrdinalIgnoreCase))
-            roleSprite = "clone";
+        // Preserve exact-ID-first precedence across the snapshot: if a real agent literally has
+        // this exact Id in state.Agents (even if not currently assigned a visible slot),
+        // never shadow it with an alias match to another agent.
+        var agents = state?.Agents;
+        if (agents != null)
+        {
+            for (int i = 0; i < agents.Count; i++)
+            {
+                if (string.Equals(agents[i].Id, trimmed, StringComparison.OrdinalIgnoreCase))
+                {
+                    return -1;
+                }
+            }
+        }
 
-        if (roleSprite != null)
+        // Pass 2a: Shared canonical alias resolution against the snapshot
+        if (AgentAliasResolver.TryResolveAgentId(trimmed, agents, out string? resolvedId) &&
+            !string.IsNullOrEmpty(resolvedId))
         {
             for (int i = 0; i < slots.Length; i++)
             {
-                if (slots[i].Occupied && string.Equals(slots[i].SpriteKey, roleSprite, StringComparison.OrdinalIgnoreCase))
+                if (slots[i].Occupied && string.Equals(slots[i].AgentId, resolvedId, StringComparison.OrdinalIgnoreCase))
                 {
-                    boundBySpriteKey = true;
-                    spriteKey = roleSprite;
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        // Pass 2b: Fallback against SlotBinding.SpriteKey using the same shared canonical role alias helper
+        if (AgentAliasResolver.TryResolveRoleAlias(trimmed, out var canonicalAlias))
+        {
+            for (int i = 0; i < slots.Length; i++)
+            {
+                if (slots[i].Occupied &&
+                    string.Equals(slots[i].SpriteKey, canonicalAlias.SpriteKey, StringComparison.OrdinalIgnoreCase))
+                {
                     return i;
                 }
             }
