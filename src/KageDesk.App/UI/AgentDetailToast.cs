@@ -180,15 +180,8 @@ public class AgentDetailToast : Form
         var sourceRect = new RectangleF(10, 34, Width - 20, 16);
         g.DrawString(sourceLabel, DetailFont, subBrush, sourceRect, sf);
 
-        // State / Role / Elapsed
-        string stateRoleText = $"State: {_agent.State}   Role: {_agent.Role}";
-        if (_agent.WorkStartedAt.HasValue)
-        {
-            int elapsedSec = (int)Math.Max(0, (DateTimeOffset.UtcNow - _agent.WorkStartedAt.Value).TotalSeconds);
-            int mm = elapsedSec / 60;
-            int ss = elapsedSec % 60;
-            stateRoleText += $"   Elapsed: {mm:D2}:{ss:D2}";
-        }
+        // State / Role / Elapsed (never displays "Role: Clone")
+        string stateRoleText = FormatStateRoleLine(_agent, DateTimeOffset.UtcNow);
         var stateRect = new RectangleF(10, 52, Width - 20, 16);
         g.DrawString(stateRoleText, BodyFont, dimBrush, stateRect, sf);
 
@@ -212,6 +205,27 @@ public class AgentDetailToast : Form
 
         using var btnTextBrush = new SolidBrush(Color.White);
         g.DrawString("Focus Window", ButtonFont, btnTextBrush, _focusBtnBounds, centerSf);
+    }
+
+    public static string FormatRoleLabel(AgentSnapshot agent)
+    {
+        return AgentAppearanceRegistry.FormatRoleLabel(agent);
+    }
+
+    public static string FormatStateRoleLine(AgentSnapshot agent, DateTimeOffset? now = null)
+    {
+        string roleLabel = FormatRoleLabel(agent);
+        string stateRoleText = $"State: {agent.State}   Role: {roleLabel}";
+        if (agent.WorkStartedAt.HasValue)
+        {
+            DateTimeOffset referenceNow = now ?? DateTimeOffset.UtcNow;
+            int elapsedSec = (int)Math.Max(0, (referenceNow - agent.WorkStartedAt.Value).TotalSeconds);
+            int mm = elapsedSec / 60;
+            int ss = elapsedSec % 60;
+            stateRoleText += $"   Elapsed: {mm:D2}:{ss:D2}";
+        }
+
+        return stateRoleText;
     }
 
     public static string FormatSourceLabel(AgentSnapshot agent)

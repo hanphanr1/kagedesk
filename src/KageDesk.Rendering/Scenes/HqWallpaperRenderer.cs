@@ -76,6 +76,7 @@ public sealed class HqWallpaperRenderer
     private int _cachedExtraCount;
     private AccountInfo? _cachedActiveAccount;
     private string? _cachedFirstAgentRepo;
+    private readonly AgentSnapshot?[] _coreAssigned = new AgentSnapshot?[4];
 
     public void ResetEffects()
     {
@@ -212,6 +213,7 @@ public sealed class HqWallpaperRenderer
     {
         for (int i = 0; i < 4; i++)
         {
+            _coreAssigned[i] = null;
             _coreSlots[i] = new StationSlot
             {
                 Occupied = false,
@@ -238,30 +240,51 @@ public sealed class HqWallpaperRenderer
             AgentSnapshot ag = agents[i];
             int coreIndex = ResolveCoreSlotIndex(ag);
 
-            if (coreIndex >= 0 && !_coreSlots[coreIndex].Occupied)
+            if (coreIndex >= 0)
             {
-                var (actionKind, badgeLabel) = AgentActionClassifier.Classify(ag.State, ag.ToolName, ag.TaskTitle);
-                _coreSlots[coreIndex] = new StationSlot
+                AgentSnapshot? existing = _coreAssigned[coreIndex];
+                if (existing == null)
                 {
-                    Occupied = true,
-                    AgentId = ag.Id,
-                    Name = ShortenDisplayName(ag.Name, ag.Id),
-                    SpriteKey = ShinobiSpriteRenderer.NormalizeSpriteKey(ag.SpriteKey),
-                    StationType = CoreDefaultSprites[coreIndex],
-                    State = ag.State,
-                    ToolName = ag.ToolName,
-                    VariantSeed = HashString(ag.Id),
-                    ActionKind = actionKind,
-                    BadgeLabel = badgeLabel,
-                    WorkStartedAt = ag.WorkStartedAt,
-                    DeskRig = ag.DeskRig,
-                    BehaviorVariant = ag.BehaviorVariant
-                };
+                    _coreAssigned[coreIndex] = ag;
+                }
+                else if (ComputeCoreSlotPriority(ag) > ComputeCoreSlotPriority(existing))
+                {
+                    _extraCandidates.Add(existing);
+                    _coreAssigned[coreIndex] = ag;
+                }
+                else
+                {
+                    _extraCandidates.Add(ag);
+                }
             }
             else
             {
                 _extraCandidates.Add(ag);
             }
+        }
+
+        for (int coreIndex = 0; coreIndex < 4; coreIndex++)
+        {
+            AgentSnapshot? ag = _coreAssigned[coreIndex];
+            if (ag == null) continue;
+
+            var (actionKind, badgeLabel) = AgentActionClassifier.Classify(ag.State, ag.ToolName, ag.TaskTitle);
+            _coreSlots[coreIndex] = new StationSlot
+            {
+                Occupied = true,
+                AgentId = ag.Id,
+                Name = ShortenDisplayName(ag.Name, ag.Id),
+                SpriteKey = ShinobiSpriteRenderer.NormalizeSpriteKey(ag.SpriteKey),
+                StationType = CoreDefaultSprites[coreIndex],
+                State = ag.State,
+                ToolName = ag.ToolName,
+                VariantSeed = HashString(ag.Id),
+                ActionKind = actionKind,
+                BadgeLabel = badgeLabel,
+                WorkStartedAt = ag.WorkStartedAt,
+                DeskRig = ag.DeskRig,
+                BehaviorVariant = ag.BehaviorVariant
+            };
         }
 
         // Priority sort for extra candidates (Row 2):
@@ -349,6 +372,20 @@ public sealed class HqWallpaperRenderer
             AgentState.Working => ColorCyan,
             _ => _palette.Border
         };
+    }
+
+    private static int ComputeCoreSlotPriority(AgentSnapshot ag)
+    {
+        int score = ag.State switch
+        {
+            AgentState.NeedsApproval => 1000,
+            AgentState.Failed => 900,
+            AgentState.Working => 800,
+            AgentState.Done => 700,
+            _ => 100
+        };
+        if (ag.IsBotHome) score += 20;
+        return score;
     }
 
     private static int ComputeExtraStationPriority(AgentSnapshot ag)

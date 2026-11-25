@@ -987,4 +987,56 @@ public class HqStateAggregatorTests
         Assert.Null(idle.WorkStartedAt);
         Assert.Null(idle.ToolName);
     }
+
+    [Fact]
+    public void UpdateOrcaSnapshot_CanonicalOrcaWorkersAndStandaloneCliSessions_EnforcesFixedCanonicalAndRandomizedNonOrcaSplit()
+    {
+        var agg = new HqStateAggregator(appearanceSeed: 123);
+
+        // Even if an upstream Orca worker arrived tagged as Clone/clone with IsBotHome=false,
+        // canonical Orca bot names MUST resolve to their exact canonical Role + fixed SpriteKey.
+        agg.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("wt:minato-v21", "Minato \u00B7 KageDesk v2.1 (Mixi + Variety)", AgentRole.Clone, "clone", AgentState.Working, IsBotHome: false, Source: "orca", Repo: "kagedesk"),
+            new AgentSnapshot("wt:shikamaru-plan", "Shikamaru \u00B7 Sprint Plan", AgentRole.Clone, "clone", AgentState.Working, IsBotHome: false, Source: "orca", Repo: "kagedesk"),
+            new AgentSnapshot("wt:kakashi-review", "Kakashi \u00B7 PR Review", AgentRole.Clone, "clone", AgentState.Working, IsBotHome: false, Source: "orca", Repo: "kagedesk"),
+            new AgentSnapshot("wt:tsunade-qa", "Tsunade \u00B7 E2E QA", AgentRole.Clone, "clone", AgentState.Working, IsBotHome: false, Source: "orca", Repo: "kagedesk"),
+            new AgentSnapshot("wt:generic-worker", "Generic Worker", AgentRole.Clone, "clone", AgentState.Working, IsBotHome: false, Source: "orca", Repo: "kagedesk")
+        }, Array.Empty<AccountInfo>());
+
+        // Standalone CLI terminals MUST stay randomized even if there are multiple concurrent sessions
+        agg.UpdateProcessAgents(new[]
+        {
+            new AgentSnapshot("proc:omp:1111", "OMP", AgentRole.Coder, "omp", AgentState.Working, Source: "process"),
+            new AgentSnapshot("proc:claude:2222", "Claude", AgentRole.Coder, "claude", AgentState.Working, Source: "process")
+        });
+
+        var agents = agg.GetState().Agents;
+
+        var minato = Assert.Single(agents, a => a.Id == "wt:minato-v21");
+        Assert.Equal(AgentRole.Coder, minato.Role);
+        Assert.Equal("minato", minato.SpriteKey);
+
+        var shikamaru = Assert.Single(agents, a => a.Id == "wt:shikamaru-plan");
+        Assert.Equal(AgentRole.Leader, shikamaru.Role);
+        Assert.Equal("shikamaru", shikamaru.SpriteKey);
+
+        var kakashi = Assert.Single(agents, a => a.Id == "wt:kakashi-review");
+        Assert.Equal(AgentRole.Reviewer, kakashi.Role);
+        Assert.Equal("kakashi", kakashi.SpriteKey);
+
+        var tsunade = Assert.Single(agents, a => a.Id == "wt:tsunade-qa");
+        Assert.Equal(AgentRole.Tester, tsunade.Role);
+        Assert.Equal("tsunade", tsunade.SpriteKey);
+
+        var genericWorker = Assert.Single(agents, a => a.Id == "wt:generic-worker");
+        Assert.True(AgentAppearanceRegistry.IsRandomizableSprite(genericWorker.SpriteKey));
+        Assert.NotEqual("clone", genericWorker.SpriteKey);
+
+        var omp = Assert.Single(agents, a => a.Id == "proc:omp:1111");
+        var claude = Assert.Single(agents, a => a.Id == "proc:claude:2222");
+        Assert.True(AgentAppearanceRegistry.IsRandomizableSprite(omp.SpriteKey));
+        Assert.True(AgentAppearanceRegistry.IsRandomizableSprite(claude.SpriteKey));
+        Assert.NotEqual(omp.SpriteKey, claude.SpriteKey);
+    }
 }

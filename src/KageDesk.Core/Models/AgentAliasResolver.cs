@@ -8,6 +8,7 @@ public static class AgentAliasResolver
     {
         // Leader / Shikamaru
         ["shikamaru"] = new("shikamaru", AgentRole.Leader),
+        ["kazama"] = new("shikamaru", AgentRole.Leader),
         ["leader"] = new("shikamaru", AgentRole.Leader),
         ["lead"] = new("shikamaru", AgentRole.Leader),
         ["team-leader"] = new("shikamaru", AgentRole.Leader),
@@ -18,6 +19,8 @@ public static class AgentAliasResolver
 
         // Coder / Minato
         ["minato"] = new("minato", AgentRole.Coder),
+        ["main-coder"] = new("minato", AgentRole.Coder),
+        ["main_coder"] = new("minato", AgentRole.Coder),
         ["coder"] = new("minato", AgentRole.Coder),
         ["dev"] = new("minato", AgentRole.Coder),
         ["developer"] = new("minato", AgentRole.Coder),

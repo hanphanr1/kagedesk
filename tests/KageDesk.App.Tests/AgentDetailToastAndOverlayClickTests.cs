@@ -367,5 +367,38 @@ public class AgentDetailToastAndOverlayClickTests
         toast.Refresh();
         toast.Close();
     }
+
+    [Fact]
+    public void FormatStateRoleLine_AllAgentTypesIncludingMinatoWorkerAndClones_NeverDisplaysRoleClone()
+    {
+        var now = new DateTimeOffset(2026, 11, 26, 1, 45, 0, TimeSpan.FromHours(7));
+
+        var cases = new[]
+        {
+            // Regression: Minato worker even if mistakenly tagged AgentRole.Clone MUST show Role: Coder
+            (new AgentSnapshot("wt:minato-v21", "Minato \u00B7 KageDesk v2.1 (Mixi + Variety)", AgentRole.Clone, "clone", AgentState.Working, Repo: "kagedesk", Source: "orca", WorkStartedAt: now.AddSeconds(-95)), "Coder"),
+            (new AgentSnapshot("wt:shika", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Working, Repo: "Bots", Source: "orca"), "Leader"),
+            (new AgentSnapshot("wt:kakashi", "Kakashi \u00B7 PR Review", AgentRole.Reviewer, "kakashi", AgentState.Working, Repo: "kagedesk", Source: "orca"), "Reviewer"),
+            (new AgentSnapshot("wt:tsunade", "Tsunade \u00B7 Final QA", AgentRole.Tester, "tsunade", AgentState.Working, Repo: "kagedesk", Source: "orca"), "Tester"),
+            // Non-canonical Orca worker with AgentRole.Clone -> MUST show Worker, NEVER Clone
+            (new AgentSnapshot("wt:generic", "Worker #1", AgentRole.Clone, "mixi", AgentState.Working, Repo: "kagedesk", Source: "orca"), "Worker"),
+            // Standalone CLI sessions -> MUST show CLI Session, NEVER Clone
+            (new AgentSnapshot("proc:omp:1001", "OMP", AgentRole.Clone, "mixi", AgentState.Idle, ProcessId: 6660, Source: "process"), "CLI Session"),
+            (new AgentSnapshot("proc:claude:1002", "Claude", AgentRole.External, "neko-dev", AgentState.Working, ProcessId: 7770, Source: "process"), "CLI Session"),
+            // Generic external hook -> Session
+            (new AgentSnapshot("hook:ext:1", "Agent", AgentRole.External, "wizard-dev", AgentState.Working, Source: "bridge"), "Session")
+        };
+
+        foreach (var (agent, expectedRoleLabel) in cases)
+        {
+            string roleLabel = AgentDetailToast.FormatRoleLabel(agent);
+            string line = AgentDetailToast.FormatStateRoleLine(agent, now);
+
+            Assert.Equal(expectedRoleLabel, roleLabel);
+            Assert.Contains($"Role: {expectedRoleLabel}", line);
+            Assert.DoesNotContain("Role: Clone", line, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("Clone", roleLabel, StringComparison.OrdinalIgnoreCase);
+        }
+    }
 }
 

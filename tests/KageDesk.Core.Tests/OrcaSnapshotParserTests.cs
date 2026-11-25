@@ -77,9 +77,9 @@ public class OrcaSnapshotParserTests
             "repo": "kagedesk",
             "path": "C:\\Users\\DELL\\.orca\\worktrees\\worker-task-1",
             "branch": "feature/scaffold",
-            "bot": "Shikamaru (Team Leader)",
+            "bot": null,
             "botHome": false,
-            "displayName": "Shadow Worker #1",
+            "displayName": "Generic Worker #1",
             "workspaceStatus": "in-progress",
             "sidebarStatus": "working",
             "terminalVerdict": "none",
@@ -140,7 +140,7 @@ public class OrcaSnapshotParserTests
     }
 
     [Fact]
-    public void ParseWorktreePs_ValidFixture_DifferentiatesBotHomeAndChildClone()
+    public void ParseWorktreePs_ValidFixture_DifferentiatesBotHomeAndNonCanonicalWorker()
     {
         var now = DateTimeOffset.FromUnixTimeMilliseconds(1795545570739 + 1000); // 1 sec after updatedAt
         var agents = OrcaSnapshotParser.ParseWorktreePs(RealWorktreePsFixture, now);
@@ -155,13 +155,13 @@ public class OrcaSnapshotParserTests
         Assert.Equal(AgentState.Working, leader.State);
         Assert.True(leader.IsBotHome);
 
-        // Child clone worktree
-        var clone = agents[1];
-        Assert.Equal("orca_session_id:clone-worker-1", clone.Id);
-        Assert.Equal(AgentRole.Clone, clone.Role);
-        Assert.Equal("clone", clone.SpriteKey);
-        Assert.Equal(AgentState.Working, clone.State);
-        Assert.False(clone.IsBotHome);
+        // Non-canonical child worker (no canonical bot persona in DisplayName/Bot/UnderBot)
+        var worker = agents[1];
+        Assert.Equal("orca_session_id:clone-worker-1", worker.Id);
+        Assert.Equal(AgentRole.Clone, worker.Role);
+        Assert.Equal("clone", worker.SpriteKey);
+        Assert.Equal(AgentState.Working, worker.State);
+        Assert.False(worker.IsBotHome);
     }
 
     [Theory]
@@ -171,6 +171,7 @@ public class OrcaSnapshotParserTests
     [InlineData("Tester specialist", "tester", AgentRole.Tester, "tsunade")]
     [InlineData("Kakashi (Reviewer)", "kakashi", AgentRole.Reviewer, "kakashi")]
     [InlineData("Code reviewer", "reviewer", AgentRole.Reviewer, "kakashi")]
+    [InlineData("Kazama (Team Lead)", "kazama", AgentRole.Leader, "shikamaru")]
     [InlineData("Generic assistant", "helper", AgentRole.External, "generic")]
     public void InferRoleAndSprite_BotHomePersonas_MappedCorrectly(string name, string conv, AgentRole expectedRole, string expectedSprite)
     {
@@ -180,15 +181,167 @@ public class OrcaSnapshotParserTests
     }
 
     [Fact]
-    public void InferRoleAndSprite_NonBotHomeOrWtPrefix_AlwaysReturnsClone()
+    public void InferRoleAndSprite_CanonicalBotsInNonBotHomeWorktrees_ResolveCanonicalRoleAndFixedSprite()
     {
-        var (role1, sprite1) = OrcaSnapshotParser.InferRoleAndSprite("Shikamaru (Team Leader)", "Shikamaru", null, isBotHome: false, worktreeId: "wt:worker");
-        Assert.Equal(AgentRole.Clone, role1);
-        Assert.Equal("clone", sprite1);
+        // Regression: "Minato · KageDesk v2.1" dispatched under Shikamaru MUST resolve to Minato (Coder), NOT Clone or Shikamaru
+        var (role1, sprite1) = OrcaSnapshotParser.InferRoleAndSprite(
+            bot: "Shikamaru (Team Leader)",
+            displayName: "Minato \u00B7 KageDesk v2.1 (Mixi + Variety + OMP Fix)",
+            conversationName: "KageDesk v2.1",
+            isBotHome: false,
+            worktreeId: "wt:kagedesk-v21");
+        Assert.Equal(AgentRole.Coder, role1);
+        Assert.Equal("minato", sprite1);
 
-        var (role2, sprite2) = OrcaSnapshotParser.InferRoleAndSprite("Minato Coder", "Minato", null, isBotHome: false, worktreeId: "folder:foo");
-        Assert.Equal(AgentRole.Clone, role2);
-        Assert.Equal("clone", sprite2);
+        // Explicit Kazama / Shikamaru worker -> Leader / shikamaru
+        var (role2, sprite2) = OrcaSnapshotParser.InferRoleAndSprite(
+            bot: null,
+            displayName: "Kazama \u00B7 Sprint Planning",
+            conversationName: null,
+            isBotHome: false,
+            worktreeId: "wt:plan");
+        Assert.Equal(AgentRole.Leader, role2);
+        Assert.Equal("shikamaru", sprite2);
+
+        // Explicit Kakashi worker under Shikamaru -> Reviewer / kakashi
+        var (role3, sprite3) = OrcaSnapshotParser.InferRoleAndSprite(
+            bot: "Shikamaru (Team Leader)",
+            displayName: "Kakashi \u00B7 Code Review",
+            conversationName: null,
+            isBotHome: false,
+            worktreeId: "wt:review");
+        Assert.Equal(AgentRole.Reviewer, role3);
+        Assert.Equal("kakashi", sprite3);
+
+        // Explicit Tsunade worker under Shikamaru -> Tester / tsunade
+        var (role4, sprite4) = OrcaSnapshotParser.InferRoleAndSprite(
+            bot: "Shikamaru (Team Leader)",
+            displayName: "Tsunade \u00B7 Final QA",
+            conversationName: null,
+            isBotHome: false,
+            worktreeId: "wt:qa");
+        Assert.Equal(AgentRole.Tester, role4);
+        Assert.Equal("tsunade", sprite4);
+
+        // Unnamed worker under Minato's UnderBot -> resolves via UnderBot to Minato (Coder)
+        var (role5, sprite5) = OrcaSnapshotParser.InferRoleAndSprite(
+            bot: null,
+            displayName: "kagedesk-v20-fixes",
+            conversationName: null,
+            isBotHome: false,
+            worktreeId: "wt:v20-fixes",
+            underBot: "Minato (Main Coder)");
+        Assert.Equal(AgentRole.Coder, role5);
+        Assert.Equal("minato", sprite5);
+
+        // Truly non-canonical child worker (no canonical bot metadata anywhere) -> falls back to Clone
+        var (role6, sprite6) = OrcaSnapshotParser.InferRoleAndSprite(
+            bot: null,
+            displayName: "feature-scratch-branch",
+            conversationName: "Temp Session",
+            isBotHome: false,
+            worktreeId: "wt:scratch");
+        Assert.Equal(AgentRole.Clone, role6);
+        Assert.Equal("clone", sprite6);
+    }
+
+    [Fact]
+    public void ParseWorktreePs_MinatoAndAllCanonicalWorkersInFeatureWorktrees_NeverMarkedClone()
+    {
+        var now = DateTimeOffset.FromUnixTimeMilliseconds(1795545571739);
+        const string json = """
+        {
+          "ok": true,
+          "result": {
+            "worktrees": [
+              {
+                "worktreeId": "57e97e35::C:/workspaces/kagedesk-v21",
+                "repo": "kagedesk",
+                "branch": "hanphanr1/kagedesk-v21",
+                "bot": "Shikamaru (Team Leader)",
+                "botHome": false,
+                "displayName": "Minato \u00B7 KageDesk v2.1 (Mixi + Variety)",
+                "sidebarStatus": "working",
+                "status": "working",
+                "agents": [
+                  {
+                    "address": "orca_session_id:minato-v21",
+                    "state": "working",
+                    "displayName": "New messages",
+                    "conversationName": "KageDesk v2.1",
+                    "updatedAt": 1795545570739
+                  }
+                ]
+              },
+              {
+                "worktreeId": "wt:review-pr",
+                "repo": "kagedesk",
+                "bot": "Shikamaru (Team Leader)",
+                "botHome": false,
+                "displayName": "Kakashi \u00B7 PR Sign-Off",
+                "status": "working",
+                "agents": [
+                  {
+                    "address": "orca_session_id:kakashi-pr",
+                    "state": "working",
+                    "updatedAt": 1795545570739
+                  }
+                ]
+              },
+              {
+                "worktreeId": "wt:qa-run",
+                "repo": "kagedesk",
+                "underBot": "Tsunade (Tester)",
+                "botHome": false,
+                "displayName": "kagedesk-v21-qa-check",
+                "status": "working",
+                "agents": [
+                  {
+                    "address": "orca_session_id:tsunade-qa",
+                    "state": "working",
+                    "updatedAt": 1795545570739
+                  }
+                ]
+              },
+              {
+                "worktreeId": "folder:kazama-team-leader",
+                "repo": "Bots",
+                "botName": "Shikamaru (Team Leader)",
+                "botHome": true,
+                "displayName": "Shikamaru (Team Leader)",
+                "status": "working",
+                "agents": [
+                  {
+                    "address": "orca_session_id:shikamaru-home",
+                    "state": "working",
+                    "updatedAt": 1795545570739
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """;
+
+        var agents = OrcaSnapshotParser.ParseWorktreePs(json, now);
+        Assert.Equal(4, agents.Count);
+
+        var minato = Assert.Single(agents, a => a.Id == "orca_session_id:minato-v21");
+        Assert.Equal(AgentRole.Coder, minato.Role);
+        Assert.Equal("minato", minato.SpriteKey);
+        Assert.Contains("Minato", minato.Name);
+
+        var kakashi = Assert.Single(agents, a => a.Id == "orca_session_id:kakashi-pr");
+        Assert.Equal(AgentRole.Reviewer, kakashi.Role);
+        Assert.Equal("kakashi", kakashi.SpriteKey);
+
+        var tsunade = Assert.Single(agents, a => a.Id == "orca_session_id:tsunade-qa");
+        Assert.Equal(AgentRole.Tester, tsunade.Role);
+        Assert.Equal("tsunade", tsunade.SpriteKey);
+
+        var shikamaru = Assert.Single(agents, a => a.Id == "orca_session_id:shikamaru-home");
+        Assert.Equal(AgentRole.Leader, shikamaru.Role);
+        Assert.Equal("shikamaru", shikamaru.SpriteKey);
     }
 
     [Fact]

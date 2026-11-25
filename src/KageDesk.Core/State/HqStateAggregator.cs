@@ -395,6 +395,15 @@ public class HqStateAggregator
                     var role = payload.Role ?? AgentRole.External;
                     var name = AgentAppearanceRegistry.SanitizeDisplayName(rawName, id, "bridge", role);
 
+                    // Resolve canonical Orca bot persona when pushing Orca bot/worker events
+                    if (string.IsNullOrWhiteSpace(payload.Provider) &&
+                        role is AgentRole.External or AgentRole.Clone &&
+                        (AgentAppearanceRegistry.TryMatchCanonicalPersonaName(name, out var canonicalRole, out _) ||
+                         AgentAppearanceRegistry.TryMatchCanonicalPersonaName(id, out canonicalRole, out _)))
+                    {
+                        role = canonicalRole;
+                    }
+
                     // Resolve AgentState: explicit State wins, otherwise map from Type
                     AgentState state = payload.State ?? ResolveStateFromType(payload.Type);
 

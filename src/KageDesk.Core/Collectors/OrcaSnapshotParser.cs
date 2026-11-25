@@ -122,15 +122,30 @@ public static class OrcaSnapshotParser
     private static void ParseWorktreeEntry(JsonElement wt, DateTimeOffset now, List<AgentSnapshot> list)
     {
         var worktreeId = wt.TryGetProperty("worktreeId", out var wId) ? wId.GetString() : null;
+        if (string.IsNullOrWhiteSpace(worktreeId) && wt.TryGetProperty("id", out var idFallback))
+        {
+            worktreeId = idFallback.GetString();
+        }
+
         var repo = wt.TryGetProperty("repo", out var rProp) ? rProp.GetString() : null;
         var branch = wt.TryGetProperty("branch", out var brProp) ? brProp.GetString() : null;
         var bot = wt.TryGetProperty("bot", out var botProp) ? botProp.GetString() : null;
-        var botHome = wt.TryGetProperty("botHome", out var bhProp) && bhProp.GetBoolean();
+        var botName = wt.TryGetProperty("botName", out var bnProp) ? bnProp.GetString() : null;
+        var underBot = wt.TryGetProperty("underBot", out var ubProp) ? ubProp.GetString() : null;
+        var wtName = wt.TryGetProperty("name", out var nmProp) ? nmProp.GetString() : null;
+        var wtRole = wt.TryGetProperty("role", out var rlProp) ? rlProp.GetString() : null;
+        var botHome = wt.TryGetProperty("botHome", out var bhProp) && bhProp.ValueKind == JsonValueKind.True;
+        if (!botHome && wt.TryGetProperty("chats", out var chatsProp) && chatsProp.ValueKind == JsonValueKind.Object &&
+            chatsProp.TryGetProperty("home", out var chHome) && chHome.ValueKind == JsonValueKind.True)
+        {
+            botHome = true;
+        }
+
         var displayName = wt.TryGetProperty("displayName", out var dnProp) ? dnProp.GetString() : null;
         var sidebarStatus = wt.TryGetProperty("sidebarStatus", out var ssProp) ? ssProp.GetString() : null;
         var terminalVerdict = wt.TryGetProperty("terminalVerdict", out var tvProp) ? tvProp.GetString() : null;
         var status = wt.TryGetProperty("status", out var stProp) ? stProp.GetString() : null;
-        var unread = wt.TryGetProperty("unread", out var unProp) && unProp.GetBoolean();
+        var unread = wt.TryGetProperty("unread", out var unProp) && unProp.ValueKind == JsonValueKind.True;
 
         DateTimeOffset? lastActivityAt = null;
         if (wt.TryGetProperty("lastActivityAt", out var laProp) && laProp.TryGetInt64Safe(out var laMs) && laMs > 0)
@@ -138,7 +153,16 @@ public static class OrcaSnapshotParser
             try { lastActivityAt = DateTimeOffset.FromUnixTimeMilliseconds(laMs); } catch { }
         }
 
-        var (role, spriteKey) = InferRoleAndSprite(bot, displayName, null, botHome, worktreeId);
+        var (role, spriteKey) = InferRoleAndSprite(
+            bot: bot,
+            displayName: displayName,
+            conversationName: null,
+            isBotHome: botHome,
+            worktreeId: worktreeId,
+            name: wtName,
+            botName: botName,
+            underBot: underBot,
+            roleText: wtRole);
 
         // Check if agents array is present
         if (wt.TryGetProperty("agents", out var agentsArr) && agentsArr.ValueKind == JsonValueKind.Array)
@@ -149,10 +173,22 @@ public static class OrcaSnapshotParser
                 foreach (var ag in agentElements)
                 {
                     var address = ag.TryGetProperty("address", out var adProp) ? adProp.GetString() : null;
+                    var agentIdField = ag.TryGetProperty("agentId", out var aiProp) ? aiProp.GetString() : null;
+                    if (string.IsNullOrWhiteSpace(agentIdField) && ag.TryGetProperty("id", out var agIdProp))
+                    {
+                        agentIdField = agIdProp.GetString();
+                    }
+
                     var agentStateStr = ag.TryGetProperty("state", out var asProp) ? asProp.GetString() : null;
                     var prompt = ag.TryGetProperty("prompt", out var prProp) ? prProp.GetString() : null;
                     var taskTitle = ag.TryGetProperty("taskTitle", out var ttProp) ? ttProp.GetString() : null;
                     var convName = ag.TryGetProperty("conversationName", out var cnProp) ? cnProp.GetString() : null;
+                    var agDisplayName = ag.TryGetProperty("displayName", out var adnProp) ? adnProp.GetString() : null;
+                    var agName = ag.TryGetProperty("name", out var anmProp) ? anmProp.GetString() : null;
+                    var agBot = ag.TryGetProperty("bot", out var abProp) ? abProp.GetString() : null;
+                    var agBotName = ag.TryGetProperty("botName", out var abnProp) ? abnProp.GetString() : null;
+                    var agUnderBot = ag.TryGetProperty("underBot", out var aubProp) ? aubProp.GetString() : null;
+                    var agRole = ag.TryGetProperty("role", out var arlProp) ? arlProp.GetString() : null;
                     var lastMsg = ag.TryGetProperty("lastAssistantMessage", out var lmProp) ? lmProp.GetString() : null;
                     var toolName = ag.TryGetProperty("toolName", out var tnProp) ? tnProp.GetString() : null;
 
@@ -171,20 +207,35 @@ public static class OrcaSnapshotParser
 
                     if (ag.TryGetProperty("activity", out var actProp) && actProp.ValueKind == JsonValueKind.Object)
                     {
-                        if (actProp.TryGetProperty("unread", out var actUnread) && actUnread.GetBoolean())
+                        if (actProp.TryGetProperty("unread", out var actUnread) && actUnread.ValueKind == JsonValueKind.True)
                             unread = true;
                         if (string.IsNullOrEmpty(taskTitle) && actProp.TryGetProperty("title", out var actTitle))
                             taskTitle = actTitle.GetString();
                     }
 
-                    var effectiveRole = role;
-                    var effectiveSprite = spriteKey;
-                    if (role != AgentRole.Clone)
-                    {
-                        var (r, s) = InferRoleAndSprite(bot, displayName, convName, botHome, worktreeId);
-                        effectiveRole = r;
-                        effectiveSprite = s;
-                    }
+                    // Always resolve canonical role/sprite across both agent-level and worktree-level fields
+                    // Priority: explicit worker/agent DisplayName/Name first, then BotName/Bot/UnderBot.
+                    string? effectiveDisplayName = !string.IsNullOrWhiteSpace(displayName) ? displayName : agDisplayName;
+                    string? effectiveNameField = !string.IsNullOrWhiteSpace(agName)
+                        ? agName
+                        : (!string.IsNullOrWhiteSpace(agDisplayName) ? agDisplayName : wtName);
+                    string? effectiveBot = !string.IsNullOrWhiteSpace(agBot) ? agBot : bot;
+                    string? effectiveBotName = !string.IsNullOrWhiteSpace(agBotName) ? agBotName : botName;
+                    string? effectiveUnderBot = !string.IsNullOrWhiteSpace(agUnderBot) ? agUnderBot : underBot;
+                    string? effectiveRoleText = !string.IsNullOrWhiteSpace(agRole) ? agRole : wtRole;
+                    string? effectiveAgentId = !string.IsNullOrWhiteSpace(agentIdField) ? agentIdField : address;
+
+                    var (effectiveRole, effectiveSprite) = InferRoleAndSprite(
+                        bot: effectiveBot,
+                        displayName: effectiveDisplayName,
+                        conversationName: convName,
+                        isBotHome: botHome,
+                        worktreeId: worktreeId,
+                        name: effectiveNameField,
+                        botName: effectiveBotName,
+                        underBot: effectiveUnderBot,
+                        roleText: effectiveRoleText,
+                        agentId: effectiveAgentId);
 
                     var agentState = ComputeState(status, sidebarStatus, terminalVerdict, agentStateStr, mainAgentOutcome, updatedAt, now);
 
@@ -208,8 +259,12 @@ public static class OrcaSnapshotParser
                         }
                     }
 
-                    var id = !string.IsNullOrEmpty(address) ? address : (worktreeId ?? bot ?? displayName ?? Guid.NewGuid().ToString());
-                    var name = !string.IsNullOrEmpty(displayName) ? displayName : (bot ?? convName ?? "Orca Worker");
+                    var id = !string.IsNullOrEmpty(address) ? address : (agentIdField ?? worktreeId ?? bot ?? displayName ?? wtName ?? Guid.NewGuid().ToString());
+                    var name = !string.IsNullOrEmpty(displayName)
+                        ? displayName
+                        : (!string.IsNullOrEmpty(agName)
+                            ? agName
+                            : (!string.IsNullOrEmpty(wtName) ? wtName : (bot ?? botName ?? convName ?? "Orca Worker")));
 
                     list.Add(new AgentSnapshot(
                         Id: id,
@@ -269,8 +324,8 @@ public static class OrcaSnapshotParser
             }
         }
 
-        var fallbackId = worktreeId ?? bot ?? displayName ?? Guid.NewGuid().ToString();
-        var fallbackName = displayName ?? bot ?? "Orca Worker";
+        var fallbackId = worktreeId ?? bot ?? displayName ?? wtName ?? Guid.NewGuid().ToString();
+        var fallbackName = displayName ?? wtName ?? bot ?? botName ?? "Orca Worker";
 
         list.Add(new AgentSnapshot(
             Id: fallbackId,
@@ -297,25 +352,55 @@ public static class OrcaSnapshotParser
         bool isBotHome,
         string? worktreeId)
     {
-        // If not botHome or worktreeId starts with wt: (child worker), classify as Clone
+        return InferRoleAndSprite(
+            bot: bot,
+            displayName: displayName,
+            conversationName: conversationName,
+            isBotHome: isBotHome,
+            worktreeId: worktreeId,
+            name: null,
+            botName: null,
+            underBot: null,
+            roleText: null,
+            agentId: null);
+    }
+
+    public static (AgentRole Role, string SpriteKey) InferRoleAndSprite(
+        string? bot,
+        string? displayName,
+        string? conversationName,
+        bool isBotHome,
+        string? worktreeId,
+        string? name = null,
+        string? botName = null,
+        string? underBot = null,
+        string? roleText = null,
+        string? agentId = null)
+    {
+        // Always check canonical Orca bots FIRST (Shikamaru/Kazama, Minato, Kakashi, Tsunade)
+        // across all metadata fields — with explicit DisplayName/Name priority over Bot/UnderBot —
+        // even when dispatched to a non-botHome worktree (e.g. "Minato · KageDesk v2.1").
+        if (AgentAppearanceRegistry.TryResolveCanonicalOrcaBot(
+            displayName: displayName,
+            name: name,
+            conversationName: conversationName,
+            agentId: agentId,
+            botName: botName,
+            bot: bot,
+            underBot: underBot,
+            roleText: roleText,
+            worktreeId: worktreeId,
+            out var canonicalRole,
+            out var canonicalSprite))
+        {
+            return (canonicalRole, canonicalSprite);
+        }
+
+        // Non-canonical child worker (no canonical Orca bot match in any field)
         if (!isBotHome || (worktreeId != null && worktreeId.StartsWith("wt:", StringComparison.OrdinalIgnoreCase)))
         {
             return (AgentRole.Clone, "clone");
         }
-
-        var text = $"{bot} {displayName} {conversationName}".ToLowerInvariant();
-
-        if (text.Contains("shikamaru") || text.Contains("leader"))
-            return (AgentRole.Leader, "shikamaru");
-
-        if (text.Contains("minato") || text.Contains("coder"))
-            return (AgentRole.Coder, "minato");
-
-        if (text.Contains("tsunade") || text.Contains("tester") || text.Contains("qa"))
-            return (AgentRole.Tester, "tsunade");
-
-        if (text.Contains("kakashi") || text.Contains("reviewer"))
-            return (AgentRole.Reviewer, "kakashi");
 
         return (AgentRole.External, "generic");
     }
