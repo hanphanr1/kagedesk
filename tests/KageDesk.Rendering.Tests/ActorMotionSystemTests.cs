@@ -1,4 +1,10 @@
+using System.Net;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Text;
+using KageDesk.Core.Bridge;
 using KageDesk.Core.Models;
+using KageDesk.Core.State;
 using KageDesk.Rendering.Canvas;
 using KageDesk.Rendering.Sprites;
 using Xunit;
@@ -537,6 +543,219 @@ public class ActorMotionSystemTests
         Assert.Equal("qa", m0.TargetAgentId);
         Assert.Equal(4, m0.TargetSlotIndex);
     }
+
+    private static int GetAvailablePort()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        return port;
+    }
+
+    [Fact]
+    public async Task BridgeToRenderer_ConcreteLiteralQaRecipientDepartsBeforeConsumption_HandoffSkipped_NeverDeliversToActiveTester()
+    {
+        int port = GetAvailablePort();
+        var aggregator = new HqStateAggregator();
+        const string token = "test-token-bridge-renderer-qa-departed";
+
+        // Snapshot 1: sender, literal agent ID "qa", and active tester "tester-1"
+        aggregator.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("sender", "Minato", AgentRole.Coder, "minato", AgentState.Working),
+            new AgentSnapshot("tester-1", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working),
+            new AgentSnapshot("qa", "Literal QA Worker", AgentRole.Clone, "clone", AgentState.Working)
+        }, Array.Empty<AccountInfo>());
+
+        await using var bridge = new LocalEventBridge(aggregator, port, requiredToken: token);
+        bridge.Start();
+
+        using var client = new HttpClient();
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{port}/api/event")
+        {
+            Content = new StringContent(
+                """{"type":"handoff","fromAgentId":"sender","toAgentId":"qa","message":"Scroll for literal qa"}""",
+                Encoding.UTF8,
+                "application/json")
+        };
+        req.Headers.Add("X-KageDesk-Token", token);
+
+        var res = await client.SendAsync(req);
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+
+        var queuedHandoff = aggregator.GetState().PendingVisualEvents
+            .Single(e => string.Equals(e.Type, "handoff", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal("sender", queuedHandoff.AgentId);
+        Assert.Equal("qa", queuedHandoff.TargetAgentId);
+        Assert.True(queuedHandoff.FromIsConcreteId);
+        Assert.True(queuedHandoff.ToIsConcreteId);
+
+        // Snapshot 2: literal "qa" departs BEFORE ActorMotionSystem consumes the queued event
+        aggregator.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("sender", "Minato", AgentRole.Coder, "minato", AgentState.Working),
+            new AgentSnapshot("tester-1", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working)
+        }, Array.Empty<AccountInfo>());
+
+        var stateAfterDeparture = aggregator.GetState();
+        Assert.Contains(stateAfterDeparture.PendingVisualEvents, e => e.SequenceId == queuedHandoff.SequenceId);
+
+        const int coreDeskY = 126;
+        const int extraDeskY = 168;
+        var slotsAfterDeparture = new SlotBinding[]
+        {
+            new(0, null, "shikamaru", AgentState.Idle, false, 56, coreDeskY),
+            new(1, "sender", "minato", AgentState.Working, true, 146, coreDeskY),
+            new(2, "tester-1", "tsunade", AgentState.Working, true, 238, coreDeskY),
+            new(3, null, "kakashi", AgentState.Idle, false, 328, coreDeskY)
+        };
+
+        var motionSystem = new ActorMotionSystem();
+        for (int step = 0; step < 40; step++)
+        {
+            motionSystem.Update(0.05f, 0.05f * (step + 1), stateAfterDeparture, slotsAfterDeparture, coreDeskY, extraDeskY);
+            Assert.False(motionSystem.IsHandoffActive);
+            var senderMotion = motionSystem.GetMotion(1);
+            Assert.Equal(ActorMotionState.AtDesk, senderMotion.State);
+            Assert.NotEqual(ActorMotionState.Delivering, senderMotion.State);
+            Assert.False(senderMotion.CarryingScroll);
+        }
+    }
+
+    [Fact]
+    public async Task BridgeToRenderer_ConcreteLiteralCoderSenderDepartsBeforeConsumption_HandoffSkipped_NotHijackedByActiveCoder()
+    {
+        int port = GetAvailablePort();
+        var aggregator = new HqStateAggregator();
+        const string token = "test-token-bridge-renderer-coder-departed";
+
+        // Snapshot 1: literal agent ID "coder", active coder "coder-1", and recipient "tester-1"
+        aggregator.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("coder-1", "Minato", AgentRole.Coder, "minato", AgentState.Working),
+            new AgentSnapshot("tester-1", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working),
+            new AgentSnapshot("coder", "Literal Coder Clone", AgentRole.Clone, "clone", AgentState.Working)
+        }, Array.Empty<AccountInfo>());
+
+        await using var bridge = new LocalEventBridge(aggregator, port, requiredToken: token);
+        bridge.Start();
+
+        using var client = new HttpClient();
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{port}/api/event")
+        {
+            Content = new StringContent(
+                """{"type":"handoff","fromAgentId":"coder","toAgentId":"tester-1","message":"Scroll from literal coder"}""",
+                Encoding.UTF8,
+                "application/json")
+        };
+        req.Headers.Add("X-KageDesk-Token", token);
+
+        var res = await client.SendAsync(req);
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+
+        var queuedHandoff = aggregator.GetState().PendingVisualEvents
+            .Single(e => string.Equals(e.Type, "handoff", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal("coder", queuedHandoff.AgentId);
+        Assert.Equal("tester-1", queuedHandoff.TargetAgentId);
+        Assert.True(queuedHandoff.FromIsConcreteId);
+        Assert.True(queuedHandoff.ToIsConcreteId);
+
+        // Snapshot 2: literal "coder" departs BEFORE ActorMotionSystem consumes the queued event
+        aggregator.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("coder-1", "Minato", AgentRole.Coder, "minato", AgentState.Working),
+            new AgentSnapshot("tester-1", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working)
+        }, Array.Empty<AccountInfo>());
+
+        var stateAfterDeparture = aggregator.GetState();
+        Assert.Contains(stateAfterDeparture.PendingVisualEvents, e => e.SequenceId == queuedHandoff.SequenceId);
+
+        const int coreDeskY = 126;
+        const int extraDeskY = 168;
+        var slotsAfterDeparture = new SlotBinding[]
+        {
+            new(0, null, "shikamaru", AgentState.Idle, false, 56, coreDeskY),
+            new(1, "coder-1", "minato", AgentState.Working, true, 146, coreDeskY),
+            new(2, "tester-1", "tsunade", AgentState.Working, true, 238, coreDeskY),
+            new(3, null, "kakashi", AgentState.Idle, false, 328, coreDeskY)
+        };
+
+        var motionSystem = new ActorMotionSystem();
+        for (int step = 0; step < 40; step++)
+        {
+            motionSystem.Update(0.05f, 0.05f * (step + 1), stateAfterDeparture, slotsAfterDeparture, coreDeskY, extraDeskY);
+            Assert.False(motionSystem.IsHandoffActive);
+            var coderMotion = motionSystem.GetMotion(1);
+            Assert.Equal(ActorMotionState.AtDesk, coderMotion.State);
+            Assert.NotEqual(ActorMotionState.Delivering, coderMotion.State);
+            Assert.False(coderMotion.CarryingScroll);
+        }
+    }
+
+    [Fact]
+    public void Handoff_UnresolvedAliasFlagsFalse_ResolvesAndAnimatesNormally()
+    {
+        var motionSystem = new ActorMotionSystem();
+        var now = DateTimeOffset.UtcNow;
+
+        var agents = new[]
+        {
+            new AgentSnapshot("demo-leader", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle),
+            new AgentSnapshot("coder-1", "Minato", AgentRole.Coder, "minato", AgentState.Working),
+            new AgentSnapshot("tester-1", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working)
+        };
+
+        // Default FromIsConcreteId = false, ToIsConcreteId = false (unresolved aliases)
+        var events = new[]
+        {
+            new HqEvent(1, "handoff", "Alias handoff", now, "coder", 10.0, "qa")
+        };
+
+        var state = new HqState(
+            Agents: agents,
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: events,
+            Timestamp: now
+        );
+
+        const int coreDeskY = 126;
+        const int extraDeskY = 168;
+        var slots = new SlotBinding[]
+        {
+            new(0, "demo-leader", "shikamaru", AgentState.Idle, true, 56, coreDeskY),
+            new(1, "coder-1", "minato", AgentState.Working, true, 146, coreDeskY),
+            new(2, "tester-1", "tsunade", AgentState.Working, true, 238, coreDeskY),
+            new(3, null, "kakashi", AgentState.Idle, false, 328, coreDeskY)
+        };
+
+        motionSystem.Update(0.016f, 0.016f, state, slots, coreDeskY, extraDeskY);
+        Assert.True(motionSystem.IsHandoffActive);
+        ref readonly var m0 = ref motionSystem.GetMotion(1);
+        Assert.Equal(ActorMotionState.StepOut, m0.State);
+        Assert.Equal("coder-1", m0.BoundAgentId);
+        Assert.Equal("tester-1", m0.TargetAgentId);
+
+        motionSystem.Update(0.36f, 0.38f, state, slots, coreDeskY, extraDeskY);
+        Assert.Equal(ActorMotionState.WalkingToTarget, motionSystem.GetMotion(1).State);
+
+        motionSystem.Update(0.60f, 0.98f, state, slots, coreDeskY, extraDeskY);
+        Assert.Equal(ActorMotionState.Delivering, motionSystem.GetMotion(1).State);
+
+        motionSystem.Update(0.46f, 1.44f, state, slots, coreDeskY, extraDeskY);
+        Assert.Equal(ActorMotionState.WalkingBack, motionSystem.GetMotion(1).State);
+
+        motionSystem.Update(0.62f, 2.06f, state, slots, coreDeskY, extraDeskY);
+        Assert.Equal(ActorMotionState.StepBack, motionSystem.GetMotion(1).State);
+
+        motionSystem.Update(0.36f, 2.42f, state, slots, coreDeskY, extraDeskY);
+        Assert.Equal(ActorMotionState.AtDesk, motionSystem.GetMotion(1).State);
+        Assert.False(motionSystem.IsHandoffActive);
+    }
 }
+
 
 

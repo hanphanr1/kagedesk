@@ -116,7 +116,9 @@ public record HqEvent(
     DateTimeOffset Timestamp,
     string? AgentId = null,
     double TtlSeconds = 10.0,
-    string? TargetAgentId = null
+    string? TargetAgentId = null,
+    bool FromIsConcreteId = false,
+    bool ToIsConcreteId = false
 );
 
 public record HqState(

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Text.Json.Serialization;
 using KageDesk.Core.Models;
 
 namespace KageDesk.Core.State;
@@ -19,7 +20,9 @@ public record PushedEventPayload(
     double? QuotaPercent = null,
     double? TtlSeconds = null,
     string? FromAgentId = null,
-    string? ToAgentId = null
+    string? ToAgentId = null,
+    [property: JsonIgnore] bool FromIsConcreteId = false,
+    [property: JsonIgnore] bool ToIsConcreteId = false
 );
 
 public class HqStateAggregator
@@ -364,7 +367,16 @@ public class HqStateAggregator
                 var fromId = payload.FromAgentId ?? payload.AgentId;
                 var toId = payload.ToAgentId;
                 var seq = Interlocked.Increment(ref _sequenceCounter);
-                _visualEvents.Add(new HqEvent(seq, "handoff", payload.Message ?? $"Handoff from {fromId} to {toId}", now, fromId, payload.TtlSeconds ?? 10.0, toId));
+                _visualEvents.Add(new HqEvent(
+                    seq,
+                    "handoff",
+                    payload.Message ?? $"Handoff from {fromId} to {toId}",
+                    now,
+                    fromId,
+                    payload.TtlSeconds ?? 10.0,
+                    toId,
+                    payload.FromIsConcreteId,
+                    payload.ToIsConcreteId));
                 toEmit = RecalculateStateLocked();
             }
             else
@@ -508,14 +520,21 @@ public class HqStateAggregator
         }
     }
 
-    public void AddVisualEvent(string type, string message, string? agentId = null, double ttlSeconds = 10.0, string? targetAgentId = null)
+    public void AddVisualEvent(
+        string type,
+        string message,
+        string? agentId = null,
+        double ttlSeconds = 10.0,
+        string? targetAgentId = null,
+        bool fromIsConcreteId = false,
+        bool toIsConcreteId = false)
     {
         HqState? toEmit = null;
         lock (_lock)
         {
             var seq = Interlocked.Increment(ref _sequenceCounter);
             var now = _timeProvider();
-            _visualEvents.Add(new HqEvent(seq, type, message, now, agentId, ttlSeconds, targetAgentId));
+            _visualEvents.Add(new HqEvent(seq, type, message, now, agentId, ttlSeconds, targetAgentId, fromIsConcreteId, toIsConcreteId));
             toEmit = RecalculateStateLocked();
         }
 
@@ -798,7 +817,7 @@ public class HqStateAggregator
                         _lastWorkingStartedAt.Remove(matchB);
                         _lastWorkingFinishedAt.Remove(prevId);
                         var seq = Interlocked.Increment(ref _sequenceCounter);
-                        _visualEvents.Add(new HqEvent(seq, "handoff", $"Handoff from {prevAg.Name} to {matchB}", now, prevId, 10.0, matchB));
+                        _visualEvents.Add(new HqEvent(seq, "handoff", $"Handoff from {prevAg.Name} to {matchB}", now, prevId, 10.0, matchB, FromIsConcreteId: true, ToIsConcreteId: true));
                     }
                 }
             }
@@ -825,7 +844,7 @@ public class HqStateAggregator
                         _lastWorkingFinishedAt.Remove(matchA);
                         _lastWorkingStartedAt.Remove(currAg.Id);
                         var seq = Interlocked.Increment(ref _sequenceCounter);
-                        _visualEvents.Add(new HqEvent(seq, "handoff", $"Handoff from {matchA} to {currAg.Name}", now, matchA, 10.0, currAg.Id));
+                        _visualEvents.Add(new HqEvent(seq, "handoff", $"Handoff from {matchA} to {currAg.Name}", now, matchA, 10.0, currAg.Id, FromIsConcreteId: true, ToIsConcreteId: true));
                     }
                 }
             }

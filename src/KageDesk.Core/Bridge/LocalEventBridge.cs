@@ -328,13 +328,26 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
 
                 // Capture ONE snapshot and resolve BOTH endpoints with strict 2-pass priority
                 HqState snapshot = _aggregator.GetState();
-                if (AgentAliasResolver.AreSameCanonicalEndpoint(fromId, toId, snapshot, out string resolvedFrom, out string resolvedTo))
+                if (AgentAliasResolver.AreSameCanonicalEndpoint(
+                    fromId,
+                    toId,
+                    snapshot,
+                    out string resolvedFrom,
+                    out string resolvedTo,
+                    out bool fromIsConcreteId,
+                    out bool toIsConcreteId))
                 {
                     await WriteJsonAsync(response, 400, new { ok = false, error = "fromAgentId and toAgentId cannot resolve to the same agent endpoint" }).ConfigureAwait(false);
                     return;
                 }
 
-                payload = payload with { FromAgentId = resolvedFrom, ToAgentId = resolvedTo };
+                payload = payload with
+                {
+                    FromAgentId = resolvedFrom,
+                    ToAgentId = resolvedTo,
+                    FromIsConcreteId = fromIsConcreteId,
+                    ToIsConcreteId = toIsConcreteId
+                };
             }
 
             _aggregator.UpdatePushedEvent(payload);

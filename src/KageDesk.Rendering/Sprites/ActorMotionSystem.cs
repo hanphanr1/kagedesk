@@ -237,8 +237,8 @@ public sealed class ActorMotionSystem
             {
                 _lastHandledHandoffSeq = ev.SequenceId;
 
-                int fromStation = ResolveStationIndex(ev.AgentId, state, slots);
-                int toStation = ResolveStationIndex(ev.TargetAgentId, state, slots);
+                int fromStation = ResolveStationIndex(ev.AgentId, state, slots, ev.FromIsConcreteId);
+                int toStation = ResolveStationIndex(ev.TargetAgentId, state, slots, ev.ToIsConcreteId);
 
                 if (fromStation >= 0 && toStation >= 0 && fromStation != toStation)
                 {
@@ -671,7 +671,7 @@ public sealed class ActorMotionSystem
         }
     }
 
-    private static int ResolveStationIndex(string? agentId, HqState state, ReadOnlySpan<SlotBinding> slots)
+    private static int ResolveStationIndex(string? agentId, HqState state, ReadOnlySpan<SlotBinding> slots, bool isConcreteId)
     {
         if (string.IsNullOrWhiteSpace(agentId)) return -1;
         string trimmed = agentId.Trim();
@@ -683,6 +683,13 @@ public sealed class ActorMotionSystem
             {
                 return i;
             }
+        }
+
+        // If this endpoint already resolved to a concrete agent ID when the handoff was queued,
+        // never fall back to alias, role, or sprite lookup when that concrete agent is absent.
+        if (isConcreteId)
+        {
+            return -1;
         }
 
         // Preserve exact-ID-first precedence across the snapshot: if a real agent literally has

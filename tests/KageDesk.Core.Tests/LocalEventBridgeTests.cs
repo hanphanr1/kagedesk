@@ -840,6 +840,46 @@ public class LocalEventBridgeTests
             .Single(e => string.Equals(e.Type, "handoff", StringComparison.OrdinalIgnoreCase));
         Assert.Equal("original", handoff.AgentId);
         Assert.Equal("qa", handoff.TargetAgentId);
+        Assert.True(handoff.FromIsConcreteId);
+        Assert.True(handoff.ToIsConcreteId);
+    }
+
+    [Fact]
+    public async Task PostEvent_Handoff_UnresolvedAliasesRemainNonConcrete_AndIgnoreClientSpoofedFlags()
+    {
+        var port = GetAvailablePort();
+        var aggregator = new HqStateAggregator();
+        const string token = "test-token-unresolved-alias-flags";
+
+        // Only coder is present in snapshot; "qa" is unresolved (no tester present).
+        aggregator.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("coder-1", "Minato", AgentRole.Coder, "minato", AgentState.Working)
+        }, Array.Empty<AccountInfo>());
+
+        await using var bridge = new LocalEventBridge(aggregator, port, requiredToken: token);
+        bridge.Start();
+
+        using var client = new HttpClient();
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{port}/api/event")
+        {
+            Content = new StringContent(
+                """{"type":"handoff","fromAgentId":"coder","toAgentId":"qa","fromIsConcreteId":false,"toIsConcreteId":true}""",
+                Encoding.UTF8,
+                "application/json")
+        };
+        req.Headers.Add("X-KageDesk-Token", token);
+
+        var res = await client.SendAsync(req);
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+
+        var handoff = aggregator.GetState().PendingVisualEvents
+            .Single(e => string.Equals(e.Type, "handoff", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal("coder-1", handoff.AgentId);
+        Assert.Equal("qa", handoff.TargetAgentId);
+        Assert.True(handoff.FromIsConcreteId);
+        Assert.False(handoff.ToIsConcreteId);
     }
 }
+
 

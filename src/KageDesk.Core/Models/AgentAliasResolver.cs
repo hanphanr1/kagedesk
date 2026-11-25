@@ -111,6 +111,18 @@ public static class AgentAliasResolver
         out string resolvedFrom,
         out string resolvedTo)
     {
+        return AreSameCanonicalEndpoint(fromRef, toRef, snapshot, out resolvedFrom, out resolvedTo, out _, out _);
+    }
+
+    public static bool AreSameCanonicalEndpoint(
+        string fromRef,
+        string toRef,
+        HqState snapshot,
+        out string resolvedFrom,
+        out string resolvedTo,
+        out bool fromIsConcreteId,
+        out bool toIsConcreteId)
+    {
         string trimmedFrom = fromRef.Trim();
         string trimmedTo = toRef.Trim();
         var agents = snapshot?.Agents;
@@ -118,8 +130,11 @@ public static class AgentAliasResolver
         bool fromMatched = TryResolveAgentId(trimmedFrom, agents, out string? matchedFrom);
         bool toMatched = TryResolveAgentId(trimmedTo, agents, out string? matchedTo);
 
-        resolvedFrom = fromMatched && !string.IsNullOrEmpty(matchedFrom) ? matchedFrom : trimmedFrom;
-        resolvedTo = toMatched && !string.IsNullOrEmpty(matchedTo) ? matchedTo : trimmedTo;
+        fromIsConcreteId = fromMatched && !string.IsNullOrEmpty(matchedFrom);
+        toIsConcreteId = toMatched && !string.IsNullOrEmpty(matchedTo);
+
+        resolvedFrom = fromIsConcreteId ? matchedFrom! : trimmedFrom;
+        resolvedTo = toIsConcreteId ? matchedTo! : trimmedTo;
 
         if (string.Equals(resolvedFrom, resolvedTo, StringComparison.OrdinalIgnoreCase))
         {
@@ -128,7 +143,7 @@ public static class AgentAliasResolver
 
         // When neither endpoint matches a concrete agent in the snapshot, reject pairs of aliases
         // that refer to the exact same canonical role/sprite (e.g., "qa" -> "tester").
-        if (!fromMatched && !toMatched &&
+        if (!fromIsConcreteId && !toIsConcreteId &&
             TryResolveRoleAlias(resolvedFrom, out var fromAlias) &&
             TryResolveRoleAlias(resolvedTo, out var toAlias) &&
             fromAlias.Role == toAlias.Role)
