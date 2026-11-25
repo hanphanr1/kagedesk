@@ -199,7 +199,7 @@ public static class PreviewSnapshotGenerator
         float t = 0.25f;
         for (int i = 0; i < warmupTicks; i++)
         {
-            renderer.Render(canvas, state, theme, t);
+            renderer.Render(canvas, state, theme, t, state.Timestamp.AddSeconds(t));
             t += 0.12f;
         }
 
@@ -223,7 +223,7 @@ public static class PreviewSnapshotGenerator
         float t = 0.25f;
         for (int i = 0; i < warmupTicks; i++)
         {
-            renderer.Render(canvas, state, theme, t);
+            renderer.Render(canvas, state, theme, t, true, state.Timestamp.AddSeconds(t));
             t += 0.12f;
         }
 

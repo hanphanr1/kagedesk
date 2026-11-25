@@ -11,6 +11,7 @@ public class TrayController : IDisposable
 {
     private NotifyIcon? _notifyIcon;
     private ContextMenuStrip? _contextMenu;
+    private ToolStripMenuItem? _exportGifMenuItem;
     private readonly Action _onExit;
 
     private IntPtr _hIcon = IntPtr.Zero;
@@ -255,7 +256,8 @@ public class TrayController : IDisposable
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Failure Alert", null, (_, _) => OnDemoTrigger?.Invoke("fail")));
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger 4 Clones", null, (_, _) => OnDemoTrigger?.Invoke("clone")));
         demoMenu.DropDownItems.Add(new ToolStripSeparator());
-        demoMenu.DropDownItems.Add(new ToolStripMenuItem("Export 6s Demo GIF...", null, (_, _) => OnExportGif?.Invoke()));
+        _exportGifMenuItem = new ToolStripMenuItem("Export 6s Demo GIF...", null, (_, _) => OnExportGif?.Invoke());
+        demoMenu.DropDownItems.Add(_exportGifMenuItem);
         demoMenu.DropDownItems.Add(new ToolStripSeparator());
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Reset to Live Orca", null, (_, _) => OnDemoTrigger?.Invoke("clear")));
         _contextMenu.Items.Add(demoMenu);
@@ -339,6 +341,26 @@ public class TrayController : IDisposable
             item.Dispose();
         }
         items.Clear();
+    }
+
+    public void SetExportGifEnabled(bool enabled)
+    {
+        if (_exportGifMenuItem != null)
+        {
+            _exportGifMenuItem.Enabled = enabled;
+        }
+    }
+
+    public void ShowBalloon(string title, string text, ToolTipIcon icon, int timeoutMs = 3000)
+    {
+        if (_notifyIcon != null && !_disposed)
+        {
+            try
+            {
+                _notifyIcon.ShowBalloonTip(timeoutMs, title, text, icon);
+            }
+            catch { }
+        }
     }
 
     public void Dispose()

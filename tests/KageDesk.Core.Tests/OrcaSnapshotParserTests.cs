@@ -369,5 +369,45 @@ public class OrcaSnapshotParserTests
         var detected = collector.DetectProcesses();
         Assert.Empty(detected);
     }
+
+    [Fact]
+    public void ParseWorktreePs_HandlesStringAndNullStateStartedAt_WithoutThrowing()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var json = """
+        {
+          "ok": true,
+          "result": {
+            "worktrees": [
+              {
+                "worktreeId": "wt:string-time",
+                "displayName": "Coder",
+                "status": "working",
+                "stateStartedAt": "1795545516240",
+                "agents": [
+                  {
+                    "address": "agent-1",
+                    "state": "working",
+                    "stateStartedAt": null,
+                    "updatedAt": "1795545570739"
+                  },
+                  {
+                    "address": "agent-2",
+                    "state": "working",
+                    "stateStartedAt": "invalid-not-a-number",
+                    "updatedAt": null
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """;
+
+        var agents = OrcaSnapshotParser.ParseWorktreePs(json, now);
+        Assert.Equal(2, agents.Count);
+        Assert.Equal("agent-1", agents[0].Id);
+        Assert.Equal("agent-2", agents[1].Id);
+    }
 }
 

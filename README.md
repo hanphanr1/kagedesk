@@ -116,7 +116,8 @@ Supported `skylineStyle` presets: `konoha`, `cyber`, and `lofi`.
 
 ### Prerequisites
 - Windows 10 or Windows 11 (x64)
-- [.NET 8 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/8.0)
+- [.NET 8 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/8.0) (for building from source)
+- The portable release ZIP requires [.NET 8 Desktop Runtime (x64)](https://dotnet.microsoft.com/en-us/download/dotnet/8.0) installed on the target machine.
 
 ### Build & Run
 
@@ -131,7 +132,7 @@ dotnet build KageDesk.sln -c Release
 | :--- | :--- |
 | *(no args)* | Starts the full Live Wallpaper + Taskbar Pet Overlay + System Tray Studio |
 | `--no-wallpaper` | Runs only the transparent Taskbar Pet Overlay and tray controller |
-| `--record-gif <path> [--theme <id>] [--scenario <id>] [--scale 1\|2]` | Records a 6-second auto-choreographed showcase or scenario loop (`showcase`, `handoff`, `working`, `approve`, `done`, `fail`, `clone`) to GIF89a with transparent diff compression |
+| `--record-gif [path] [--theme <id>] [--scenario <id>] [--scale 1\|2]` | Records a 6-second auto-choreographed showcase or scenario loop (`showcase`, `handoff`, `working`, `approve`, `done`, `fail`, `clone`) to GIF89a with transparent diff compression |
 | `--snapshot <dir>` | Headlessly renders all 9 crisp nearest-neighbor preview PNGs into `<dir>` |
 | `--benchmark <seconds> [--out <file>]` | Runs a headless rendering & GDI/RAM soak benchmark for `<seconds>` and optionally writes a JSON/text report |
 
@@ -165,8 +166,9 @@ Any local agent, CLI runner, or CI hook can push real-time status updates to `ht
 - **Endpoints**:
   - `GET /api/health` — unauthenticated health/telemetry probe (`ok`, `version`, `workingSetMb`, `uptimeSec`, `activeTheme`, `agentCount`)
   - `GET /api/state` — token-protected allowlisted state DTO
-  - `POST /api/event` — token-protected event ingestion (`type`, `state`, `agentId`, `name`, `role`, `toolName`, `message`, `repo`, `buildStatus`, `accountProvider`, `accountName`, `quotaPercent`)
-  - `POST /api/demo/{working|approve|done|fail|clone|clear}` — token-protected Demo Studio triggers
+  - `POST /api/event` — token-protected event ingestion (`type`, `state`, `agentId`, `name`, `role`, `toolName`, `message`, `repo`, `buildStatus`, `accountProvider`, `accountName`, `quotaPercent`, `fromAgentId`, `toAgentId`)
+    - **Living Handoffs**: send `{"type": "handoff", "fromAgentId": "minato", "toAgentId": "tsunade"}` to trigger a shinobi scroll handoff walk with Hiraishin sparks
+  - `POST /api/demo/{working|approve|done|fail|clone|handoff|clear}` — token-protected Demo Studio triggers
 
 ### 3. Ready-to-Use Hook Scripts & Claude Code Templates
 

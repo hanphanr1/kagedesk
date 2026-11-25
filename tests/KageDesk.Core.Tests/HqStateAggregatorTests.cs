@@ -786,6 +786,77 @@ public class HqStateAggregatorTests
         Assert.Equal(AgentState.NeedsApproval, agents[0].State);
         Assert.Equal(expectedDto, agents[0].WorkStartedAt);
     }
+
+    [Fact]
+    public void RecalculateState_ClearsWorkStartedAt_WhenAgentTransitionsToDoneOrFailed()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var agg = new HqStateAggregator(timeProvider: () => now);
+
+        // 1. Agent enters Working
+        agg.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("agent-1", "Minato", AgentRole.Coder, "minato", AgentState.Working)
+        }, Array.Empty<AccountInfo>());
+
+        var state1 = agg.GetState();
+        var ag1 = state1.Agents.First(a => a.Id == "agent-1");
+        Assert.NotNull(ag1.WorkStartedAt);
+        Assert.Equal(now, ag1.WorkStartedAt.Value);
+
+        // 2. Agent transitions to Done
+        var doneTime = now.AddMinutes(5);
+        agg = new HqStateAggregator(timeProvider: () => doneTime);
+        agg.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("agent-1", "Minato", AgentRole.Coder, "minato", AgentState.Working)
+        }, Array.Empty<AccountInfo>());
+        agg.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("agent-1", "Minato", AgentRole.Coder, "minato", AgentState.Done, UpdatedAt: doneTime)
+        }, Array.Empty<AccountInfo>());
+
+        var state2 = agg.GetState();
+        var ag2 = state2.Agents.First(a => a.Id == "agent-1");
+        Assert.Equal(AgentState.Done, ag2.State);
+        Assert.Null(ag2.WorkStartedAt);
+
+        // 3. Agent starts a new task later: must receive new start time, not old cached time
+        var newWorkTime = doneTime.AddMinutes(10);
+        var agg3 = new HqStateAggregator(timeProvider: () => newWorkTime);
+        agg3.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("agent-1", "Minato", AgentRole.Coder, "minato", AgentState.Done, UpdatedAt: doneTime)
+        }, Array.Empty<AccountInfo>());
+        agg3.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("agent-1", "Minato", AgentRole.Coder, "minato", AgentState.Working)
+        }, Array.Empty<AccountInfo>());
+
+        var state3 = agg3.GetState();
+        var ag3 = state3.Agents.First(a => a.Id == "agent-1");
+        Assert.Equal(AgentState.Working, ag3.State);
+        Assert.Equal(newWorkTime, ag3.WorkStartedAt);
+    }
+
+    [Fact]
+    public void SetDemoScenario_Handoff_EmitsVisualEventOnlyOnceAcrossEvaluations()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var agg = new HqStateAggregator(timeProvider: () => now);
+
+        agg.SetDemoScenario("handoff");
+        var state1 = agg.GetState();
+        var handoffEvents1 = state1.PendingVisualEvents.Count(e => e.Type == "handoff");
+        Assert.Equal(1, handoffEvents1);
+
+        // Repeated reevaluations
+        agg.Reevaluate();
+        agg.Reevaluate();
+        var state2 = agg.GetState();
+        var handoffEvents2 = state2.PendingVisualEvents.Count(e => e.Type == "handoff");
+        Assert.Equal(1, handoffEvents2);
+    }
 }
 
 

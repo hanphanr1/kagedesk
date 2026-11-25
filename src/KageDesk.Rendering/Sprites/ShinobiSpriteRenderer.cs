@@ -1506,19 +1506,15 @@ public static class ShinobiSpriteRenderer
             trimmed = trimmed[..^4];
         }
 
-        return trimmed.ToLowerInvariant() switch
-        {
-            "shikamaru" => "shikamaru",
-            "minato" => "minato",
-            "tsunade" => "tsunade",
-            "kakashi" => "kakashi",
-            "clone" => "clone",
-            "omp" => "omp",
-            "agy" => "agy",
-            "antigravity" => "agy",
-            "claude" => "claude",
-            "codex" => "codex",
-            _ => "generic"
-        };
+        if (string.Equals(trimmed, "shikamaru", StringComparison.OrdinalIgnoreCase)) return "shikamaru";
+        if (string.Equals(trimmed, "minato", StringComparison.OrdinalIgnoreCase)) return "minato";
+        if (string.Equals(trimmed, "tsunade", StringComparison.OrdinalIgnoreCase)) return "tsunade";
+        if (string.Equals(trimmed, "kakashi", StringComparison.OrdinalIgnoreCase)) return "kakashi";
+        if (string.Equals(trimmed, "clone", StringComparison.OrdinalIgnoreCase)) return "clone";
+        if (string.Equals(trimmed, "omp", StringComparison.OrdinalIgnoreCase)) return "omp";
+        if (string.Equals(trimmed, "agy", StringComparison.OrdinalIgnoreCase) || string.Equals(trimmed, "antigravity", StringComparison.OrdinalIgnoreCase)) return "agy";
+        if (string.Equals(trimmed, "claude", StringComparison.OrdinalIgnoreCase)) return "claude";
+        if (string.Equals(trimmed, "codex", StringComparison.OrdinalIgnoreCase)) return "codex";
+        return "generic";
     }
 }

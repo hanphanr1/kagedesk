@@ -14,6 +14,28 @@ public enum ActorMotionState : byte
     IdleStroll
 }
 
+public readonly struct SlotBinding
+{
+    public readonly int SlotIndex;
+    public readonly string? AgentId;
+    public readonly string SpriteKey;
+    public readonly AgentState State;
+    public readonly bool Occupied;
+    public readonly int CenterX;
+    public readonly int DeskY;
+
+    public SlotBinding(int slotIndex, string? agentId, string spriteKey, AgentState state, bool occupied, int centerX, int deskY)
+    {
+        SlotIndex = slotIndex;
+        AgentId = agentId;
+        SpriteKey = spriteKey;
+        State = state;
+        Occupied = occupied;
+        CenterX = centerX;
+        DeskY = deskY;
+    }
+}
+
 public struct ActorMotion
 {
     public ActorMotionState State;
@@ -31,6 +53,7 @@ public struct ActorMotion
     public bool CarryingScroll;
     public bool IsFlashTrail;
     public bool BehindDesk;
+    public string? BoundAgentId;
 
     public readonly bool IsInMotion => State != ActorMotionState.AtDesk;
 }
@@ -81,20 +104,51 @@ public sealed class ActorMotionSystem
         float dt,
         float timeSeconds,
         HqState state,
+        ReadOnlySpan<SlotBinding> slots,
         int coreDeskY,
         int extraDeskY,
-        int extraCount,
-        ReadOnlySpan<int> coreCentersX,
-        Func<int, int, int> getExtraCenterX,
         ParticleSystem? particles = null)
     {
+        // 0. Cancel/reset motion if a moving actor's slot changes or disappears
+        for (int i = 0; i < MaxStations; i++)
+        {
+            if (_motions[i].IsInMotion)
+            {
+                bool cancel = false;
+                if (i >= slots.Length || !slots[i].Occupied)
+                {
+                    cancel = true;
+                }
+                else if (!string.Equals(slots[i].AgentId, _motions[i].BoundAgentId, StringComparison.OrdinalIgnoreCase))
+                {
+                    cancel = true;
+                }
+
+                if (cancel)
+                {
+                    ref var m = ref _motions[i];
+                    m.State = ActorMotionState.AtDesk;
+                    m.BehindDesk = true;
+                    m.OffsetX = 0;
+                    m.OffsetY = 0;
+                    m.CarryingScroll = false;
+                    m.IsFlashTrail = false;
+                    m.BoundAgentId = null;
+                    if (_activeHandoffStation == i)
+                    {
+                        _activeHandoffStation = -1;
+                    }
+                }
+            }
+        }
+
         // 1. Check for new handoff visual events
-        int newlyStarted = CheckForHandoffEvents(state, coreDeskY, extraDeskY, extraCount, coreCentersX, getExtraCenterX);
+        int newlyStarted = CheckForHandoffEvents(state, slots, coreDeskY, extraDeskY);
 
         // 2. Check for ambient idle life stroll
         if (newlyStarted < 0)
         {
-            newlyStarted = CheckForAmbientStroll(dt, state, coreDeskY, coreCentersX);
+            newlyStarted = CheckForAmbientStroll(dt, state, slots, coreDeskY);
         }
 
         // 3. Update all active motions (do not advance on the frame it was triggered)
@@ -107,18 +161,65 @@ public sealed class ActorMotionSystem
         }
     }
 
-    private int CheckForHandoffEvents(
+    public void Update(
+        float dt,
+        float timeSeconds,
         HqState state,
         int coreDeskY,
         int extraDeskY,
         int extraCount,
         ReadOnlySpan<int> coreCentersX,
-        Func<int, int, int> getExtraCenterX)
+        Func<int, int, int> getExtraCenterX,
+        ParticleSystem? particles = null)
+    {
+        int total = 4 + Math.Clamp(extraCount, 0, 5);
+        Span<SlotBinding> slots = new SlotBinding[total];
+        static string DefaultCoreSprite(int i) => i switch { 0 => "shikamaru", 1 => "minato", 2 => "tsunade", _ => "kakashi" };
+
+        for (int i = 0; i < 4; i++)
+        {
+            int cx = i < coreCentersX.Length ? coreCentersX[i] : 56 + i * 90;
+            string sprite = DefaultCoreSprite(i);
+            AgentSnapshot? found = null;
+            for (int a = 0; a < state.Agents.Count; a++)
+            {
+                var ag = state.Agents[a];
+                if (string.Equals(ag.SpriteKey, sprite, StringComparison.OrdinalIgnoreCase) ||
+                    (i == 0 && ag.Role == AgentRole.Leader) ||
+                    (i == 1 && ag.Role == AgentRole.Coder) ||
+                    (i == 2 && ag.Role == AgentRole.Tester) ||
+                    (i == 3 && ag.Role == AgentRole.Reviewer))
+                {
+                    found = ag;
+                    break;
+                }
+            }
+            slots[i] = new SlotBinding(i, found?.Id, sprite, found?.State ?? AgentState.Idle, found != null, cx, coreDeskY);
+        }
+
+        for (int i = 0; i < extraCount; i++)
+        {
+            int cx = getExtraCenterX(i, extraCount);
+            int agentIdx = 4 + i;
+            AgentSnapshot? found = agentIdx < state.Agents.Count ? state.Agents[agentIdx] : null;
+            slots[4 + i] = new SlotBinding(4 + i, found?.Id, found?.SpriteKey ?? "clone", found?.State ?? AgentState.Idle, found != null, cx, extraDeskY);
+        }
+
+        Update(dt, timeSeconds, state, slots, coreDeskY, extraDeskY, particles);
+    }
+
+    private int CheckForHandoffEvents(
+        HqState state,
+        ReadOnlySpan<SlotBinding> slots,
+        int coreDeskY,
+        int extraDeskY)
     {
         if (_activeHandoffStation >= 0)
             return -1; // Handoff already in progress
 
         var events = state.PendingVisualEvents;
+        if (events == null) return -1;
+
         for (int e = 0; e < events.Count; e++)
         {
             var ev = events[e];
@@ -127,12 +228,12 @@ public sealed class ActorMotionSystem
             {
                 _lastHandledHandoffSeq = ev.SequenceId;
 
-                int fromStation = ResolveStationIndex(ev.AgentId, state, extraCount);
-                int toStation = ResolveStationIndex(ev.TargetAgentId, state, extraCount);
+                int fromStation = ResolveStationIndex(ev.AgentId, slots);
+                int toStation = ResolveStationIndex(ev.TargetAgentId, slots);
 
                 if (fromStation >= 0 && toStation >= 0 && fromStation != toStation)
                 {
-                    StartHandoff(fromStation, toStation, coreDeskY, extraDeskY, extraCount, coreCentersX, getExtraCenterX, state);
+                    StartHandoff(fromStation, toStation, slots, coreDeskY, extraDeskY);
                     return fromStation;
                 }
             }
@@ -143,23 +244,23 @@ public sealed class ActorMotionSystem
     private void StartHandoff(
         int fromStation,
         int toStation,
+        ReadOnlySpan<SlotBinding> slots,
         int coreDeskY,
-        int extraDeskY,
-        int extraCount,
-        ReadOnlySpan<int> coreCentersX,
-        Func<int, int, int> getExtraCenterX,
-        HqState state)
+        int extraDeskY)
     {
-        int fromDeskX = GetStationX(fromStation, extraCount, coreCentersX, getExtraCenterX);
-        int fromDeskY = fromStation < 4 ? coreDeskY : extraDeskY;
-        int toDeskX = GetStationX(toStation, extraCount, coreCentersX, getExtraCenterX);
-        int toDeskY = toStation < 4 ? coreDeskY : extraDeskY;
+        ref readonly var fromSlot = ref slots[fromStation];
+        ref readonly var toSlot = ref slots[toStation];
 
-        int rugY = fromStation < 4 ? coreDeskY + 22 : extraDeskY + 22;
+        int fromDeskX = fromSlot.CenterX;
+        int fromDeskY = fromSlot.DeskY;
+        int toDeskX = toSlot.CenterX;
+        int toDeskY = toSlot.DeskY;
+
+        int fromRugY = fromDeskY + 22;
+        int toRugY = toDeskY + 22;
         int targetArrivalX = toDeskX + (fromDeskX < toDeskX ? -16 : 16);
 
-        string fromSprite = GetStationSprite(fromStation, state);
-        bool isMinato = string.Equals(fromSprite, "minato", StringComparison.OrdinalIgnoreCase);
+        bool isMinato = string.Equals(fromSlot.SpriteKey, "minato", StringComparison.OrdinalIgnoreCase);
 
         ref var m = ref _motions[fromStation];
         m.State = ActorMotionState.StepOut;
@@ -167,9 +268,9 @@ public sealed class ActorMotionSystem
         m.Duration = 0.35f;
         m.DeskX = fromDeskX;
         m.DeskY = fromDeskY;
-        m.RugY = rugY;
+        m.RugY = fromRugY;
         m.TargetX = targetArrivalX;
-        m.TargetY = rugY;
+        m.TargetY = toRugY;
         m.OffsetX = 0;
         m.OffsetY = 0;
         m.FacingRight = toDeskX >= fromDeskX;
@@ -177,6 +278,7 @@ public sealed class ActorMotionSystem
         m.CarryingScroll = true;
         m.IsFlashTrail = isMinato;
         m.BehindDesk = true;
+        m.BoundAgentId = fromSlot.AgentId;
 
         _activeHandoffStation = fromStation;
     }
@@ -184,14 +286,19 @@ public sealed class ActorMotionSystem
     private int CheckForAmbientStroll(
         float dt,
         HqState state,
-        int coreDeskY,
-        ReadOnlySpan<int> coreCentersX)
+        ReadOnlySpan<SlotBinding> slots,
+        int coreDeskY)
     {
         if (_activeHandoffStation >= 0) return -1;
 
         // Only stroll if all core stations are calm/idle and no alerts
         if (state.Mood != HqMood.Calm) return -1;
-        if (state.Agents.Any(a => a.State == AgentState.NeedsApproval || a.State == AgentState.Working)) return -1;
+        var agents = state.Agents;
+        for (int a = 0; a < agents.Count; a++)
+        {
+            var st = agents[a].State;
+            if (st == AgentState.NeedsApproval || st == AgentState.Working) return -1;
+        }
 
         _ambientTimer += dt;
         if (_ambientTimer >= _nextAmbientCooldown)
@@ -201,11 +308,12 @@ public sealed class ActorMotionSystem
 
             // Choose a random core character (0..3)
             int candidate = (int)(NextPrng() % 4);
-            if (!_motions[candidate].IsInMotion)
+            if (!_motions[candidate].IsInMotion && candidate < slots.Length)
             {
-                int deskX = coreCentersX[candidate];
-                int deskY = coreDeskY;
-                int rugY = coreDeskY + 22;
+                ref readonly var slot = ref slots[candidate];
+                int deskX = slot.CenterX;
+                int deskY = slot.DeskY;
+                int rugY = deskY + 22;
                 int strollDist = ((int)(NextPrng() % 2) == 0 ? 1 : -1) * (18 + (int)(NextPrng() % 14));
                 int targetX = Math.Clamp(deskX + strollDist, 30, 354);
 
@@ -225,9 +333,11 @@ public sealed class ActorMotionSystem
                 m.CarryingScroll = false;
                 m.IsFlashTrail = false;
                 m.BehindDesk = true;
+                m.BoundAgentId = slot.AgentId;
                 return candidate;
             }
         }
+
         return -1;
     }
 
@@ -263,7 +373,8 @@ public sealed class ActorMotionSystem
                 float p = Math.Clamp(m.Elapsed / m.Duration, 0f, 1f);
                 m.BehindDesk = false;
                 m.OffsetX = (int)(p * (m.TargetX - m.DeskX));
-                m.OffsetY = m.RugY - m.DeskY;
+                int currentY = (int)(m.RugY + p * (m.TargetY - m.RugY));
+                m.OffsetY = currentY - m.DeskY;
                 m.WalkPhase = ((int)(timeSeconds * 8f)) & 3;
 
                 if (m.IsFlashTrail && particles != null && (int)(timeSeconds * 20f) % 2 == 0)
@@ -278,6 +389,7 @@ public sealed class ActorMotionSystem
                     m.Elapsed = 0f;
                     m.Duration = 0.45f; // Exactly 0.45s delivery pause
                     m.OffsetX = m.TargetX - m.DeskX;
+                    m.OffsetY = m.TargetY - m.DeskY;
                     m.WalkPhase = 0;
 
                     // Spark burst upon scroll delivery
@@ -293,7 +405,7 @@ public sealed class ActorMotionSystem
             {
                 m.BehindDesk = false;
                 m.OffsetX = m.TargetX - m.DeskX;
-                m.OffsetY = m.RugY - m.DeskY;
+                m.OffsetY = m.TargetY - m.DeskY;
                 m.WalkPhase = 0;
 
                 if (m.Elapsed >= m.Duration)
@@ -313,7 +425,8 @@ public sealed class ActorMotionSystem
                 float p = Math.Clamp(m.Elapsed / m.Duration, 0f, 1f);
                 m.BehindDesk = false;
                 m.OffsetX = (int)((1f - p) * (m.TargetX - m.DeskX));
-                m.OffsetY = m.RugY - m.DeskY;
+                int currentY = (int)(m.TargetY + p * (m.RugY - m.TargetY));
+                m.OffsetY = currentY - m.DeskY;
                 m.WalkPhase = ((int)(timeSeconds * 8f)) & 3;
 
                 if (m.IsFlashTrail && particles != null && (int)(timeSeconds * 20f) % 2 == 0)
@@ -327,6 +440,7 @@ public sealed class ActorMotionSystem
                     m.Elapsed = 0f;
                     m.Duration = 0.35f;
                     m.OffsetX = 0;
+                    m.OffsetY = m.RugY - m.DeskY;
                     m.FacingRight = true;
                 }
                 break;
@@ -421,52 +535,45 @@ public sealed class ActorMotionSystem
         }
     }
 
-    private static int ResolveStationIndex(string? agentId, HqState state, int extraCount)
+    private static int ResolveStationIndex(string? agentId, ReadOnlySpan<SlotBinding> slots)
     {
         if (string.IsNullOrWhiteSpace(agentId)) return -1;
+        string trimmed = agentId.Trim();
 
-        // Check if matches core character name or sprite or ID
-        string lower = agentId.ToLowerInvariant();
-        if (lower.Contains("shikamaru") || lower.Contains("leader")) return 0;
-        if (lower.Contains("minato") || lower.Contains("coder")) return 1;
-        if (lower.Contains("tsunade") || lower.Contains("tester") || lower.Contains("qa")) return 2;
-        if (lower.Contains("kakashi") || lower.Contains("reviewer")) return 3;
-
-        // Search live agents
-        for (int i = 0; i < state.Agents.Count; i++)
+        // 1. Strict exact OrdinalIgnoreCase lookup against SlotBinding.AgentId
+        for (int i = 0; i < slots.Length; i++)
         {
-            var a = state.Agents[i];
-            if (string.Equals(a.Id, agentId, StringComparison.OrdinalIgnoreCase))
+            if (slots[i].Occupied && string.Equals(slots[i].AgentId, trimmed, StringComparison.OrdinalIgnoreCase))
             {
-                if (a.Role == AgentRole.Leader) return 0;
-                if (a.Role == AgentRole.Coder) return 1;
-                if (a.Role == AgentRole.Tester) return 2;
-                if (a.Role == AgentRole.Reviewer) return 3;
-                // Otherwise extra slot
-                int extraIdx = 4 + (i - 4);
-                if (extraIdx >= 4 && extraIdx < 4 + extraCount) return extraIdx;
-                return 4; // fallback first extra slot
+                return i;
             }
         }
-        return -1;
-    }
 
-    private static int GetStationX(int idx, int extraCount, ReadOnlySpan<int> coreCentersX, Func<int, int, int> getExtraCenterX)
-    {
-        if (idx < 4) return coreCentersX[idx];
-        return getExtraCenterX(idx - 4, extraCount);
-    }
+        // 2. Fallback to exact SpriteKey only if agentId matches a known role alias (e.g. "minato" -> slot whose SpriteKey == "minato" AND Occupied)
+        string? roleSprite = null;
+        if (string.Equals(trimmed, "shikamaru", StringComparison.OrdinalIgnoreCase) || string.Equals(trimmed, "leader", StringComparison.OrdinalIgnoreCase))
+            roleSprite = "shikamaru";
+        else if (string.Equals(trimmed, "minato", StringComparison.OrdinalIgnoreCase) || string.Equals(trimmed, "coder", StringComparison.OrdinalIgnoreCase))
+            roleSprite = "minato";
+        else if (string.Equals(trimmed, "tsunade", StringComparison.OrdinalIgnoreCase) || string.Equals(trimmed, "tester", StringComparison.OrdinalIgnoreCase) || string.Equals(trimmed, "qa", StringComparison.OrdinalIgnoreCase))
+            roleSprite = "tsunade";
+        else if (string.Equals(trimmed, "kakashi", StringComparison.OrdinalIgnoreCase) || string.Equals(trimmed, "reviewer", StringComparison.OrdinalIgnoreCase))
+            roleSprite = "kakashi";
+        else if (string.Equals(trimmed, "clone", StringComparison.OrdinalIgnoreCase))
+            roleSprite = "clone";
 
-    private static string GetStationSprite(int idx, HqState state)
-    {
-        return idx switch
+        if (roleSprite != null)
         {
-            0 => "shikamaru",
-            1 => "minato",
-            2 => "tsunade",
-            3 => "kakashi",
-            _ => "clone"
-        };
+            for (int i = 0; i < slots.Length; i++)
+            {
+                if (slots[i].Occupied && string.Equals(slots[i].SpriteKey, roleSprite, StringComparison.OrdinalIgnoreCase))
+                {
+                    return i;
+                }
+            }
+        }
+
+        return -1;
     }
 
     private uint NextPrng()

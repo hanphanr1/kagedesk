@@ -7,8 +7,8 @@ namespace KageDesk.Rendering.Export;
 
 public static class DemoGifRecorder
 {
-    public const int TotalFrames = 72; // 6 seconds @ 12 FPS
-    public const int FrameDelayCentiseconds = 8; // 80ms delay = 12.5 FPS (~6.0s total)
+    public const int TotalFrames = 75; // 6.00 seconds @ 12.5 FPS (75 frames * 8 cs = 600 cs)
+    public const int FrameDelayCentiseconds = 8; // 80ms delay = 12.5 FPS (6.00s total)
 
     public static void RecordGif(
         string outputPath,
@@ -20,39 +20,62 @@ public static class DemoGifRecorder
         ArgumentNullException.ThrowIfNull(outputPath);
         ArgumentNullException.ThrowIfNull(theme);
 
-        string? dir = Path.GetDirectoryName(Path.GetFullPath(outputPath));
+        string fullOutPath = Path.GetFullPath(outputPath);
+        string? dir = Path.GetDirectoryName(fullOutPath);
         if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
         {
             Directory.CreateDirectory(dir);
         }
 
-        using var fileStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None);
-        var encoder = new Gif89aEncoder(fileStream, HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight, scale);
-
-        var renderer = new HqWallpaperRenderer();
-        using var pixelBuffer = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
-
-        DateTimeOffset baseTime = new(2026, 11, 25, 12, 0, 0, TimeSpan.Zero);
-        string scenKey = scenario.Trim().ToLowerInvariant();
-
-        int[] scratch = new int[HqWallpaperRenderer.CanvasWidth * HqWallpaperRenderer.CanvasHeight];
-
-        for (int frame = 0; frame < TotalFrames; frame++)
+        string tmpPath = fullOutPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
         {
-            float timeSeconds = frame * (6.0f / TotalFrames);
-            DateTimeOffset frameNow = baseTime.AddSeconds(timeSeconds);
+            using (var fileStream = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                var encoder = new Gif89aEncoder(fileStream, HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight, scale);
+                var renderer = new HqWallpaperRenderer();
+                using var pixelBuffer = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
 
-            HqState state = BuildFrameState(scenKey, frame, timeSeconds, frameNow, baseTime);
+                DateTimeOffset baseTime = new(2026, 11, 25, 12, 0, 0, TimeSpan.Zero);
+                string scenKey = scenario.Trim().ToLowerInvariant();
+                int[] scratch = new int[HqWallpaperRenderer.CanvasWidth * HqWallpaperRenderer.CanvasHeight];
 
-            renderer.Render(pixelBuffer, state, theme, timeSeconds);
+                for (int frame = 0; frame < TotalFrames; frame++)
+                {
+                    float timeSeconds = frame * (6.0f / TotalFrames);
+                    DateTimeOffset frameNow = baseTime.AddSeconds(timeSeconds);
 
-            pixelBuffer.ReadOnlyPixels.CopyTo(scratch);
-            encoder.AddFrame(scratch, FrameDelayCentiseconds);
+                    HqState state = BuildFrameState(scenKey, frame, timeSeconds, frameNow, baseTime);
 
-            onProgress?.Invoke(frame + 1, TotalFrames);
+                    renderer.Render(pixelBuffer, state, theme, timeSeconds, nowOverride: frameNow);
+
+                    pixelBuffer.ReadOnlyPixels.CopyTo(scratch);
+                    encoder.AddFrame(scratch, FrameDelayCentiseconds);
+
+                    onProgress?.Invoke(frame + 1, TotalFrames);
+                }
+
+                encoder.Finish();
+            }
+
+            File.Move(tmpPath, fullOutPath, overwrite: true);
         }
+        catch
+        {
+            try
+            {
+                if (File.Exists(tmpPath))
+                {
+                    File.Delete(tmpPath);
+                }
+            }
+            catch
+            {
+                // Ignore secondary cleanup error
+            }
 
-        encoder.Finish();
+            throw;
+        }
     }
 
     private static HqState BuildFrameState(
@@ -145,11 +168,11 @@ public static class DemoGifRecorder
             default:
             {
                 // Multi-phase choreographed 6-second showcase:
-                // Phase 1 (0.0 .. 1.25s, frames 0..14): Working agents with cyan elapsed timer pills
-                // Phase 2 (1.25 .. 4.25s, frames 15..50): Living handoff (Minato walks across rug with scroll & Hiraishin sparks to Tsunade)
-                // Phase 3 (4.25 .. 5.25s, frames 51..62): Celebration sparks / done
-                // Phase 4 (5.25 .. 6.00s, frames 63..71): Calm return to idle desks
-                if (frame < 15)
+                // Phase 1 (0.0 .. 1.25s, frames 0..15): Working agents with cyan elapsed timer pills
+                // Phase 2 (1.25 .. 4.25s, frames 16..53): Living handoff (Minato walks across rug with scroll & Hiraishin sparks to Tsunade)
+                // Phase 3 (4.25 .. 5.25s, frames 54..65): Celebration sparks / done
+                // Phase 4 (5.25 .. 6.00s, frames 66..74): Calm return to idle desks
+                if (timeSeconds < 1.25f)
                 {
                     agents.Add(new AgentSnapshot("demo-leader", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "plan", TaskTitle: "Architecture plan", IsBotHome: true, WorkStartedAt: baseTime.AddSeconds(-45)));
                     agents.Add(new AgentSnapshot("demo-coder", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "compile", TaskTitle: "Building v2.0 features", IsBotHome: true, WorkStartedAt: baseTime.AddSeconds(-95)));
@@ -157,7 +180,7 @@ public static class DemoGifRecorder
                     agents.Add(new AgentSnapshot("demo-reviewer", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle, IsBotHome: true));
                     mood = HqMood.Busy;
                 }
-                else if (frame < 51)
+                else if (timeSeconds < 4.25f)
                 {
                     agents.Add(new AgentSnapshot("demo-leader", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle, IsBotHome: true));
                     agents.Add(new AgentSnapshot("demo-coder", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "compile", TaskTitle: "Handoff to QA", IsBotHome: true, WorkStartedAt: baseTime.AddSeconds(-120)));
@@ -167,7 +190,7 @@ public static class DemoGifRecorder
                     visualEvents.Add(new HqEvent(1, "handoff", "Scroll handoff from Minato to Tsunade", baseTime.AddSeconds(1.25), "demo-coder", 10.0, "demo-tester"));
                     mood = HqMood.Busy;
                 }
-                else if (frame < 63)
+                else if (timeSeconds < 5.25f)
                 {
                     agents.Add(new AgentSnapshot("demo-leader", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Done, TaskTitle: "Release ready", UpdatedAt: baseTime.AddSeconds(4.25), IsBotHome: true));
                     agents.Add(new AgentSnapshot("demo-coder", "Minato", AgentRole.Coder, "minato", AgentState.Done, TaskTitle: "Handoff complete", UpdatedAt: baseTime.AddSeconds(4.25), IsBotHome: true));

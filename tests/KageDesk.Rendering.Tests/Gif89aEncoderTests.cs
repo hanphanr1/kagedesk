@@ -52,71 +52,242 @@ public class Gif89aEncoderTests
     }
 
     [Fact]
-    public void Encode_FallbackUniformPalette_WhenMoreThan256Colors()
+    public void Encode_ExactPixelRgbEquality_AcrossFrames()
     {
+        int width = 32;
+        int height = 32;
         using var ms = new MemoryStream();
-        var encoder = new Gif89aEncoder(ms, 20, 20, scale: 1);
+        var encoder = new Gif89aEncoder(ms, width, height, scale: 1);
 
-        // Generate 400 distinct colors
-        int[] frame = new int[400];
-        for (int i = 0; i < 400; i++)
+        int[] f1 = new int[width * height];
+        for (int y = 0; y < height; y++)
         {
-            int r = (i * 3) & 0xFF;
-            int g = (i * 7) & 0xFF;
-            int b = (i * 11) & 0xFF;
-            frame[i] = unchecked((int)(0xFF000000 | (uint)(r << 16) | (uint)(g << 8) | (uint)b));
+            for (int x = 0; x < width; x++)
+            {
+                int red = (x % 8) * 32;
+                int green = (y % 8) * 32;
+                f1[y * width + x] = unchecked((int)(0xFF000000 | (uint)(red << 16) | (uint)(green << 8) | 0x80));
+            }
         }
 
-        encoder.AddFrame(frame, delayCentiseconds: 8);
-        encoder.Finish();
-
-        ms.Position = 0;
-        using var img = Image.FromStream(ms);
-        Assert.Equal(20, img.Width);
-        Assert.Equal(20, img.Height);
-    }
-
-    [Fact]
-    public void Encode_Scale2_Outputs768x432()
-    {
-        using var ms = new MemoryStream();
-        var encoder = new Gif89aEncoder(ms, 384, 216, scale: 2);
-
-        int[] frame = new int[384 * 216];
-        encoder.AddFrame(frame, delayCentiseconds: 8);
-        encoder.Finish();
-
-        ms.Position = 0;
-        using var img = Image.FromStream(ms);
-        Assert.Equal(768, img.Width);
-        Assert.Equal(432, img.Height);
-    }
-
-    [Fact]
-    public void Encode_MultiFrameWithTransparentDiffing_DecodesCorrectFrameCount()
-    {
-        using var ms = new MemoryStream();
-        var encoder = new Gif89aEncoder(ms, 16, 16, scale: 1);
-
-        int[] f1 = new int[256];
-        Array.Fill(f1, unchecked((int)0xFF000000));
-
-        int[] f2 = new int[256];
-        Array.Fill(f2, unchecked((int)0xFF000000));
-        f2[10] = unchecked((int)0xFFFF0000); // Only 1 pixel changed
-
-        int[] f3 = new int[256];
-        Array.Fill(f3, unchecked((int)0xFF000000));
-        f3[20] = unchecked((int)0xFF00FF00);
+        int[] f2 = (int[])f1.Clone();
+        // Modify a 10x10 patch in frame 2
+        for (int y = 5; y < 15; y++)
+        {
+            for (int x = 5; x < 15; x++)
+            {
+                f2[y * width + x] = unchecked((int)0xFFFF0055);
+            }
+        }
 
         encoder.AddFrame(f1, 8);
         encoder.AddFrame(f2, 8);
-        encoder.AddFrame(f3, 8);
         encoder.Finish();
 
         ms.Position = 0;
         using var img = Image.FromStream(ms);
         var dim = new FrameDimension(img.FrameDimensionsList[0]);
-        Assert.Equal(3, img.GetFrameCount(dim));
+        Assert.Equal(2, img.GetFrameCount(dim));
+
+        using var composite = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+        using var g = Graphics.FromImage(composite);
+
+        // Frame 1 check
+        img.SelectActiveFrame(dim, 0);
+        g.DrawImage(img, 0, 0);
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                int expected = f1[y * width + x] & 0x00FFFFFF;
+                int actual = composite.GetPixel(x, y).ToArgb() & 0x00FFFFFF;
+                Assert.Equal(expected, actual);
+            }
+        }
+
+        // Frame 2 check
+        img.SelectActiveFrame(dim, 1);
+        g.DrawImage(img, 0, 0);
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                int expected = f2[y * width + x] & 0x00FFFFFF;
+                int actual = composite.GetPixel(x, y).ToArgb() & 0x00FFFFFF;
+                Assert.Equal(expected, actual);
+            }
+        }
+    }
+
+    [Fact]
+    public void Encode_ComplexFrame_MoreThan512LzwCodes_DecodesExactPixels()
+    {
+        // 64x64 = 4096 pixels with varying sequence triggering >512 LZW dictionary codes
+        int width = 64;
+        int height = 64;
+        using var ms = new MemoryStream();
+        var encoder = new Gif89aEncoder(ms, width, height, scale: 1);
+
+        int[] frame = new int[width * height];
+        for (int i = 0; i < frame.Length; i++)
+        {
+            int colorIndex = (i ^ (i >> 3) ^ (i >> 6)) & 0x0F;
+            int r = (colorIndex * 17) & 0xFF;
+            int g = (colorIndex * 31) & 0xFF;
+            int b = (colorIndex * 53) & 0xFF;
+            frame[i] = unchecked((int)(0xFF000000 | (uint)(r << 16) | (uint)(g << 8) | (uint)b));
+        }
+
+        encoder.AddFrame(frame, 10);
+        encoder.Finish();
+
+        ms.Position = 0;
+        using var img = Image.FromStream(ms);
+        using var bmp = new Bitmap(img);
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                int expected = frame[y * width + x] & 0x00FFFFFF;
+                int actual = bmp.GetPixel(x, y).ToArgb() & 0x00FFFFFF;
+                Assert.Equal(expected, actual);
+            }
+        }
+    }
+
+    [Fact]
+    public void Encode_LargeFrame_MoreThan4096LzwCodes_TriggersClearCodeResetAndDecodesExactPixels()
+    {
+        // 128x128 = 16384 pixels with high entropy pattern triggering Clear code table reset (>4096 codes)
+        int width = 128;
+        int height = 128;
+        using var ms = new MemoryStream();
+        var encoder = new Gif89aEncoder(ms, width, height, scale: 1);
+
+        int[] frame = new int[width * height];
+        for (int i = 0; i < frame.Length; i++)
+        {
+            int c = ((i * 37) + (i >> 2)) & 0x1F;
+            frame[i] = unchecked((int)(0xFF000000 | (uint)(c * 8 << 16) | (uint)(c * 4 << 8) | (uint)(c * 7)));
+        }
+
+        encoder.AddFrame(frame, 8);
+        encoder.Finish();
+
+        ms.Position = 0;
+        using var img = Image.FromStream(ms);
+        using var bmp = new Bitmap(img);
+        Assert.Equal(width, bmp.Width);
+        Assert.Equal(height, bmp.Height);
+
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                int expected = frame[y * width + x] & 0x00FFFFFF;
+                int actual = bmp.GetPixel(x, y).ToArgb() & 0x00FFFFFF;
+                Assert.Equal(expected, actual);
+            }
+        }
+    }
+
+    [Fact]
+    public void Encode_HighColorFrame2Fallback_OpaqueWithBlackPreserved()
+    {
+        int width = 30;
+        int height = 20;
+        using var ms = new MemoryStream();
+        var encoder = new Gif89aEncoder(ms, width, height, scale: 1);
+
+        // Frame 1: 400 genuinely distinct RGB colors
+        int[] f1 = new int[width * height];
+        for (int i = 0; i < f1.Length; i++)
+        {
+            int red = (i * 11) % 256;
+            int green = (i * 23) % 256;
+            int blue = (i * 37) % 256;
+            f1[i] = unchecked((int)(0xFF000000 | (uint)(red << 16) | (uint)(green << 8) | (uint)blue));
+        }
+
+        // Frame 2: change >256 pixels, including changing specific pixels to pure black (0,0,0)
+        int[] f2 = (int[])f1.Clone();
+        for (int i = 0; i < 300; i++)
+        {
+            if (i < 50)
+            {
+                f2[i] = unchecked((int)0xFF000000); // pure black
+            }
+            else
+            {
+                f2[i] = unchecked((int)(0xFF000000 | (uint)((i * 13) % 256 << 16) | (uint)((i * 29) % 256 << 8) | 0xFF));
+            }
+        }
+
+        encoder.AddFrame(f1, 8);
+        encoder.AddFrame(f2, 8);
+        encoder.Finish();
+
+        ms.Position = 0;
+        using var img = Image.FromStream(ms);
+        var dim = new FrameDimension(img.FrameDimensionsList[0]);
+        Assert.Equal(2, img.GetFrameCount(dim));
+
+        using var composite = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+        using var g = Graphics.FromImage(composite);
+
+        // Frame 1 composite
+        img.SelectActiveFrame(dim, 0);
+        g.DrawImage(img, 0, 0);
+
+        // Frame 2 composite
+        img.SelectActiveFrame(dim, 1);
+        g.DrawImage(img, 0, 0);
+
+        // Verify that changed pixels to black are opaque black (not transparent!)
+        for (int i = 0; i < 50; i++)
+        {
+            int x = i % width;
+            int y = i / width;
+            Color pixel = composite.GetPixel(x, y);
+            Assert.Equal(255, pixel.A);
+            Assert.Equal(0, pixel.R);
+            Assert.Equal(0, pixel.G);
+            Assert.Equal(0, pixel.B);
+        }
+    }
+
+    [Theory]
+    [InlineData(0, 10, 1)]
+    [InlineData(10, 0, 1)]
+    [InlineData(-5, 10, 1)]
+    [InlineData(10, -5, 1)]
+    [InlineData(10, 10, 0)]
+    [InlineData(10, 10, -1)]
+    [InlineData(40000, 2, 2)] // 40000 * 2 = 80000 > 65535
+    public void Constructor_InvalidDimensionsOrScale_Throws(int width, int height, int scale)
+    {
+        using var ms = new MemoryStream();
+        Assert.ThrowsAny<ArgumentException>(() => new Gif89aEncoder(ms, width, height, scale));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(70000)]
+    public void AddFrame_InvalidDelay_Throws(int delay)
+    {
+        using var ms = new MemoryStream();
+        var encoder = new Gif89aEncoder(ms, 10, 10, 1);
+        int[] pixels = new int[100];
+        Assert.Throws<ArgumentOutOfRangeException>(() => encoder.AddFrame(pixels, delay));
+    }
+
+    [Fact]
+    public void AddFrame_WrongPixelBufferLength_Throws()
+    {
+        using var ms = new MemoryStream();
+        var encoder = new Gif89aEncoder(ms, 10, 10, 1);
+        int[] wrongLength = new int[50];
+        Assert.Throws<ArgumentException>(() => encoder.AddFrame(wrongLength, 8));
     }
 }

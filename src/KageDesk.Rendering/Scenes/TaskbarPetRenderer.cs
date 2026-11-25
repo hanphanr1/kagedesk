@@ -81,14 +81,15 @@ public sealed class TaskbarPetRenderer
         HqState state,
         ThemePack theme,
         float timeSeconds,
-        bool showIdleChill = true)
+        bool showIdleChill = true,
+        DateTimeOffset? nowOverride = null)
     {
         if (buf.Width < CanvasWidth || buf.Height < CanvasHeight)
         {
             throw new ArgumentException($"PixelBuffer must be at least {CanvasWidth}x{CanvasHeight}.", nameof(buf));
         }
 
-        _stateTimestamp = state.Timestamp;
+        _stateTimestamp = nowOverride ?? state.Timestamp;
 
         if (!ReferenceEquals(_cachedTheme, theme))
         {
@@ -451,9 +452,10 @@ public sealed class TaskbarPetRenderer
             if (a.WorkStartedAt.HasValue)
             {
                 var now = _stateTimestamp;
-                var elapsedSec = (int)Math.Max(0, (now - a.WorkStartedAt.Value).TotalSeconds);
-                int mm = Math.Min(99, elapsedSec / 60);
-                int ss = elapsedSec % 60;
+                var elapsed = now - a.WorkStartedAt.Value;
+                long totalSeconds = Math.Clamp((long)elapsed.TotalSeconds, 0L, 5999L);
+                int mm = (int)(totalSeconds / 60);
+                int ss = (int)(totalSeconds % 60);
                 if (written + 8 <= _textScratch.Length)
                 {
                     " \u2022 ".AsSpan().CopyTo(_textScratch.AsSpan(written));

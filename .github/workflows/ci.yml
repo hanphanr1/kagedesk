@@ -98,7 +98,7 @@ jobs:
             Write-Host "Verified snapshot: $png ($len bytes)"
           }
 
-          # 5. Run Release KageDesk.exe --record-gif into temp file and verify GIF89a header and size > 10 KB
+          # 5. Run Release KageDesk.exe --record-gif into temp file and strictly decode all 75 frames
           $tempGif = Join-Path $env:RUNNER_TEMP "kagedesk-ci-demo.gif"
           $gifProc = Start-Process -FilePath $exePath -ArgumentList @('--record-gif', $tempGif, '--theme', 'shinobi-hq', '--scenario', 'showcase', '--scale', '1') -Wait -PassThru
           if ($gifProc.ExitCode -ne 0) {
@@ -116,4 +116,31 @@ jobs:
           if ($header -ne "GIF89a") {
             throw "Recorded GIF header is '$header', expected 'GIF89a'"
           }
-          Write-Host "Verified animated GIF recorder: $tempGif ($gifLen bytes, header=$header)"
+
+          # Strictly decode ALL 75 frames via System.Drawing.Image and verify pixel buffers
+          Add-Type -AssemblyName System.Drawing
+          $gifImg = [System.Drawing.Image]::FromFile($tempGif)
+          try {
+            $dimension = New-Object System.Drawing.Imaging.FrameDimension($gifImg.FrameDimensionsList[0])
+            $frameCount = $gifImg.GetFrameCount($dimension)
+            if ($frameCount -ne 75) {
+              throw "Recorded GIF frame count was $frameCount, expected exactly 75 frames"
+            }
+            for ($f = 0; $f -lt $frameCount; $f++) {
+              $gifImg.SelectActiveFrame($dimension, $f) | Out-Null
+              $bmp = New-Object System.Drawing.Bitmap($gifImg)
+              try {
+                $samplePixel = $bmp.GetPixel(10, 10)
+                if ($samplePixel.A -eq 0 -and $bmp.GetPixel(50, 50).A -eq 0) {
+                  throw "Frame $f appears completely transparent / corrupt"
+                }
+              }
+              finally {
+                $bmp.Dispose()
+              }
+            }
+            Write-Host "Strictly decoded and verified all $frameCount frames of $tempGif ($gifLen bytes, header=$header)"
+          }
+          finally {
+            $gifImg.Dispose()
+          }

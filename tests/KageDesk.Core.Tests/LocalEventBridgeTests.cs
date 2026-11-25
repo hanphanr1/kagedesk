@@ -569,10 +569,36 @@ public class LocalEventBridgeTests
         Assert.Equal(HttpStatusCode.OK, res.StatusCode);
 
         var state = aggregator.GetState();
+        Assert.Empty(state.Agents); // Must not create phantom agents!
         var ev = state.PendingVisualEvents.FirstOrDefault(e => e.Type == "handoff");
         Assert.NotNull(ev);
         Assert.Equal("demo-minato", ev.AgentId);
         Assert.Equal("demo-tsunade", ev.TargetAgentId);
+    }
+
+    [Theory]
+    [InlineData("""{"type":"handoff","fromAgentId":"","toAgentId":"tsunade"}""")]
+    [InlineData("""{"type":"handoff","fromAgentId":"minato","toAgentId":""}""")]
+    [InlineData("""{"type":"handoff","fromAgentId":"minato","toAgentId":"minato"}""")]
+    [InlineData("""{"type":"handoff","fromAgentId":"minato;evil","toAgentId":"tsunade"}""")]
+    public async Task PostEvent_Handoff_InvalidEndpoints_ReturnsBadRequest(string payload)
+    {
+        var port = GetAvailablePort();
+        var aggregator = new HqStateAggregator();
+        const string token = "test-token-handoff-invalid";
+
+        await using var bridge = new LocalEventBridge(aggregator, port, requiredToken: token);
+        bridge.Start();
+
+        using var client = new HttpClient();
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{port}/api/event")
+        {
+            Content = new StringContent(payload, Encoding.UTF8, "application/json")
+        };
+        req.Headers.Add("X-KageDesk-Token", token);
+
+        var res = await client.SendAsync(req);
+        Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
     }
 
     [Fact]

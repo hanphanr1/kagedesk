@@ -28,46 +28,116 @@ public sealed class RetroSoundEngine : IDisposable
     private readonly Dictionary<SoundKind, long> _lastPlayedTimestamp = new();
     private readonly object _lock = new();
     private bool _disposed;
+    private bool _enabled = true;
+    private bool _muted;
 
     public Func<bool>? IsSoundEnabled { get; set; }
     public Func<bool>? IsFullscreenGameDnd { get; set; }
     public Func<bool>? IsSessionLocked { get; set; }
 
+    public bool IsEnabled
+    {
+        get { lock (_lock) return _enabled; }
+    }
+
+    public bool IsMuted
+    {
+        get { lock (_lock) return _muted; }
+    }
+
     public RetroSoundEngine()
     {
-        foreach (SoundKind kind in Enum.GetValues<SoundKind>())
+        GCHandle currentHandle = default;
+        try
         {
-            byte[] bytes = BuildWavBytes(kind);
-            _wavBytes[kind] = bytes;
+            foreach (SoundKind kind in Enum.GetValues<SoundKind>())
+            {
+                byte[] bytes = BuildWavBytes(kind);
+                _wavBytes[kind] = bytes;
 
-            var handle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
-            _pinnedHandles[kind] = handle;
-            _pinnedPointers[kind] = handle.AddrOfPinnedObject();
-            _lastPlayedTimestamp[kind] = 0;
+                currentHandle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+                _pinnedHandles[kind] = currentHandle;
+                _pinnedPointers[kind] = currentHandle.AddrOfPinnedObject();
+                _lastPlayedTimestamp[kind] = 0;
+                currentHandle = default;
+            }
+        }
+        catch
+        {
+            if (currentHandle.IsAllocated)
+            {
+                try { currentHandle.Free(); } catch { }
+            }
+            foreach (var kvp in _pinnedHandles)
+            {
+                if (kvp.Value.IsAllocated)
+                {
+                    try { kvp.Value.Free(); } catch { }
+                }
+            }
+            _pinnedHandles.Clear();
+            _pinnedPointers.Clear();
+            _wavBytes.Clear();
+            throw;
+        }
+    }
+
+    public void SetEnabled(bool enabled)
+    {
+        lock (_lock)
+        {
+            if (_disposed) return;
+            _enabled = enabled;
+            if (!_enabled)
+            {
+                try
+                {
+                    PlaySound(IntPtr.Zero, IntPtr.Zero, 0);
+                }
+                catch { }
+            }
+        }
+    }
+
+    public void SetMuted(bool muted)
+    {
+        lock (_lock)
+        {
+            if (_disposed) return;
+            _muted = muted;
+            if (_muted)
+            {
+                try
+                {
+                    PlaySound(IntPtr.Zero, IntPtr.Zero, 0);
+                }
+                catch { }
+            }
         }
     }
 
     public bool Play(SoundKind kind)
     {
-        if (_disposed) return false;
-
-        // Guards
-        if (IsSoundEnabled != null && !IsSoundEnabled()) return false;
-        if (IsFullscreenGameDnd != null && IsFullscreenGameDnd()) return false;
-        if (IsSessionLocked != null && IsSessionLocked()) return false;
-
         lock (_lock)
         {
             if (_disposed) return false;
+            if (!_enabled || _muted) return false;
+
+            // Optional delegate guards
+            if (IsSoundEnabled != null && !IsSoundEnabled()) return false;
+            if (IsFullscreenGameDnd != null && IsFullscreenGameDnd()) return false;
+            if (IsSessionLocked != null && IsSessionLocked()) return false;
 
             long now = Stopwatch.GetTimestamp();
-            long elapsedTicks = now - _lastPlayedTimestamp[kind];
-            double elapsedMs = (elapsedTicks * 1000.0) / Stopwatch.Frequency;
-
-            if (elapsedMs < 1500.0)
+            if (_lastPlayedTimestamp.TryGetValue(kind, out long last))
             {
-                // Under 1.5s cooldown
-                return false;
+                long elapsedTicks = now - last;
+                double elapsedMs = (elapsedTicks * 1000.0) / Stopwatch.Frequency;
+                if (elapsedMs < 1500.0)
+                {
+                    // Under 1.5s cooldown
+                    return false;
+                }
             }
 
             _lastPlayedTimestamp[kind] = now;
@@ -83,9 +153,9 @@ public sealed class RetroSoundEngine : IDisposable
                     return false;
                 }
             }
-        }
 
-        return false;
+            return false;
+        }
     }
 
     public static byte[] BuildWavBytes(SoundKind kind)
@@ -276,34 +346,51 @@ public sealed class RetroSoundEngine : IDisposable
 
     public void StopAll()
     {
-        try
+        lock (_lock)
         {
-            PlaySound(IntPtr.Zero, IntPtr.Zero, 0);
-        }
-        catch
-        {
-            // Ignore if native call fails during shutdown
+            if (_disposed) return;
+            try
+            {
+                PlaySound(IntPtr.Zero, IntPtr.Zero, 0);
+            }
+            catch
+            {
+                // Ignore if native call fails during shutdown
+            }
         }
     }
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-
-        StopAll();
-
         lock (_lock)
         {
-            foreach (var kvp in _pinnedHandles)
+            if (_disposed) return;
+            _disposed = true;
+
+            bool stopped = false;
+            try
             {
-                if (kvp.Value.IsAllocated)
-                {
-                    kvp.Value.Free();
-                }
+                stopped = PlaySound(IntPtr.Zero, IntPtr.Zero, 0);
             }
-            _pinnedHandles.Clear();
-            _pinnedPointers.Clear();
+            catch
+            {
+                stopped = false;
+            }
+
+            // ONLY free pinned GCHandles if the native stop succeeded
+            // (never unpin a buffer that WinMM might still be reading!)
+            if (stopped)
+            {
+                foreach (var kvp in _pinnedHandles)
+                {
+                    if (kvp.Value.IsAllocated)
+                    {
+                        try { kvp.Value.Free(); } catch { }
+                    }
+                }
+                _pinnedHandles.Clear();
+                _pinnedPointers.Clear();
+            }
         }
     }
 }

@@ -165,5 +165,45 @@ public class RetroSoundEngineTests
         // Amplitude should be soft and pleasant (between 1000 and 28000), never harsh clipping
         Assert.InRange(maxAbsSample, 1500, 30000);
     }
+
+    [Fact]
+    public void SetMutedAndSetEnabled_StopsPlaybackAndMutesSafely()
+    {
+        using var engine = new RetroSoundEngine();
+        engine.SetMuted(true);
+        Assert.False(engine.Play(SoundKind.Done));
+
+        engine.SetMuted(false);
+        engine.SetEnabled(false);
+        Assert.False(engine.Play(SoundKind.Done));
+
+        engine.SetEnabled(true);
+        // Play succeeds or attempts playback
+        _ = engine.Play(SoundKind.Done);
+    }
+
+    [Fact]
+    public async Task ConcurrentAccess_PlayMuteEnabledDispose_DoesNotThrowOrDeadlock()
+    {
+        var engine = new RetroSoundEngine();
+        var tasks = new List<Task>();
+
+        for (int i = 0; i < 8; i++)
+        {
+            int index = i;
+            tasks.Add(Task.Run(() =>
+            {
+                for (int j = 0; j < 50; j++)
+                {
+                    if (index % 3 == 0) engine.Play(SoundKind.Handoff);
+                    else if (index % 3 == 1) engine.SetMuted(j % 2 == 0);
+                    else engine.SetEnabled(j % 2 == 0);
+                }
+            }));
+        }
+
+        await Task.WhenAll(tasks);
+        engine.Dispose();
+    }
 }
 

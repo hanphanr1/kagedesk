@@ -30,6 +30,7 @@ public sealed class HqWallpaperRenderer
     internal struct StationSlot
     {
         public bool Occupied;
+        public string? AgentId;
         public string Name;
         public string SpriteKey;
         public string StationType;
@@ -47,6 +48,7 @@ public sealed class HqWallpaperRenderer
 
     private readonly StationSlot[] _coreSlots = new StationSlot[4];
     private readonly StationSlot[] _extraSlots = new StationSlot[5];
+    private readonly SlotBinding[] _slotBindings = new SlotBinding[9];
     private readonly List<AgentSnapshot> _extraCandidates = new(16);
     private static readonly Comparison<AgentSnapshot> ExtraStationComparison = (a, b) =>
         ComputeExtraStationPriority(b).CompareTo(ComputeExtraStationPriority(a));
@@ -83,12 +85,14 @@ public sealed class HqWallpaperRenderer
         _lastAssignedState = null;
     }
 
-    public void Render(PixelBuffer buf, HqState state, ThemePack theme, float timeSeconds)
+    public void Render(PixelBuffer buf, HqState state, ThemePack theme, float timeSeconds, DateTimeOffset? nowOverride = null)
     {
         if (buf.Width < CanvasWidth || buf.Height < CanvasHeight)
         {
             throw new ArgumentException($"PixelBuffer must be at least {CanvasWidth}x{CanvasHeight}.", nameof(buf));
         }
+
+        DateTimeOffset now = nowOverride ?? state.Timestamp;
 
         if (!ReferenceEquals(_cachedTheme, theme))
         {
@@ -152,29 +156,44 @@ public sealed class HqWallpaperRenderer
         // 4. Emit & Update Particles (zero-alloc)
         UpdateStationParticles(dt, extraCount, coreDeskY, extraDeskY, state);
 
+        int slotCount = 4 + extraCount;
+        for (int i = 0; i < 4; i++)
+        {
+            ref readonly var s = ref _coreSlots[i];
+            _slotBindings[i] = new SlotBinding(i, s.AgentId, s.SpriteKey, s.State, s.Occupied, CoreStationCentersX[i], coreDeskY);
+        }
+        for (int i = 0; i < extraCount; i++)
+        {
+            ref readonly var s = ref _extraSlots[i];
+            int cx = GetExtraStationCenterX(i, extraCount);
+            _slotBindings[4 + i] = new SlotBinding(4 + i, s.AgentId, s.SpriteKey, s.State, s.Occupied, cx, extraDeskY);
+        }
+        for (int i = slotCount; i < 9; i++)
+        {
+            _slotBindings[i] = default;
+        }
+
         // 4b. Update zero-allocation ActorMotionSystem for handoffs & ambient life
         _motionSystem.Update(
             dt,
             timeSeconds,
             state,
+            _slotBindings.AsSpan(0, slotCount),
             coreDeskY,
             extraDeskY,
-            extraCount,
-            CoreStationCentersX,
-            GetExtraStationCenterX,
             _particles);
 
         // 5. Row 1: 4 Core Character Workstations
         for (int i = 0; i < 4; i++)
         {
-            DrawWorkstation(buf, ref _coreSlots[i], CoreStationCentersX[i], coreDeskY, timeSeconds, i, state.Timestamp);
+            DrawWorkstation(buf, ref _coreSlots[i], CoreStationCentersX[i], coreDeskY, timeSeconds, i, now);
         }
 
         // 6. Row 2: Dynamic Clone / External Workstations (up to 5)
         for (int i = 0; i < extraCount; i++)
         {
             int cx = GetExtraStationCenterX(i, extraCount);
-            DrawWorkstation(buf, ref _extraSlots[i], cx, extraDeskY, timeSeconds, i + 4, state.Timestamp);
+            DrawWorkstation(buf, ref _extraSlots[i], cx, extraDeskY, timeSeconds, i + 4, now);
         }
 
         // 7. Render Active Particles on top
@@ -223,6 +242,7 @@ public sealed class HqWallpaperRenderer
                 _coreSlots[coreIndex] = new StationSlot
                 {
                     Occupied = true,
+                    AgentId = ag.Id,
                     Name = ShortenDisplayName(ag.Name),
                     SpriteKey = ShinobiSpriteRenderer.NormalizeSpriteKey(ag.SpriteKey),
                     StationType = CoreDefaultSprites[coreIndex],
@@ -254,6 +274,7 @@ public sealed class HqWallpaperRenderer
             _extraSlots[i] = new StationSlot
             {
                 Occupied = true,
+                AgentId = ag.Id,
                 Name = ShortenDisplayName(ag.Name),
                 SpriteKey = sprite,
                 StationType = "clone",
@@ -1298,9 +1319,10 @@ public sealed class HqWallpaperRenderer
         // Live Elapsed Timer pill (when working or approval and WorkStartedAt != null)
         if ((slot.State == AgentState.Working || slot.State == AgentState.NeedsApproval) && slot.WorkStartedAt.HasValue)
         {
-            int elapsedSec = (int)Math.Max(0, (now - slot.WorkStartedAt.Value).TotalSeconds);
-            int mm = Math.Min(99, elapsedSec / 60);
-            int ss = elapsedSec % 60;
+            var elapsed = now - slot.WorkStartedAt.Value;
+            long totalSeconds = Math.Clamp((long)elapsed.TotalSeconds, 0L, 5999L);
+            int mm = (int)(totalSeconds / 60);
+            int ss = (int)(totalSeconds % 60);
 
             _fmtScratch[0] = (char)('0' + (mm / 10));
             _fmtScratch[1] = (char)('0' + (mm % 10));

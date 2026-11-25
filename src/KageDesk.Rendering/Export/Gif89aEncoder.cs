@@ -29,17 +29,37 @@ public sealed class Gif89aEncoder
     public Gif89aEncoder(Stream stream, int width, int height, int scale = 1)
     {
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
+        if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Width must be positive.");
+        if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height), "Height must be positive.");
+        if (scale < 1) throw new ArgumentOutOfRangeException(nameof(scale), "Scale must be at least 1.");
+
+        int outWidth = checked(width * scale);
+        int outHeight = checked(height * scale);
+
+        if (outWidth > ushort.MaxValue) throw new ArgumentOutOfRangeException(nameof(width), "Scaled width exceeds max GIF dimension (65535).");
+        if (outHeight > ushort.MaxValue) throw new ArgumentOutOfRangeException(nameof(height), "Scaled height exceeds max GIF dimension (65535).");
+
         _width = width;
         _height = height;
-        _scale = Math.Max(1, scale);
-        _outWidth = _width * _scale;
-        _outHeight = _height * _scale;
+        _scale = scale;
+        _outWidth = outWidth;
+        _outHeight = outHeight;
     }
 
     private int[]? _prevArgb;
 
     public void AddFrame(int[] argbPixels, int delayCentiseconds = 8)
     {
+        ArgumentNullException.ThrowIfNull(argbPixels);
+        if (argbPixels.Length != _width * _height)
+        {
+            throw new ArgumentException($"Pixel array length {argbPixels.Length} does not match expected {_width}x{_height} ({_width * _height}).", nameof(argbPixels));
+        }
+        if (delayCentiseconds < 1 || delayCentiseconds > ushort.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(delayCentiseconds), $"Delay {delayCentiseconds} must be between 1 and {ushort.MaxValue} centiseconds.");
+        }
+
         if (!_headerWritten)
         {
             WriteHeader();
@@ -48,13 +68,14 @@ public sealed class Gif89aEncoder
 
         bool isFirstFrame = _prevArgb == null;
         byte[] palette = new byte[768]; // 256 * 3 (RGB)
-        byte[] indexedPixels = QuantizeFrame(argbPixels, palette, !isFirstFrame, _prevArgb);
+        byte[] indexedPixels = QuantizeFrame(argbPixels, palette, !isFirstFrame, _prevArgb, out bool hasTransparency);
 
         // 2. Graphic Control Extension (delay & disposal)
         _stream.WriteByte(0x21); // Extension Introducer
         _stream.WriteByte(0xF9); // Graphic Control Label
         _stream.WriteByte(0x04); // Block size = 4
-        _stream.WriteByte((byte)(isFirstFrame ? 0x04 : 0x05)); // 0x04 = leave in place, 0x05 = leave in place + transparent flag
+        // 0x04 = leave in place (opaque), 0x05 = leave in place + transparent flag
+        _stream.WriteByte((byte)(hasTransparency ? 0x05 : 0x04));
         WriteShort((ushort)delayCentiseconds);
         _stream.WriteByte(0x00); // Transparent Color Index = 0
         _stream.WriteByte(0x00); // Block Terminator
@@ -110,12 +131,11 @@ public sealed class Gif89aEncoder
         _stream.WriteByte(0x00); // Block Terminator
     }
 
-    private byte[] QuantizeFrame(int[] sourceArgb, byte[] palette, bool useTransparency, int[]? prevArgb)
+    private byte[] QuantizeFrame(int[] sourceArgb, byte[] palette, bool useTransparency, int[]? prevArgb, out bool hasTransparency)
     {
         int totalPixels = _outWidth * _outHeight;
         byte[] indexed = new byte[totalPixels];
 
-        int maxColors = useTransparency ? 255 : 256;
         int startIndex = useTransparency ? 1 : 0;
 
         // Collect unique colors
@@ -216,6 +236,7 @@ public sealed class Gif89aEncoder
 
         if (colorCount <= 256)
         {
+            hasTransparency = useTransparency;
             int destIdx = 0;
             for (int y = 0; y < _outHeight; y++)
             {
@@ -241,7 +262,8 @@ public sealed class Gif89aEncoder
         }
         else
         {
-            // Fallback: Uniform 6/8-bit palette
+            // Fallback: Uniform 6/8-bit RGB332 palette (fully opaque so changed dark/black pixels never drop to transparent)
+            hasTransparency = false;
             for (int i = 0; i < 256; i++)
             {
                 int r3 = (i >> 5) & 0x07;
@@ -343,7 +365,7 @@ public sealed class Gif89aEncoder
                     _hashValues[hash] = (short)nextCode;
                     nextCode++;
 
-                    if (nextCode >= (1 << codeSize) && codeSize < 12)
+                    if (nextCode > (1 << codeSize) && codeSize < 12)
                     {
                         codeSize++;
                     }

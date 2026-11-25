@@ -308,6 +308,37 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
                 return;
             }
 
+            if (string.Equals(payload.Type, "handoff", StringComparison.OrdinalIgnoreCase))
+            {
+                var fromId = (payload.FromAgentId ?? payload.AgentId)?.Trim();
+                var toId = payload.ToAgentId?.Trim();
+
+                if (string.IsNullOrEmpty(fromId) || string.IsNullOrEmpty(toId))
+                {
+                    await WriteJsonAsync(response, 400, new { ok = false, error = "Handoff requires both fromAgentId and toAgentId" }).ConfigureAwait(false);
+                    return;
+                }
+
+                if (fromId.Length > 64 || toId.Length > 64 ||
+                    !IsValidEndpointId(fromId) || !IsValidEndpointId(toId))
+                {
+                    await WriteJsonAsync(response, 400, new { ok = false, error = "Invalid endpoint ID format: must be 1-64 characters matching ^[A-Za-z0-9_.:-]+$" }).ConfigureAwait(false);
+                    return;
+                }
+
+                if (string.Equals(fromId, toId, StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(response, 400, new { ok = false, error = "fromAgentId and toAgentId cannot be the same" }).ConfigureAwait(false);
+                    return;
+                }
+
+                // Resolve to canonical agent IDs if an active agent matches
+                fromId = ResolveCanonicalAgentId(fromId);
+                toId = ResolveCanonicalAgentId(toId);
+
+                payload = payload with { FromAgentId = fromId, ToAgentId = toId };
+            }
+
             _aggregator.UpdatePushedEvent(payload);
             await WriteJsonAsync(response, 200, new { ok = true }).ConfigureAwait(false);
             return;
@@ -510,5 +541,25 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
     {
         await ShutdownCoreAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
         GC.SuppressFinalize(this);
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex ValidEndpointRegex =
+        new(@"^[A-Za-z0-9_.:-]+$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    public static bool IsValidEndpointId(string id)
+    {
+        return !string.IsNullOrWhiteSpace(id) && id.Length <= 64 && ValidEndpointRegex.IsMatch(id);
+    }
+
+    private string ResolveCanonicalAgentId(string agentRef)
+    {
+        var activeAgents = _aggregator.CurrentState.Agents;
+        var match = activeAgents.FirstOrDefault(a =>
+            string.Equals(a.Id, agentRef, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a.Name, agentRef, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a.SpriteKey, agentRef, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a.Role.ToString(), agentRef, StringComparison.OrdinalIgnoreCase));
+
+        return match?.Id ?? agentRef;
     }
 }

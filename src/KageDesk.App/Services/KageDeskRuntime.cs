@@ -29,8 +29,11 @@ public class KageDeskRuntime : IDisposable
     private LocalEventBridge? _localBridge;
 
     private readonly RetroSoundEngine _soundEngine;
-    private readonly Dictionary<string, AgentState> _previousAgentStates = new(StringComparer.OrdinalIgnoreCase);
-    private long _lastSoundEventSequenceId;
+    private readonly object _audioTrackLock = new();
+    private readonly Dictionary<string, AgentState> _lastAgentStates = new(StringComparer.OrdinalIgnoreCase);
+    private long _lastSeenAudioEventSeq;
+    private int _gifExportInProgress;
+    private Task? _gifExportTask;
 
     private readonly DesktopOcclusionMonitor _occlusionMonitor;
     private readonly Win32WallpaperBridge _wallpaperBridge;
@@ -105,6 +108,8 @@ public class KageDeskRuntime : IDisposable
             IsFullscreenGameDnd = () => _occlusionMonitor.IsFullscreenGame && _config.HidePetsInFullscreenGame,
             IsSessionLocked = () => _occlusionMonitor.IsSessionLocked
         };
+        _soundEngine.SetEnabled(_config.SoundEnabled);
+        _soundEngine.SetMuted(_occlusionMonitor.IsSessionLocked || (_occlusionMonitor.IsFullscreenGame && _config.HidePetsInFullscreenGame));
 
         InitCollectorsAndBridge();
         InitFormsAndTray();
@@ -119,11 +124,14 @@ public class KageDeskRuntime : IDisposable
     public void UpdateConfig(Action<AppConfig> updater)
     {
         ArgumentNullException.ThrowIfNull(updater);
+        bool soundEnabled;
         lock (_configLock)
         {
             updater(_config);
             _configStore.Save(_config);
+            soundEnabled = _config.SoundEnabled;
         }
+        _soundEngine.SetEnabled(soundEnabled);
     }
 
     public void Start()
@@ -316,26 +324,79 @@ public class KageDeskRuntime : IDisposable
             OnDemoTrigger = scenario => _aggregator.SetDemoScenario(scenario),
             OnExportGif = () =>
             {
+                if (Interlocked.CompareExchange(ref _gifExportInProgress, 1, 0) != 0)
+                {
+                    return;
+                }
+
+                _trayController?.SetExportGifEnabled(false);
+
                 string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-                string gifPath = Path.Combine(desktop, $"kagedesk-demo-{DateTime.Now:yyyyMMdd-HHmmss}.gif");
-                Task.Run(() =>
+                string filename = $"KageDesk-Demo-{DateTime.Now:yyyyMMdd-HHmmss-fff}.gif";
+                string gifPath = Path.Combine(desktop, filename);
+                ThemePack themeToExport;
+                lock (_syncLock)
+                {
+                    themeToExport = _activeTheme;
+                }
+
+                _gifExportTask = Task.Run(() =>
                 {
                     try
                     {
-                        DemoGifRecorder.RecordGif(gifPath, _activeTheme, "showcase", 2);
-                        _dispatcherForm.BeginInvoke(new Action(() =>
+                        DemoGifRecorder.RecordGif(gifPath, themeToExport, "showcase", 2);
+
+                        if (!_stopping && !_disposed && _dispatcherForm.IsHandleCreated)
                         {
-                            MessageBox.Show($"6-second showcase GIF exported to:\n{gifPath}", "KageDesk GIF Export", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                        }));
+                            try
+                            {
+                                _dispatcherForm.BeginInvoke(new Action(() =>
+                                {
+                                    if (!_stopping && !_disposed)
+                                    {
+                                        _trayController?.ShowBalloon("KageDesk GIF Export", $"6-second showcase GIF exported to:\n{gifPath}", ToolTipIcon.Info);
+                                    }
+                                }));
+                            }
+                            catch { }
+                        }
                     }
                     catch (Exception ex)
                     {
-                        _dispatcherForm.BeginInvoke(new Action(() =>
+                        if (!_stopping && !_disposed && _dispatcherForm.IsHandleCreated)
                         {
-                            MessageBox.Show($"Failed to export GIF:\n{ex.Message}", "KageDesk GIF Export Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                        }));
+                            try
+                            {
+                                _dispatcherForm.BeginInvoke(new Action(() =>
+                                {
+                                    if (!_stopping && !_disposed)
+                                    {
+                                        _trayController?.ShowBalloon("KageDesk GIF Export Error", $"Failed to export GIF:\n{ex.Message}", ToolTipIcon.Error);
+                                    }
+                                }));
+                            }
+                            catch { }
+                        }
                     }
-                });
+                    finally
+                    {
+                        Interlocked.Exchange(ref _gifExportInProgress, 0);
+                        if (!_stopping && !_disposed && _dispatcherForm.IsHandleCreated)
+                        {
+                            try
+                            {
+                                _dispatcherForm.BeginInvoke(new Action(() =>
+                                {
+                                    if (!_stopping && !_disposed)
+                                    {
+                                        _trayController?.SetExportGifEnabled(true);
+                                    }
+                                }));
+                            }
+                            catch { }
+                        }
+                    }
+                }, _cts.Token);
             }
         };
 
@@ -520,54 +581,88 @@ public class KageDeskRuntime : IDisposable
 
     private void OnHqStateChanged(object? sender, HqState state)
     {
-        // 1. Process visual events (handoff, etc.)
-        if (state.PendingVisualEvents != null)
-        {
-            foreach (var ev in state.PendingVisualEvents)
-            {
-                if (ev.SequenceId > _lastSoundEventSequenceId)
-                {
-                    if (string.Equals(ev.Type, "handoff", StringComparison.OrdinalIgnoreCase))
-                    {
-                        _soundEngine.Play(SoundKind.Handoff);
-                    }
-                    if (ev.SequenceId > _lastSoundEventSequenceId)
-                    {
-                        _lastSoundEventSequenceId = ev.SequenceId;
-                    }
-                }
-            }
-        }
-
-        // 2. Process agent state transitions
-        if (state.Agents != null)
-        {
-            foreach (var agent in state.Agents)
-            {
-                if (_previousAgentStates.TryGetValue(agent.Id, out var oldState))
-                {
-                    if (oldState != AgentState.NeedsApproval && agent.State == AgentState.NeedsApproval)
-                    {
-                        _soundEngine.Play(SoundKind.Approval);
-                    }
-                    else if (oldState != AgentState.Done && agent.State == AgentState.Done)
-                    {
-                        _soundEngine.Play(SoundKind.Done);
-                    }
-                    else if (oldState != AgentState.Failed && agent.State == AgentState.Failed)
-                    {
-                        _soundEngine.Play(SoundKind.Fail);
-                    }
-                }
-                _previousAgentStates[agent.Id] = agent.State;
-            }
-        }
-
+        ProcessAudioEvents(state);
         RequestUiSync();
+    }
+
+    private void ProcessAudioEvents(HqState state)
+    {
+        lock (_audioTrackLock)
+        {
+            // 1. Process visual events (handoff, etc.)
+            if (state.PendingVisualEvents != null)
+            {
+                for (int i = 0; i < state.PendingVisualEvents.Count; i++)
+                {
+                    var ev = state.PendingVisualEvents[i];
+                    if (ev.SequenceId > _lastSeenAudioEventSeq)
+                    {
+                        if (string.Equals(ev.Type, "handoff", StringComparison.OrdinalIgnoreCase))
+                        {
+                            _soundEngine.Play(SoundKind.Handoff);
+                        }
+                        if (ev.SequenceId > _lastSeenAudioEventSeq)
+                        {
+                            _lastSeenAudioEventSeq = ev.SequenceId;
+                        }
+                    }
+                }
+            }
+
+            // 2. Process agent state transitions
+            if (state.Agents != null)
+            {
+                var activeIds = new HashSet<string>(state.Agents.Count, StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < state.Agents.Count; i++)
+                {
+                    var agent = state.Agents[i];
+                    activeIds.Add(agent.Id);
+                    if (_lastAgentStates.TryGetValue(agent.Id, out var oldState))
+                    {
+                        if (oldState != AgentState.NeedsApproval && agent.State == AgentState.NeedsApproval)
+                        {
+                            _soundEngine.Play(SoundKind.Approval);
+                        }
+                        else if (oldState != AgentState.Done && agent.State == AgentState.Done)
+                        {
+                            _soundEngine.Play(SoundKind.Done);
+                        }
+                        else if (oldState != AgentState.Failed && agent.State == AgentState.Failed)
+                        {
+                            _soundEngine.Play(SoundKind.Fail);
+                        }
+                    }
+                    _lastAgentStates[agent.Id] = agent.State;
+                }
+
+                // Prune disappeared agent IDs so dictionary never grows unbounded over days
+                if (_lastAgentStates.Count > activeIds.Count)
+                {
+                    List<string>? disappeared = null;
+                    foreach (var id in _lastAgentStates.Keys)
+                    {
+                        if (!activeIds.Contains(id))
+                        {
+                            disappeared ??= new List<string>();
+                            disappeared.Add(id);
+                        }
+                    }
+                    if (disappeared != null)
+                    {
+                        for (int i = 0; i < disappeared.Count; i++)
+                        {
+                            _lastAgentStates.Remove(disappeared[i]);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private void OnOcclusionStateChanged(object? sender, EventArgs e)
     {
+        bool muted = _occlusionMonitor.IsSessionLocked || (_occlusionMonitor.IsFullscreenGame && _config.HidePetsInFullscreenGame);
+        _soundEngine.SetMuted(muted);
         RequestUiSync();
     }
 
@@ -715,6 +810,15 @@ public class KageDeskRuntime : IDisposable
             try
             {
                 _pollingLoopTask.Wait(TimeSpan.FromSeconds(2));
+            }
+            catch { }
+        }
+
+        if (_gifExportTask != null)
+        {
+            try
+            {
+                _gifExportTask.Wait(TimeSpan.FromSeconds(2));
             }
             catch { }
         }

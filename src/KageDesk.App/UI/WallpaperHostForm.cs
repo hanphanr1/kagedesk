@@ -129,7 +129,7 @@ public class WallpaperHostForm : Form
         if (_disposed) return;
 
         float timeSeconds = (float)_stopwatch.Elapsed.TotalSeconds;
-        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds);
+        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds, DateTimeOffset.UtcNow);
         Invalidate();
     }
 
@@ -144,7 +144,7 @@ public class WallpaperHostForm : Form
         if (_isPaused || _disposed || (!Visible && !_isAttached)) return;
 
         float timeSeconds = (float)_stopwatch.Elapsed.TotalSeconds;
-        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds);
+        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds, DateTimeOffset.UtcNow);
         Invalidate();
     }
 

@@ -50,6 +50,8 @@ public class HqStateAggregator
     private readonly Dictionary<string, DateTimeOffset> _lastWorkingStartedAt = new(StringComparer.OrdinalIgnoreCase);
 
     private string? _demoScenario;
+    private bool _demoHandoffEmitted;
+    private DateTimeOffset _demoAnchorTime;
     private HqState _currentState;
 
     public event EventHandler<HqState>? StateChanged;
@@ -104,6 +106,7 @@ public class HqStateAggregator
             if (string.IsNullOrWhiteSpace(scenario) || string.Equals(scenario, "clear", StringComparison.OrdinalIgnoreCase))
             {
                 _demoScenario = null;
+                _demoHandoffEmitted = false;
             }
             else
             {
@@ -112,7 +115,13 @@ public class HqStateAggregator
                 {
                     throw new ArgumentException($"Unknown demo scenario: '{scenario}'", nameof(scenario));
                 }
-                _demoScenario = lower;
+
+                if (!string.Equals(_demoScenario, lower, StringComparison.Ordinal))
+                {
+                    _demoScenario = lower;
+                    _demoHandoffEmitted = false;
+                    _demoAnchorTime = _timeProvider();
+                }
             }
 
             toEmit = RecalculateStateLocked();
@@ -348,116 +357,119 @@ public class HqStateAggregator
         {
             var now = _timeProvider();
 
-            // 1. Agent event
-            if (!string.IsNullOrEmpty(payload.AgentId) || !string.IsNullOrEmpty(payload.Name))
-            {
-                var id = payload.AgentId ?? payload.Name!;
-                var name = payload.Name ?? payload.AgentId!;
-                var role = payload.Role ?? AgentRole.External;
-
-                // Resolve AgentState: explicit State wins, otherwise map from Type
-                AgentState state = payload.State ?? ResolveStateFromType(payload.Type);
-
-                var ttl = payload.TtlSeconds ?? 30.0;
-                var expiresAt = now.AddSeconds(ttl);
-
-                var spriteKey = role switch
-                {
-                    AgentRole.Leader => "shikamaru",
-                    AgentRole.Coder => "minato",
-                    AgentRole.Tester => "tsunade",
-                    AgentRole.Reviewer => "kakashi",
-                    AgentRole.Clone => "clone",
-                    _ => "generic"
-                };
-
-                var snapshot = new AgentSnapshot(
-                    Id: id,
-                    Name: name,
-                    Role: role,
-                    SpriteKey: spriteKey,
-                    State: state,
-                    ToolName: payload.ToolName,
-                    LastMessage: payload.Message,
-                    LastActivityAt: now,
-                    UpdatedAt: now,
-                    Source: "bridge"
-                );
-
-                _pushedAgents[id] = (snapshot, expiresAt);
-            }
-
-            // 1b. Handoff event
+            // Special-case "handoff" events: do NOT mutate agent list or create phantom agents!
             if (string.Equals(payload.Type, "handoff", StringComparison.OrdinalIgnoreCase))
             {
                 var fromId = payload.FromAgentId ?? payload.AgentId;
                 var toId = payload.ToAgentId;
                 var seq = Interlocked.Increment(ref _sequenceCounter);
                 _visualEvents.Add(new HqEvent(seq, "handoff", payload.Message ?? $"Handoff from {fromId} to {toId}", now, fromId, payload.TtlSeconds ?? 10.0, toId));
+                toEmit = RecalculateStateLocked();
             }
-
-            // 2. Build event
-            if (!string.IsNullOrEmpty(payload.Repo) && !string.IsNullOrEmpty(payload.BuildStatus))
+            else
             {
-                var buildId = $"{payload.Repo}:latest";
-                var ttl = payload.TtlSeconds ?? 120.0;
-                var expiresAt = now.AddSeconds(ttl);
-
-                _pushedBuilds[buildId] = (new BuildInfo(
-                    Id: buildId,
-                    Repo: payload.Repo,
-                    WorkflowName: "CI",
-                    Branch: "main",
-                    Title: payload.Message ?? "Build Event",
-                    Status: "completed",
-                    Conclusion: payload.BuildStatus,
-                    UpdatedAt: now
-                ), expiresAt);
-
-                // Cap pushed builds at MaxCappedItems
-                if (_pushedBuilds.Count > MaxCappedItems)
+                // 1. Agent event
+                if (!string.IsNullOrEmpty(payload.AgentId) || !string.IsNullOrEmpty(payload.Name))
                 {
-                    var oldest = _pushedBuilds.OrderBy(kv => kv.Value.ExpiresAt).First().Key;
-                    _pushedBuilds.Remove(oldest);
-                }
-            }
+                    var id = payload.AgentId ?? payload.Name!;
+                    var name = payload.Name ?? payload.AgentId!;
+                    var role = payload.Role ?? AgentRole.External;
 
-            // 3. Account quota event
-            if (!string.IsNullOrEmpty(payload.AccountProvider))
-            {
-                var accKey = $"{payload.AccountProvider}:{payload.AccountName ?? "default"}";
-                double ttl = payload.TtlSeconds ?? 300.0;
-                var expiresAt = now.AddSeconds(ttl);
+                    // Resolve AgentState: explicit State wins, otherwise map from Type
+                    AgentState state = payload.State ?? ResolveStateFromType(payload.Type);
 
-                var accountInfo = new AccountInfo(
-                    Provider: payload.AccountProvider,
-                    AccountId: payload.AccountName ?? "default",
-                    Label: payload.AccountName ?? "Default",
-                    IsActive: true,
-                    QuotaPercent: payload.QuotaPercent
-                );
+                    var ttl = payload.TtlSeconds ?? 30.0;
+                    var expiresAt = now.AddSeconds(ttl);
 
-                if (_pushedAccounts.TryGetValue(accKey, out var existingAcc))
-                {
-                    _pushedAccounts[accKey] = (existingAcc.Account with
+                    var spriteKey = role switch
                     {
-                        QuotaPercent = payload.QuotaPercent ?? existingAcc.Account.QuotaPercent
-                    }, expiresAt);
-                }
-                else
-                {
-                    _pushedAccounts[accKey] = (accountInfo, expiresAt);
+                        AgentRole.Leader => "shikamaru",
+                        AgentRole.Coder => "minato",
+                        AgentRole.Tester => "tsunade",
+                        AgentRole.Reviewer => "kakashi",
+                        AgentRole.Clone => "clone",
+                        _ => "generic"
+                    };
+
+                    var snapshot = new AgentSnapshot(
+                        Id: id,
+                        Name: name,
+                        Role: role,
+                        SpriteKey: spriteKey,
+                        State: state,
+                        ToolName: payload.ToolName,
+                        LastMessage: payload.Message,
+                        LastActivityAt: now,
+                        UpdatedAt: now,
+                        Source: "bridge"
+                    );
+
+                    _pushedAgents[id] = (snapshot, expiresAt);
                 }
 
-                // Cap pushed accounts at MaxCappedItems
-                if (_pushedAccounts.Count > MaxCappedItems)
+                // 2. Build event
+                if (!string.IsNullOrEmpty(payload.Repo) && !string.IsNullOrEmpty(payload.BuildStatus))
                 {
-                    var oldest = _pushedAccounts.OrderBy(kv => kv.Value.ExpiresAt).First().Key;
-                    _pushedAccounts.Remove(oldest);
+                    var buildId = $"{payload.Repo}:latest";
+                    var ttl = payload.TtlSeconds ?? 120.0;
+                    var expiresAt = now.AddSeconds(ttl);
+
+                    _pushedBuilds[buildId] = (new BuildInfo(
+                        Id: buildId,
+                        Repo: payload.Repo,
+                        WorkflowName: "CI",
+                        Branch: "main",
+                        Title: payload.Message ?? "Build Event",
+                        Status: "completed",
+                        Conclusion: payload.BuildStatus,
+                        UpdatedAt: now
+                    ), expiresAt);
+
+                    // Cap pushed builds at MaxCappedItems
+                    if (_pushedBuilds.Count > MaxCappedItems)
+                    {
+                        var oldest = _pushedBuilds.OrderBy(kv => kv.Value.ExpiresAt).First().Key;
+                        _pushedBuilds.Remove(oldest);
+                    }
                 }
+
+                // 3. Account quota event
+                if (!string.IsNullOrEmpty(payload.AccountProvider))
+                {
+                    var accKey = $"{payload.AccountProvider}:{payload.AccountName ?? "default"}";
+                    double ttl = payload.TtlSeconds ?? 300.0;
+                    var expiresAt = now.AddSeconds(ttl);
+
+                    var accountInfo = new AccountInfo(
+                        Provider: payload.AccountProvider,
+                        AccountId: payload.AccountName ?? "default",
+                        Label: payload.AccountName ?? "Default",
+                        IsActive: true,
+                        QuotaPercent: payload.QuotaPercent
+                    );
+
+                    if (_pushedAccounts.TryGetValue(accKey, out var existingAcc))
+                    {
+                        _pushedAccounts[accKey] = (existingAcc.Account with
+                        {
+                            QuotaPercent = payload.QuotaPercent ?? existingAcc.Account.QuotaPercent
+                        }, expiresAt);
+                    }
+                    else
+                    {
+                        _pushedAccounts[accKey] = (accountInfo, expiresAt);
+                    }
+
+                    // Cap pushed accounts at MaxCappedItems
+                    if (_pushedAccounts.Count > MaxCappedItems)
+                    {
+                        var oldest = _pushedAccounts.OrderBy(kv => kv.Value.ExpiresAt).First().Key;
+                        _pushedAccounts.Remove(oldest);
+                    }
+                }
+
+                toEmit = RecalculateStateLocked();
             }
-
-            toEmit = RecalculateStateLocked();
         }
 
         if (toEmit != null)
@@ -635,9 +647,11 @@ public class HqStateAggregator
                     }
                 }
             }
-            else if (a.State == AgentState.Idle)
+            else
             {
+                // Agent transitioned out of Working / NeedsApproval (e.g. Idle, Done, Failed)
                 _workStartedAt.Remove(a.Id);
+                _lastWorkingStartedAt.Remove(a.Id);
                 if (a.WorkStartedAt.HasValue)
                 {
                     finalAgents[i] = a with { WorkStartedAt = null };
@@ -650,6 +664,16 @@ public class HqStateAggregator
         foreach (var k in staleWorkKeys)
         {
             _workStartedAt.Remove(k);
+        }
+        var staleWorkingStarted = _lastWorkingStartedAt.Keys.Where(k => !liveIds.Contains(k)).ToList();
+        foreach (var k in staleWorkingStarted)
+        {
+            _lastWorkingStartedAt.Remove(k);
+        }
+        var staleDoneEntered = _doneStateEnteredAt.Keys.Where(k => !liveIds.Contains(k) && !_departedDoneAgents.ContainsKey(k)).ToList();
+        foreach (var k in staleDoneEntered)
+        {
+            _doneStateEnteredAt.Remove(k);
         }
 
         // 5. Detect transitions for visual events
@@ -845,8 +869,9 @@ public class HqStateAggregator
         switch (scenario)
         {
             case "working":
-                agents.Add(new AgentSnapshot("demo-leader", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "execute", TaskTitle: "Refactoring state engine", IsBotHome: true));
-                agents.Add(new AgentSnapshot("demo-coder", "Minato (Senior Coder)", AgentRole.Coder, "minato", AgentState.Working, ToolName: "compile", TaskTitle: "Writing unit tests", IsBotHome: true));
+                var workAnchor = _demoAnchorTime == default ? now : _demoAnchorTime;
+                agents.Add(new AgentSnapshot("demo-leader", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "execute", TaskTitle: "Refactoring state engine", IsBotHome: true, WorkStartedAt: workAnchor.AddSeconds(-60)));
+                agents.Add(new AgentSnapshot("demo-coder", "Minato (Senior Coder)", AgentRole.Coder, "minato", AgentState.Working, ToolName: "compile", TaskTitle: "Writing unit tests", IsBotHome: true, WorkStartedAt: workAnchor.AddSeconds(-120)));
                 break;
 
             case "approve":
@@ -869,12 +894,17 @@ public class HqStateAggregator
                 break;
 
             case "handoff":
+                var anchor = _demoAnchorTime == default ? now : _demoAnchorTime;
                 agents.Add(new AgentSnapshot("demo-leader", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Idle, IsBotHome: true));
-                agents.Add(new AgentSnapshot("demo-coder", "Minato (Senior Coder)", AgentRole.Coder, "minato", AgentState.Working, ToolName: "compile", TaskTitle: "Refactoring state engine", IsBotHome: true, WorkStartedAt: now.AddSeconds(-45)));
-                agents.Add(new AgentSnapshot("demo-tester", "Tsunade (QA Lead)", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test", TaskTitle: "Integration testing", IsBotHome: true, WorkStartedAt: now.AddSeconds(-10)));
+                agents.Add(new AgentSnapshot("demo-coder", "Minato (Senior Coder)", AgentRole.Coder, "minato", AgentState.Working, ToolName: "compile", TaskTitle: "Refactoring state engine", IsBotHome: true, WorkStartedAt: anchor.AddSeconds(-45)));
+                agents.Add(new AgentSnapshot("demo-tester", "Tsunade (QA Lead)", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test", TaskTitle: "Integration testing", IsBotHome: true, WorkStartedAt: anchor.AddSeconds(-10)));
                 agents.Add(new AgentSnapshot("demo-reviewer", "Kakashi (Code Reviewer)", AgentRole.Reviewer, "kakashi", AgentState.Idle, IsBotHome: true));
-                var handoffSeq = Interlocked.Increment(ref _sequenceCounter);
-                _visualEvents.Add(new HqEvent(handoffSeq, "handoff", "Scroll handoff from Minato to Tsunade", now, "demo-coder", 10.0, "demo-tester"));
+                if (!_demoHandoffEmitted)
+                {
+                    _demoHandoffEmitted = true;
+                    var handoffSeq = Interlocked.Increment(ref _sequenceCounter);
+                    _visualEvents.Add(new HqEvent(handoffSeq, "handoff", "Scroll handoff from Minato to Tsunade", anchor, "demo-coder", 10.0, "demo-tester"));
+                }
                 break;
         }
 

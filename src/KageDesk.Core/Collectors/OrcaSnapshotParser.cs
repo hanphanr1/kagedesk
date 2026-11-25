@@ -133,7 +133,7 @@ public static class OrcaSnapshotParser
         var unread = wt.TryGetProperty("unread", out var unProp) && unProp.GetBoolean();
 
         DateTimeOffset? lastActivityAt = null;
-        if (wt.TryGetProperty("lastActivityAt", out var laProp) && laProp.TryGetInt64(out var laMs) && laMs > 0)
+        if (wt.TryGetProperty("lastActivityAt", out var laProp) && laProp.TryGetInt64Safe(out var laMs) && laMs > 0)
         {
             try { lastActivityAt = DateTimeOffset.FromUnixTimeMilliseconds(laMs); } catch { }
         }
@@ -164,7 +164,7 @@ public static class OrcaSnapshotParser
                     }
 
                     DateTimeOffset? updatedAt = null;
-                    if (ag.TryGetProperty("updatedAt", out var upProp) && upProp.TryGetInt64(out var upMs) && upMs > 0)
+                    if (ag.TryGetProperty("updatedAt", out var upProp) && upProp.TryGetInt64Safe(out var upMs) && upMs > 0)
                     {
                         try { updatedAt = DateTimeOffset.FromUnixTimeMilliseconds(upMs); } catch { }
                     }
@@ -192,12 +192,12 @@ public static class OrcaSnapshotParser
                     if (agentState == AgentState.Working || agentState == AgentState.NeedsApproval)
                     {
                         long startedMs = 0;
-                        if (ag.TryGetProperty("stateStartedAt", out var saProp) && saProp.TryGetInt64(out var ms1) && ms1 > 0)
+                        if (ag.TryGetProperty("stateStartedAt", out var saProp) && saProp.TryGetInt64Safe(out var ms1) && ms1 > 0)
                         {
                             startedMs = ms1;
                         }
                         else if (ag.TryGetProperty("mainAgent", out var maObj) && maObj.ValueKind == JsonValueKind.Object &&
-                                 maObj.TryGetProperty("stateStartedAt", out var maSsProp) && maSsProp.TryGetInt64(out var ms2) && ms2 > 0)
+                                 maObj.TryGetProperty("stateStartedAt", out var maSsProp) && maSsProp.TryGetInt64Safe(out var ms2) && ms2 > 0)
                         {
                             startedMs = ms2;
                         }
@@ -253,12 +253,12 @@ public static class OrcaSnapshotParser
         if (wtState == AgentState.Working || wtState == AgentState.NeedsApproval)
         {
             long startedMs = 0;
-            if (wt.TryGetProperty("stateStartedAt", out var wtSs) && wtSs.TryGetInt64(out var ms1) && ms1 > 0)
+            if (wt.TryGetProperty("stateStartedAt", out var wtSs) && wtSs.TryGetInt64Safe(out var ms1) && ms1 > 0)
             {
                 startedMs = ms1;
             }
             else if (hasWtMa &&
-                     wtMa.TryGetProperty("stateStartedAt", out var wtMaSs) && wtMaSs.TryGetInt64(out var ms2) && ms2 > 0)
+                     wtMa.TryGetProperty("stateStartedAt", out var wtMaSs) && wtMaSs.TryGetInt64Safe(out var ms2) && ms2 > 0)
             {
                 startedMs = ms2;
             }
@@ -420,7 +420,7 @@ public static class OrcaSnapshotParser
                 }
 
                 DateTimeOffset? updatedAt = null;
-                if (item.TryGetProperty("updatedAt", out var upProp) && upProp.TryGetInt64(out var ms) && ms > 0)
+                if (item.TryGetProperty("updatedAt", out var upProp) && upProp.TryGetInt64Safe(out var ms) && ms > 0)
                 {
                     try { updatedAt = DateTimeOffset.FromUnixTimeMilliseconds(ms); } catch { }
                 }
@@ -573,5 +573,21 @@ public static class OrcaSnapshotParser
         }
 
         return accounts;
+    }
+
+    public static bool TryGetInt64Safe(this JsonElement element, out long value)
+    {
+        if (element.ValueKind == JsonValueKind.Number)
+        {
+            return element.TryGetInt64(out value);
+        }
+
+        if (element.ValueKind == JsonValueKind.String)
+        {
+            return long.TryParse(element.GetString(), out value);
+        }
+
+        value = 0;
+        return false;
     }
 }

@@ -325,7 +325,7 @@ public class PetOverlayForm : Form
         float timeSeconds = (float)_stopwatch.Elapsed.TotalSeconds;
         bool showIdle = _idleMode != "off";
 
-        _renderer.Render(_petBuffer, _cachedRenderState, _currentTheme, timeSeconds, showIdle);
+        _renderer.Render(_petBuffer, _cachedRenderState, _currentTheme, timeSeconds, showIdle, DateTimeOffset.UtcNow);
 
         if (_scale == 1)
         {
