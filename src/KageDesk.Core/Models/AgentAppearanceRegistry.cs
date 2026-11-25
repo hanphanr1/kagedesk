@@ -12,7 +12,7 @@ public sealed class AgentAppearanceRegistry
 {
     public static readonly IReadOnlyList<string> RandomizableSprites = new[]
     {
-        "mixi",
+        "dj-synth",
         "neko-dev",
         "cyber-hacker",
         "ronin-dev",
@@ -488,7 +488,7 @@ public sealed class AgentAppearanceRegistry
             chosenSprite = spritePool[_rng.Next(spritePool.Count)];
         }
 
-        // Choose desk rig: strong affinity for Mixi -> RgbStreamerRig when unused, else pick randomly among least-used rigs
+        // Choose desk rig: strong affinity for dj-synth -> RgbStreamerRig when unused, else pick randomly among least-used rigs
         DeskRigKind chosenRig;
         if (preferredRig.HasValue &&
             preferredRig.Value != DeskRigKind.Default &&
@@ -496,8 +496,8 @@ public sealed class AgentAppearanceRegistry
         {
             chosenRig = preferredRig.Value;
         }
-        else if (string.Equals(chosenSprite, "mixi", StringComparison.OrdinalIgnoreCase) &&
-                 (!rigCounts.TryGetValue(DeskRigKind.RgbStreamerRig, out int mixiRigCount) || mixiRigCount == 0))
+        else if (string.Equals(chosenSprite, "dj-synth", StringComparison.OrdinalIgnoreCase) &&
+                 (!rigCounts.TryGetValue(DeskRigKind.RgbStreamerRig, out int djRigCount) || djRigCount == 0))
         {
             chosenRig = DeskRigKind.RgbStreamerRig;
         }

@@ -74,6 +74,31 @@ public sealed class ActorMotionSystem
     private int _activeHandoffStation = -1;
 
     public bool IsHandoffActive => _activeHandoffStation >= 0;
+    public int ActiveHandoffStationIndex => _activeHandoffStation;
+    public string? ActiveHandoffFromAgentId => _activeHandoffStation >= 0 ? _motions[_activeHandoffStation].BoundAgentId : null;
+    public string? ActiveHandoffToAgentId => _activeHandoffStation >= 0 ? _motions[_activeHandoffStation].TargetAgentId : null;
+    public long LastHandledHandoffSeq => _lastHandledHandoffSeq;
+
+    public bool TryGetPendingHandoffEvent(HqState state, out HqEvent handoffEvent)
+    {
+        var events = state.PendingVisualEvents;
+        if (events != null)
+        {
+            for (int i = 0; i < events.Count; i++)
+            {
+                var ev = events[i];
+                if (ev.SequenceId > _lastHandledHandoffSeq &&
+                    string.Equals(ev.Type, "handoff", StringComparison.OrdinalIgnoreCase))
+                {
+                    handoffEvent = ev;
+                    return true;
+                }
+            }
+        }
+
+        handoffEvent = default!;
+        return false;
+    }
 
     public ActorMotionSystem()
     {
@@ -112,7 +137,9 @@ public sealed class ActorMotionSystem
         ReadOnlySpan<SlotBinding> slots,
         int coreDeskY,
         int extraDeskY,
-        ParticleSystem? particles = null)
+        ParticleSystem? particles = null,
+        int rugOffsetY = 22,
+        bool enableAmbientStroll = true)
     {
         // 0. Cancel/reset motion if a moving actor's slot changes or disappears
         for (int i = 0; i < MaxStations; i++)
@@ -152,12 +179,12 @@ public sealed class ActorMotionSystem
         }
 
         // 1. Check for new handoff visual events
-        int newlyStarted = CheckForHandoffEvents(state, slots, coreDeskY, extraDeskY);
+        int newlyStarted = CheckForHandoffEvents(state, slots, coreDeskY, extraDeskY, rugOffsetY);
 
         // 2. Check for ambient idle life stroll
-        if (newlyStarted < 0)
+        if (newlyStarted < 0 && enableAmbientStroll)
         {
-            newlyStarted = CheckForAmbientStroll(dt, state, slots, coreDeskY);
+            newlyStarted = CheckForAmbientStroll(dt, state, slots, coreDeskY, rugOffsetY);
         }
 
         // 3. Update all active motions (do not advance on the frame it was triggered)
@@ -165,7 +192,7 @@ public sealed class ActorMotionSystem
         {
             if (_motions[i].State != ActorMotionState.AtDesk && i != newlyStarted)
             {
-                UpdateStationMotion(i, dt, timeSeconds, slots, particles);
+                UpdateStationMotion(i, dt, timeSeconds, slots, particles, rugOffsetY);
             }
         }
     }
@@ -221,7 +248,8 @@ public sealed class ActorMotionSystem
         HqState state,
         ReadOnlySpan<SlotBinding> slots,
         int coreDeskY,
-        int extraDeskY)
+        int extraDeskY,
+        int rugOffsetY)
     {
         if (_activeHandoffStation >= 0)
             return -1; // Handoff already in progress
@@ -249,7 +277,7 @@ public sealed class ActorMotionSystem
 
                     if (!sameConcreteAgent)
                     {
-                        StartHandoff(fromStation, toStation, slots, coreDeskY, extraDeskY);
+                        StartHandoff(fromStation, toStation, slots, coreDeskY, extraDeskY, rugOffsetY);
                         return fromStation;
                     }
                 }
@@ -263,7 +291,8 @@ public sealed class ActorMotionSystem
         int toStation,
         ReadOnlySpan<SlotBinding> slots,
         int coreDeskY,
-        int extraDeskY)
+        int extraDeskY,
+        int rugOffsetY)
     {
         ref readonly var fromSlot = ref slots[fromStation];
         ref readonly var toSlot = ref slots[toStation];
@@ -273,8 +302,8 @@ public sealed class ActorMotionSystem
         int toDeskX = toSlot.CenterX;
         int toDeskY = toSlot.DeskY;
 
-        int fromRugY = fromDeskY + 22;
-        int toRugY = toDeskY + 22;
+        int fromRugY = fromDeskY + rugOffsetY;
+        int toRugY = toDeskY + rugOffsetY;
         int targetArrivalX = toDeskX + (fromDeskX < toDeskX ? -16 : 16);
 
         bool isMinato = string.Equals(fromSlot.SpriteKey, "minato", StringComparison.OrdinalIgnoreCase);
@@ -319,7 +348,8 @@ public sealed class ActorMotionSystem
         float dt,
         HqState state,
         ReadOnlySpan<SlotBinding> slots,
-        int coreDeskY)
+        int coreDeskY,
+        int rugOffsetY)
     {
         if (_activeHandoffStation >= 0) return -1;
 
@@ -345,7 +375,7 @@ public sealed class ActorMotionSystem
                 ref readonly var slot = ref slots[candidate];
                 int deskX = slot.CenterX;
                 int deskY = slot.DeskY;
-                int rugY = deskY + 22;
+                int rugY = deskY + rugOffsetY;
                 int strollDist = ((int)(NextPrng() % 2) == 0 ? 1 : -1) * (18 + (int)(NextPrng() % 14));
                 int targetX = Math.Clamp(deskX + strollDist, 30, 354);
 
@@ -378,7 +408,8 @@ public sealed class ActorMotionSystem
         float dt,
         float timeSeconds,
         ReadOnlySpan<SlotBinding> slots,
-        ParticleSystem? particles)
+        ParticleSystem? particles,
+        int rugOffsetY)
     {
         ref var m = ref _motions[idx];
 
@@ -402,6 +433,11 @@ public sealed class ActorMotionSystem
                 if (_activeHandoffStation == idx) _activeHandoffStation = -1;
                 return;
             }
+
+            // Keep DeskX/DeskY synced if strip spacing adjusted while sender stayed at same slot index
+            m.DeskX = slots[idx].CenterX;
+            m.DeskY = slots[idx].DeskY;
+            m.RugY = m.DeskY + rugOffsetY;
 
             // 2. Revalidate recipient binding
             if (m.CarryingScroll || m.TargetSlotIndex >= 0)
@@ -454,7 +490,7 @@ public sealed class ActorMotionSystem
                     ref readonly var recSlot = ref slots[currentRecipientSlot];
                     int toDeskX = recSlot.CenterX;
                     int toDeskY = recSlot.DeskY;
-                    int toRugY = toDeskY + 22;
+                    int toRugY = toDeskY + rugOffsetY;
                     int newTargetX = toDeskX + (m.DeskX < toDeskX ? -16 : 16);
                     int newTargetY = toRugY;
 

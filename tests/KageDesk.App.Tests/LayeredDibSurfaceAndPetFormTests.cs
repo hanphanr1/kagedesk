@@ -197,5 +197,77 @@ public class LayeredDibSurfaceAndPetFormTests
         Assert.True(ok2);
         Assert.Equal(1, form.PetScale);
     }
+
+    [Fact]
+    public void PetOverlayForm_AutoHide_ShowsMixiWhenEnabled_AndHidesWhenDisabled()
+    {
+        var theme = ThemePackLoader.BuiltInFallback;
+        using var form = new PetOverlayForm(theme, initialScale: 1, idleMode: "auto-hide", showMixiWhenAllIdle: true);
+        form.Start();
+
+        var allIdleState = new KageDesk.Core.Models.HqState(
+            Agents: new[]
+            {
+                new KageDesk.Core.Models.AgentSnapshot("o1", "Shikamaru", KageDesk.Core.Models.AgentRole.Leader, "shikamaru", KageDesk.Core.Models.AgentState.Idle, Source: "orca", IsBotHome: true)
+            },
+            Accounts: Array.Empty<KageDesk.Core.Models.AccountInfo>(),
+            Builds: Array.Empty<KageDesk.Core.Models.BuildInfo>(),
+            Weather: KageDesk.Core.Models.EffectiveWeather.Day,
+            Mood: KageDesk.Core.Models.HqMood.Calm,
+            PendingVisualEvents: Array.Empty<KageDesk.Core.Models.HqEvent>()
+        );
+
+        // 1. auto-hide + ShowMixiWhenAllIdle=true -> stays visible showing Do Mixi chill corner
+        form.ApplyRenderState(allIdleState, theme, petPaused: false, petHiddenByDndOrLock: false);
+        Assert.True(form.Visible);
+        Assert.True(form.IsMixiChillActive);
+
+        // 2. auto-hide + ShowMixiWhenAllIdle=false -> hides completely when all-idle
+        form.SetShowMixiWhenAllIdle(false);
+        Assert.False(form.Visible);
+
+        // 3. PetIdleMode="off" -> hides even if ShowMixiWhenAllIdle=true
+        form.SetShowMixiWhenAllIdle(true);
+        Assert.True(form.Visible);
+        form.SetIdleMode("off");
+        Assert.False(form.Visible);
+    }
+
+    [Fact]
+    public void DemoHandoff_AnimatesOnTaskbarPet_EvenWhenWallpaperDisabled()
+    {
+        var tempFile = Path.Combine(Path.GetTempPath(), "kagedesk_handoff_nowp_" + Guid.NewGuid().ToString("N"), "config.json");
+        try
+        {
+            var store = new KageDesk.Core.Config.ConfigStore(tempFile);
+            store.Save(new KageDesk.Core.Models.AppConfig
+            {
+                WallpaperEnabled = false,
+                PetOverlayEnabled = true,
+                PetIdleMode = "auto-hide",
+                ShowMixiWhenAllIdle = false
+            });
+
+            using var runtime = new KageDesk.App.Services.KageDeskRuntime(store, noWallpaper: true);
+            Assert.Null(runtime.WallpaperForm);
+            Assert.NotNull(runtime.PetForm);
+
+            runtime.Aggregator.SetDemoScenario("handoff");
+            runtime.SyncUiOnDispatcher();
+            runtime.PetForm!.RenderAndPresent();
+
+            Assert.True(runtime.PetForm.Visible);
+            Assert.True(runtime.PetForm.IsHandoffActive);
+            Assert.False(runtime.PetForm.IsMixiChillActive);
+        }
+        finally
+        {
+            var dir = Path.GetDirectoryName(tempFile);
+            if (Directory.Exists(dir))
+            {
+                try { Directory.Delete(dir, recursive: true); } catch { }
+            }
+        }
+    }
 }
 

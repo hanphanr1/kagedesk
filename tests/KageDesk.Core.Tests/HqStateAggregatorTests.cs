@@ -937,9 +937,8 @@ public class HqStateAggregatorTests
 
     [Theory]
     [InlineData("variety")]
-    [InlineData("mixi")]
     [InlineData("clone")]
-    public void DemoScenario_VarietyMixiClone_IncludesMixiRgbRigAndZeroCloneNames(string scenario)
+    public void DemoScenario_VarietyAndClone_ExcludeMixiAndUseDistinctNonMixiRigs(string scenario)
     {
         var agg = new HqStateAggregator(appearanceSeed: 7);
         agg.SetDemoScenario(scenario);
@@ -947,13 +946,52 @@ public class HqStateAggregatorTests
         var state = agg.GetState();
         Assert.Equal(scenario, state.DemoScenario);
         Assert.All(state.Agents, a => Assert.DoesNotContain("clone", a.Name, StringComparison.OrdinalIgnoreCase));
-        Assert.Contains(state.Agents, a => a.SpriteKey == "mixi" && a.DeskRig == DeskRigKind.RgbStreamerRig);
+        Assert.All(state.Agents, a => Assert.NotEqual("mixi", a.SpriteKey, StringComparer.OrdinalIgnoreCase));
+        Assert.Contains(state.Agents, a => a.SpriteKey == "dj-synth" && a.DeskRig == DeskRigKind.RgbStreamerRig);
 
-        if (scenario is "variety" or "mixi")
+        if (scenario == "variety")
         {
             var rigs = state.Agents.Where(a => a.DeskRig != DeskRigKind.Default).Select(a => a.DeskRig).Distinct().ToList();
             Assert.Equal(5, rigs.Count);
         }
+    }
+
+    [Fact]
+    public void DemoScenario_Mixi_ProducesAllIdleChillCornerScenario()
+    {
+        var agg = new HqStateAggregator(appearanceSeed: 7);
+        agg.SetDemoScenario("mixi");
+
+        var state = agg.GetState();
+        Assert.Equal("mixi", state.DemoScenario);
+        Assert.Equal(HqMood.Calm, state.Mood);
+        Assert.NotEmpty(state.Agents);
+        Assert.All(state.Agents, a => Assert.Equal(AgentState.Idle, a.State));
+        Assert.All(state.Agents, a => Assert.NotEqual("mixi", a.SpriteKey, StringComparer.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void AgentAppearanceRegistry_NeverAssignsMixiToAnyWorkingSession()
+    {
+        Assert.Equal(8, AgentAppearanceRegistry.RandomizableSprites.Count);
+        Assert.DoesNotContain("mixi", AgentAppearanceRegistry.RandomizableSprites, StringComparer.OrdinalIgnoreCase);
+        Assert.False(AgentAppearanceRegistry.IsRandomizableSprite("mixi"));
+
+        var registry = new AgentAppearanceRegistry(seed: 123);
+        var activeIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var assignedSprites = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        for (int i = 0; i < 100; i++)
+        {
+            string id = $"proc:omp:session-{i:D3}";
+            activeIds.Add(id);
+            var appearance = registry.GetOrAssignForNonOrca(id, activeIds, preferredSprite: i % 3 == 0 ? "mixi" : null);
+            Assert.NotEqual("mixi", appearance.SpriteKey, StringComparer.OrdinalIgnoreCase);
+            Assert.True(AgentAppearanceRegistry.IsRandomizableSprite(appearance.SpriteKey));
+            assignedSprites.Add(appearance.SpriteKey);
+        }
+
+        Assert.Equal(8, assignedSprites.Count);
     }
 
     [Fact]

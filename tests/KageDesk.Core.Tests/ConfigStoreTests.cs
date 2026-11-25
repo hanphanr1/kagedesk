@@ -21,6 +21,7 @@ public class ConfigStoreTests
             Assert.Equal(4319, config.LocalBridgePort);
             Assert.Equal(WeatherMode.Auto, config.WeatherMode);
             Assert.Equal("shinobi-hq", config.ActiveThemeId);
+            Assert.True(config.ShowMixiWhenAllIdle);
             Assert.True(File.Exists(tempFile));
         }
         finally
@@ -50,7 +51,8 @@ public class ConfigStoreTests
                 EnableProcessAgentCollector = true,
                 EnableGitHubCiCollector = true,
                 GitHubRepos = new List<string> { "hanphanr1/kagedesk" },
-                CelebrationDurationSeconds = 10.0
+                CelebrationDurationSeconds = 10.0,
+                ShowMixiWhenAllIdle = false
             };
 
             store.Save(customConfig);
@@ -68,6 +70,7 @@ public class ConfigStoreTests
             Assert.Single(loaded.GitHubRepos);
             Assert.Equal("hanphanr1/kagedesk", loaded.GitHubRepos[0]);
             Assert.Equal(10.0, loaded.CelebrationDurationSeconds);
+            Assert.False(loaded.ShowMixiWhenAllIdle);
         }
         finally
         {

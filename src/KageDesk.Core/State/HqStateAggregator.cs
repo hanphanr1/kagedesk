@@ -929,24 +929,31 @@ public class HqStateAggregator
             case "clone":
                 var cloneAnchor = _demoAnchorTime == default ? now : _demoAnchorTime;
                 agents.Add(new AgentSnapshot("demo-leader", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "execute", IsBotHome: true, Source: "orca", WorkStartedAt: cloneAnchor.AddSeconds(-40)));
-                agents.Add(new AgentSnapshot("demo-term-1", "OMP", AgentRole.External, "mixi", AgentState.Working, ToolName: "edit", Source: "process", WorkStartedAt: cloneAnchor.AddSeconds(-30), DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0));
+                agents.Add(new AgentSnapshot("demo-term-1", "OMP", AgentRole.External, "dj-synth", AgentState.Working, ToolName: "edit", Source: "process", WorkStartedAt: cloneAnchor.AddSeconds(-30), DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0));
                 agents.Add(new AgentSnapshot("demo-term-2", "Claude", AgentRole.External, "neko-dev", AgentState.Working, ToolName: "test", Source: "process", WorkStartedAt: cloneAnchor.AddSeconds(-20), DeskRig: DeskRigKind.CozyLofiRig, BehaviorVariant: 1));
                 agents.Add(new AgentSnapshot("demo-term-3", "Codex", AgentRole.External, "cyber-hacker", AgentState.Working, ToolName: "build", Source: "process", WorkStartedAt: cloneAnchor.AddSeconds(-15), DeskRig: DeskRigKind.CyberConsoleRig, BehaviorVariant: 2));
                 agents.Add(new AgentSnapshot("demo-term-4", "AGY", AgentRole.External, "ronin-dev", AgentState.Working, ToolName: "search", Source: "process", WorkStartedAt: cloneAnchor.AddSeconds(-10), DeskRig: DeskRigKind.RetroCrtRig, BehaviorVariant: 0));
                 break;
 
             case "variety":
-            case "mixi":
-                var mixiAnchor = _demoAnchorTime == default ? now : _demoAnchorTime;
+                var varAnchor = _demoAnchorTime == default ? now : _demoAnchorTime;
                 agents.Add(new AgentSnapshot("demo-leader", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Idle, IsBotHome: true, Source: "orca", BehaviorVariant: 0));
-                agents.Add(new AgentSnapshot("demo-coder", "Minato (Senior Coder)", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", TaskTitle: "Core engine", IsBotHome: true, Source: "orca", WorkStartedAt: mixiAnchor.AddSeconds(-75), BehaviorVariant: 1));
+                agents.Add(new AgentSnapshot("demo-coder", "Minato (Senior Coder)", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", TaskTitle: "Core engine", IsBotHome: true, Source: "orca", WorkStartedAt: varAnchor.AddSeconds(-75), BehaviorVariant: 1));
                 agents.Add(new AgentSnapshot("demo-tester", "Tsunade (QA Lead)", AgentRole.Tester, "tsunade", AgentState.Idle, IsBotHome: true, Source: "orca", BehaviorVariant: 2));
                 agents.Add(new AgentSnapshot("demo-reviewer", "Kakashi (Code Reviewer)", AgentRole.Reviewer, "kakashi", AgentState.Idle, IsBotHome: true, Source: "orca", BehaviorVariant: 0));
-                agents.Add(new AgentSnapshot("demo-mixi", "OMP", AgentRole.Coder, "mixi", AgentState.Working, ToolName: "edit", TaskTitle: "Do Mixi Gaming stream setup", Source: "process", WorkStartedAt: mixiAnchor.AddSeconds(-55), DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0));
-                agents.Add(new AgentSnapshot("demo-var-2", "OMP 2", AgentRole.Coder, "neko-dev", AgentState.Working, ToolName: "thinking", TaskTitle: "Lo-fi shader tuning", Source: "process", WorkStartedAt: mixiAnchor.AddSeconds(-35), DeskRig: DeskRigKind.CozyLofiRig, BehaviorVariant: 1));
-                agents.Add(new AgentSnapshot("demo-var-3", "Claude", AgentRole.Coder, "cyber-hacker", AgentState.Working, ToolName: "exec", TaskTitle: "Running benchmarks", Source: "process", WorkStartedAt: mixiAnchor.AddSeconds(-25), DeskRig: DeskRigKind.CyberConsoleRig, BehaviorVariant: 2));
-                agents.Add(new AgentSnapshot("demo-var-4", "Codex", AgentRole.Coder, "astro-dev", AgentState.Working, ToolName: "git", TaskTitle: "Branch sync", Source: "process", WorkStartedAt: mixiAnchor.AddSeconds(-15), DeskRig: DeskRigKind.RetroCrtRig, BehaviorVariant: 1));
+                agents.Add(new AgentSnapshot("demo-var-1", "OMP", AgentRole.Coder, "dj-synth", AgentState.Working, ToolName: "edit", TaskTitle: "Synthwave shader pass", Source: "process", WorkStartedAt: varAnchor.AddSeconds(-55), DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0));
+                agents.Add(new AgentSnapshot("demo-var-2", "OMP 2", AgentRole.Coder, "neko-dev", AgentState.Working, ToolName: "thinking", TaskTitle: "Lo-fi shader tuning", Source: "process", WorkStartedAt: varAnchor.AddSeconds(-35), DeskRig: DeskRigKind.CozyLofiRig, BehaviorVariant: 1));
+                agents.Add(new AgentSnapshot("demo-var-3", "Claude", AgentRole.Coder, "cyber-hacker", AgentState.Working, ToolName: "exec", TaskTitle: "Running benchmarks", Source: "process", WorkStartedAt: varAnchor.AddSeconds(-25), DeskRig: DeskRigKind.CyberConsoleRig, BehaviorVariant: 2));
+                agents.Add(new AgentSnapshot("demo-var-4", "Codex", AgentRole.Coder, "astro-dev", AgentState.Working, ToolName: "git", TaskTitle: "Branch sync", Source: "process", WorkStartedAt: varAnchor.AddSeconds(-15), DeskRig: DeskRigKind.RetroCrtRig, BehaviorVariant: 1));
                 agents.Add(new AgentSnapshot("demo-var-5", "AGY", AgentRole.External, "mecha-droid", AgentState.Idle, TaskTitle: "Standby console", Source: "process", DeskRig: DeskRigKind.DualMonitorRig, BehaviorVariant: 2));
+                break;
+
+            case "mixi":
+                // Exclusive All-Idle Do Mixi Gaming Chill Mode demo (all shinobi off-duty/idle)
+                agents.Add(new AgentSnapshot("demo-leader", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Idle, IsBotHome: true, Source: "orca", BehaviorVariant: 0));
+                agents.Add(new AgentSnapshot("demo-coder", "Minato (Senior Coder)", AgentRole.Coder, "minato", AgentState.Idle, IsBotHome: true, Source: "orca", BehaviorVariant: 1));
+                agents.Add(new AgentSnapshot("demo-tester", "Tsunade (QA Lead)", AgentRole.Tester, "tsunade", AgentState.Idle, IsBotHome: true, Source: "orca", BehaviorVariant: 2));
+                agents.Add(new AgentSnapshot("demo-reviewer", "Kakashi (Code Reviewer)", AgentRole.Reviewer, "kakashi", AgentState.Idle, IsBotHome: true, Source: "orca", BehaviorVariant: 0));
                 break;
 
             case "handoff":

@@ -161,15 +161,24 @@ public static class DemoGifRecorder
 
             case "clone":
             case "variety":
-            case "mixi":
             {
                 agents.Add(new AgentSnapshot("demo-leader", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "command", TaskTitle: "Leader", IsBotHome: true, Source: "orca", WorkStartedAt: baseTime.AddSeconds(-40)));
-                agents.Add(new AgentSnapshot("demo-term-1", "OMP", AgentRole.External, "mixi", AgentState.Working, ToolName: "edit", Source: "process", WorkStartedAt: baseTime.AddSeconds(-30), DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0));
+                agents.Add(new AgentSnapshot("demo-term-1", "OMP", AgentRole.External, "dj-synth", AgentState.Working, ToolName: "edit", Source: "process", WorkStartedAt: baseTime.AddSeconds(-30), DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0));
                 agents.Add(new AgentSnapshot("demo-term-2", "Claude", AgentRole.External, "neko-dev", AgentState.Working, ToolName: "test", Source: "process", WorkStartedAt: baseTime.AddSeconds(-20), DeskRig: DeskRigKind.CozyLofiRig, BehaviorVariant: 1));
                 agents.Add(new AgentSnapshot("demo-term-3", "Codex", AgentRole.External, "cyber-hacker", AgentState.Working, ToolName: "build", Source: "process", WorkStartedAt: baseTime.AddSeconds(-15), DeskRig: DeskRigKind.CyberConsoleRig, BehaviorVariant: 2));
                 agents.Add(new AgentSnapshot("demo-term-4", "AGY", AgentRole.External, "ronin-dev", AgentState.Working, ToolName: "search", Source: "process", WorkStartedAt: baseTime.AddSeconds(-10), DeskRig: DeskRigKind.RetroCrtRig, BehaviorVariant: 0));
                 agents.Add(new AgentSnapshot("demo-term-5", "OMP 2", AgentRole.External, "astro-dev", AgentState.Working, ToolName: "execute", Source: "process", WorkStartedAt: baseTime.AddSeconds(-8), DeskRig: DeskRigKind.DualMonitorRig, BehaviorVariant: 1));
                 mood = HqMood.Busy;
+                break;
+            }
+
+            case "mixi":
+            {
+                agents.Add(new AgentSnapshot("demo-leader", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle, IsBotHome: true, Source: "orca"));
+                agents.Add(new AgentSnapshot("demo-coder", "Minato", AgentRole.Coder, "minato", AgentState.Idle, IsBotHome: true, Source: "orca"));
+                agents.Add(new AgentSnapshot("demo-tester", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Idle, IsBotHome: true, Source: "orca"));
+                agents.Add(new AgentSnapshot("demo-reviewer", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle, IsBotHome: true, Source: "orca"));
+                mood = HqMood.Calm;
                 break;
             }
 

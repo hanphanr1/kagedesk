@@ -22,4 +22,5 @@ public class AppConfig
     public int TargetFps { get; set; } = 15;
     public bool LaunchOnStartup { get; set; } = false;
     public bool SoundEnabled { get; set; } = true;
+    public bool ShowMixiWhenAllIdle { get; set; } = true;
 }

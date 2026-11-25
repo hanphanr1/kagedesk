@@ -18,9 +18,12 @@ public class WallpaperHostForm : Form
 
     private HqState _currentState;
     private ThemePack _currentTheme;
+    private bool _showMixiWhenAllIdle = true;
     private bool _isAttached;
     private bool _isPaused;
     private bool _disposed;
+
+    public bool ShowMixiWhenAllIdle => _showMixiWhenAllIdle;
 
     public bool IsAttached
     {
@@ -70,9 +73,10 @@ public class WallpaperHostForm : Form
 
     protected override bool ShowWithoutActivation => true;
 
-    public WallpaperHostForm(ThemePack initialTheme, int targetFps = 15)
+    public WallpaperHostForm(ThemePack initialTheme, int targetFps = 15, bool showMixiWhenAllIdle = true)
     {
         _currentTheme = initialTheme ?? throw new ArgumentNullException(nameof(initialTheme));
+        _showMixiWhenAllIdle = showMixiWhenAllIdle;
         _currentState = new HqState(
             Agents: Array.Empty<AgentSnapshot>(),
             Accounts: Array.Empty<AccountInfo>(),
@@ -122,6 +126,11 @@ public class WallpaperHostForm : Form
         _currentTheme = theme ?? _currentTheme;
     }
 
+    public void SetShowMixiWhenAllIdle(bool enabled)
+    {
+        _showMixiWhenAllIdle = enabled;
+    }
+
     internal ReadOnlySpan<int> CurrentFramePixels => _buffer.ReadOnlyPixels;
 
     public void RenderFrameNow()
@@ -129,7 +138,7 @@ public class WallpaperHostForm : Form
         if (_disposed) return;
 
         float timeSeconds = (float)_stopwatch.Elapsed.TotalSeconds;
-        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds, DateTimeOffset.UtcNow);
+        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds, DateTimeOffset.UtcNow, _showMixiWhenAllIdle);
         Invalidate();
     }
 
@@ -144,7 +153,7 @@ public class WallpaperHostForm : Form
         if (_isPaused || _disposed || (!Visible && !_isAttached)) return;
 
         float timeSeconds = (float)_stopwatch.Elapsed.TotalSeconds;
-        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds, DateTimeOffset.UtcNow);
+        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds, DateTimeOffset.UtcNow, _showMixiWhenAllIdle);
         Invalidate();
     }
 

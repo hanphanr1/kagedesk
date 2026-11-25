@@ -73,10 +73,14 @@ public sealed class HqWallpaperRenderer
     private string? _cachedPrimaryWorkflow;
     private string? _cachedBranchText;
     private HqState? _lastAssignedState;
+    private bool _lastShowMixiCorner;
     private int _cachedExtraCount;
     private AccountInfo? _cachedActiveAccount;
     private string? _cachedFirstAgentRepo;
     private readonly AgentSnapshot?[] _coreAssigned = new AgentSnapshot?[4];
+
+    public bool IsMixiChillActive { get; private set; }
+    public MixiChillActivity? ActiveMixiActivity { get; private set; }
 
     public void ResetEffects()
     {
@@ -86,9 +90,18 @@ public sealed class HqWallpaperRenderer
         _emitAccum = 0f;
         _lastCloneCount = 0;
         _lastAssignedState = null;
+        _lastShowMixiCorner = false;
+        IsMixiChillActive = false;
+        ActiveMixiActivity = null;
     }
 
-    public void Render(PixelBuffer buf, HqState state, ThemePack theme, float timeSeconds, DateTimeOffset? nowOverride = null)
+    public void Render(
+        PixelBuffer buf,
+        HqState state,
+        ThemePack theme,
+        float timeSeconds,
+        DateTimeOffset? nowOverride = null,
+        bool showMixiWhenAllIdle = true)
     {
         if (buf.Width < CanvasWidth || buf.Height < CanvasHeight)
         {
@@ -110,20 +123,25 @@ public sealed class HqWallpaperRenderer
         float dt = _lastTime < 0f ? 0.033f : Math.Clamp(timeSeconds - _lastTime, 0f, 0.2f);
         _lastTime = timeSeconds;
 
+        bool showMixiCorner = MixiChillRenderer.ShouldRenderMixiChillCorner(state, showMixiWhenAllIdle, _motionSystem.IsHandoffActive);
+        IsMixiChillActive = showMixiCorner;
+
         int extraCount;
-        if (!ReferenceEquals(state, _lastAssignedState))
+        if (!ReferenceEquals(state, _lastAssignedState) || _lastShowMixiCorner != showMixiCorner)
         {
             _lastAssignedState = state;
-            _cachedExtraCount = AssignStations(state);
+            _lastShowMixiCorner = showMixiCorner;
+            _cachedExtraCount = AssignStations(state, showMixiCorner);
         }
-        extraCount = _cachedExtraCount;
+        extraCount = showMixiCorner ? 0 : _cachedExtraCount;
 
         bool hasExtraRow = extraCount > 0;
+        bool hasSecondZone = hasExtraRow || showMixiCorner;
         bool anyApproval = false;
         int approvalAlertX = -1;
         int approvalAlertY = -1;
 
-        int coreDeskY = hasExtraRow ? 104 : 126;
+        int coreDeskY = hasSecondZone ? 104 : 126;
         int extraDeskY = 168;
 
         for (int i = 0; i < 4; i++)
@@ -146,7 +164,7 @@ public sealed class HqWallpaperRenderer
         }
 
         // 1. Walls & Floor & Rug
-        DrawRoomBackdrop(buf, timeSeconds, hasExtraRow);
+        DrawRoomBackdrop(buf, timeSeconds, hasSecondZone);
 
         // 2. Top Wall Boards & Weather Window
         DrawAccountsBoard(buf, state, timeSeconds);
@@ -154,7 +172,7 @@ public sealed class HqWallpaperRenderer
         DrawBuildCiBoard(buf, state, timeSeconds);
 
         // 3. Theme-Specific Room Decor Props (scroll/bonsai, server racks, desk lamp/cat)
-        DrawThemeProps(buf, timeSeconds, hasExtraRow);
+        DrawThemeProps(buf, timeSeconds, hasSecondZone);
 
         // 4. Emit & Update Particles (zero-alloc)
         UpdateStationParticles(dt, extraCount, coreDeskY, extraDeskY, state);
@@ -184,7 +202,9 @@ public sealed class HqWallpaperRenderer
             _slotBindings.AsSpan(0, slotCount),
             coreDeskY,
             extraDeskY,
-            _particles);
+            _particles,
+            rugOffsetY: 22,
+            enableAmbientStroll: !showMixiCorner);
 
         // 5. Row 1: 4 Core Character Workstations
         for (int i = 0; i < 4; i++)
@@ -192,11 +212,21 @@ public sealed class HqWallpaperRenderer
             DrawWorkstation(buf, ref _coreSlots[i], CoreStationCentersX[i], coreDeskY, timeSeconds, i, now);
         }
 
-        // 6. Row 2: Dynamic Clone / External Workstations (up to 5)
-        for (int i = 0; i < extraCount; i++)
+        // 6. Row 2: Exclusive All-Idle Do Mixi Gaming Chill Corner OR Dynamic External Workstations
+        if (showMixiCorner)
         {
-            int cx = GetExtraStationCenterX(i, extraCount);
-            DrawWorkstation(buf, ref _extraSlots[i], cx, extraDeskY, timeSeconds, i + 4, now);
+            MixiChillActivity activity = MixiChillRenderer.DrawChillCorner(buf, cx: 192, groundY: 191, timeSeconds);
+            ActiveMixiActivity = activity;
+            DrawMixiChillNameplate(buf, cx: 192, y: 194, activity);
+        }
+        else
+        {
+            ActiveMixiActivity = null;
+            for (int i = 0; i < extraCount; i++)
+            {
+                int cx = GetExtraStationCenterX(i, extraCount);
+                DrawWorkstation(buf, ref _extraSlots[i], cx, extraDeskY, timeSeconds, i + 4, now);
+            }
         }
 
         // 7. Render Active Particles on top
@@ -209,7 +239,20 @@ public sealed class HqWallpaperRenderer
         }
     }
 
-    private int AssignStations(HqState state)
+    private void DrawMixiChillNameplate(PixelBuffer buf, int cx, int y, MixiChillActivity activity)
+    {
+        string badge = MixiChillRenderer.GetShortBadge(activity);
+        ReadOnlySpan<char> nameSpan = "DO MIXI".AsSpan();
+        ReadOnlySpan<char> badgeSpan = badge.AsSpan();
+        var layout = ComputeNameplateLayout(cx, y, nameSpan, badgeSpan, 112);
+
+        buf.DrawPixelCard(layout.X, layout.Y, layout.TotalWidth, layout.Height, _palette.BoardBg, ColorCrimson);
+        PixelFont.DrawTextTruncated(buf, layout.X + 3, layout.Y + 3, layout.NameAvailableWidth, nameSpan, ColorWhite, PixelFontSize.Small);
+        buf.FillRect(layout.BadgeX, layout.Y + 1, layout.BadgeWidth, layout.BadgeHeight, ColorCrimsonDark);
+        PixelFont.DrawText(buf, layout.BadgeX + 2, layout.Y + 3, badgeSpan, ColorAmberBright, PixelFontSize.Small);
+    }
+
+    private int AssignStations(HqState state, bool showMixiCorner)
     {
         for (int i = 0; i < 4; i++)
         {
@@ -315,8 +358,8 @@ public sealed class HqWallpaperRenderer
             };
         }
 
-        bool hasExtraRow = extraCount > 0;
-        int coreDeskY = hasExtraRow ? 104 : 126;
+        bool hasSecondZone = extraCount > 0 || showMixiCorner;
+        int coreDeskY = hasSecondZone ? 104 : 126;
         int extraDeskY = 168;
 
         int coreY = coreDeskY + 20;

@@ -214,9 +214,9 @@ public class TaskbarPetRendererTests
             new AgentSnapshot("proc:omp:100", "OMP", AgentRole.Coder, "omp", AgentState.Idle, Source: "process", ProcessId: 100),
             new AgentSnapshot("proc:agy:200", "AGY", AgentRole.Leader, "agy", AgentState.Idle, Source: "process", ProcessId: 200));
 
-        IReadOnlyList<PetHitRegion> regions = renderer.Render(buf, state, ThemePackLoader.BuiltInFallback, 1.0f, showIdleChill: true);
+        IReadOnlyList<PetHitRegion> regions = renderer.Render(buf, state, ThemePackLoader.BuiltInFallback, 1.0f, showIdleChill: true, showMixiWhenAllIdle: false);
 
-        // Primary (Kakashi) + 2 live idle terminal agents
+        // Primary (Kakashi) + 2 live idle terminal agents when Do Mixi idle mode is disabled
         Assert.Contains(regions, r => r.ActionId == "agent:proc:omp:100");
         Assert.Contains(regions, r => r.ActionId == "agent:proc:agy:200");
         Assert.All(regions, AssertValidRegionInBounds);
@@ -350,6 +350,281 @@ public class TaskbarPetRendererTests
         }
 
         Assert.Equal(8, checksums.Count);
+    }
+
+    [Fact]
+    public void Render_LivingHandoff_WalksHorizontallyWithScrollMinatoFlashAndReturnsToDesk()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        var agents = new[]
+        {
+            new AgentSnapshot("demo-coder", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", Source: "orca", IsBotHome: true, WorkStartedAt: now),
+            new AgentSnapshot("demo-tester", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test", Source: "orca", IsBotHome: true, WorkStartedAt: now)
+        };
+
+        var handoffEvent = new HqEvent(
+            SequenceId: 101,
+            Type: "handoff",
+            Message: "Minato -> Tsunade: PR ready",
+            Timestamp: now,
+            AgentId: "demo-coder",
+            TargetAgentId: "demo-tester",
+            FromIsConcreteId: true,
+            ToIsConcreteId: true);
+
+        var state = new HqState(
+            Agents: agents,
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: new[] { handoffEvent },
+            Timestamp: now);
+
+        bool sawWalking = false;
+        bool sawMinatoFlashTrail = false;
+        bool sawScroll = false;
+        bool sawDelivering = false;
+        bool sawWalkingBack = false;
+        int minOffsetX = 0;
+        int maxOffsetX = 0;
+        long baselineChecksum = 0;
+        long midWalkChecksum = 0;
+
+        for (int frame = 0; frame <= 60; frame++)
+        {
+            float t = frame * 0.1f;
+            var regions = renderer.Render(buf, state, theme, t, showIdleChill: true, nowOverride: now.AddSeconds(t));
+            Assert.All(regions, AssertValidRegionInBounds);
+            Assert.True(ComputeTransparentRatio(buf) > 0.55, $"Frame {frame}: expected transparent background ratio > 0.55");
+
+            if (frame == 0) baselineChecksum = ComputeChecksum(buf);
+
+            int activeIdx = renderer.MotionSystem.ActiveHandoffStationIndex;
+            if (activeIdx >= 0)
+            {
+                var m = renderer.MotionSystem.GetMotion(activeIdx);
+                minOffsetX = Math.Min(minOffsetX, m.OffsetX);
+                maxOffsetX = Math.Max(maxOffsetX, m.OffsetX);
+
+                if (m.State == KageDesk.Rendering.Sprites.ActorMotionState.WalkingToTarget)
+                {
+                    sawWalking = true;
+                    if (m.CarryingScroll) sawScroll = true;
+                    if (m.IsFlashTrail) sawMinatoFlashTrail = true;
+                    if (midWalkChecksum == 0 && Math.Abs(m.OffsetX) > 12)
+                    {
+                        midWalkChecksum = ComputeChecksum(buf);
+                    }
+                }
+                else if (m.State == KageDesk.Rendering.Sprites.ActorMotionState.Delivering)
+                {
+                    sawDelivering = true;
+                }
+                else if (m.State == KageDesk.Rendering.Sprites.ActorMotionState.WalkingBack)
+                {
+                    sawWalkingBack = true;
+                }
+            }
+        }
+
+        Assert.True(sawWalking, "Expected sender to enter WalkingToTarget state on Taskbar Pet.");
+        Assert.True(sawScroll, "Expected walking sender to carry glowing scroll on Taskbar Pet.");
+        Assert.True(sawMinatoFlashTrail, "Expected Minato sender to trigger golden Hiraishin flash trail on Taskbar Pet.");
+        Assert.True(sawDelivering, "Expected sender to pause and deliver at recipient desk.");
+        Assert.True(sawWalkingBack, "Expected sender to walk back to own desk after delivery.");
+        Assert.True(maxOffsetX - minOffsetX >= 30, $"Expected clear horizontal walk travel across taskbar strip, got span {maxOffsetX - minOffsetX}px.");
+        Assert.NotEqual(0, midWalkChecksum);
+        Assert.NotEqual(baselineChecksum, midWalkChecksum);
+        Assert.False(renderer.IsHandoffActive, "Expected handoff to complete and return cleanly to AtDesk.");
+    }
+
+    [Fact]
+    public void Render_LivingHandoff_GuaranteesBothSenderAndRecipientInStrip_EvenWithMoreThanSixAgentsOrDoneSender()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        // 7 working agents + 1 Done sender ("sender-done") handing off to the 7th working agent ("recipient-late")
+        var agents = new[]
+        {
+            new AgentSnapshot("w1", "OMP 1", AgentRole.External, "dj-synth", AgentState.Working, Source: "process"),
+            new AgentSnapshot("w2", "OMP 2", AgentRole.External, "neko-dev", AgentState.Working, Source: "process"),
+            new AgentSnapshot("w3", "OMP 3", AgentRole.External, "cyber-hacker", AgentState.Working, Source: "process"),
+            new AgentSnapshot("w4", "OMP 4", AgentRole.External, "ronin-dev", AgentState.Working, Source: "process"),
+            new AgentSnapshot("w5", "OMP 5", AgentRole.External, "astro-dev", AgentState.Working, Source: "process"),
+            new AgentSnapshot("w6", "OMP 6", AgentRole.External, "wizard-dev", AgentState.Working, Source: "process"),
+            new AgentSnapshot("recipient-late", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, Source: "orca", IsBotHome: true),
+            new AgentSnapshot("sender-done", "Minato", AgentRole.Coder, "minato", AgentState.Done, Source: "orca", IsBotHome: true)
+        };
+
+        var handoffEvent = new HqEvent(
+            SequenceId: 202,
+            Type: "handoff",
+            Message: "Minato -> Tsunade: Verify",
+            Timestamp: now,
+            AgentId: "sender-done",
+            TargetAgentId: "recipient-late",
+            FromIsConcreteId: true,
+            ToIsConcreteId: true);
+
+        var state = new HqState(
+            Agents: agents,
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: new[] { handoffEvent },
+            Timestamp: now);
+
+        var regions = renderer.Render(buf, state, theme, 0.2f, showIdleChill: true, nowOverride: now);
+        Assert.True(renderer.IsHandoffActive);
+        Assert.Contains(regions, r => r.ActionId == "agent:sender-done");
+        Assert.Contains(regions, r => r.ActionId == "agent:recipient-late");
+        Assert.All(regions, AssertValidRegionInBounds);
+    }
+
+    [Fact]
+    public void Render_LivingHandoff_ConcreteRecipientDepartsMidWalk_WalksBackWithoutDeliveringToReplacement()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        var initialAgents = new[]
+        {
+            new AgentSnapshot("sender-1", "Minato", AgentRole.Coder, "minato", AgentState.Working, Source: "orca", IsBotHome: true),
+            new AgentSnapshot("recipient-1", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, Source: "orca", IsBotHome: true)
+        };
+
+        var handoffEvent = new HqEvent(
+            SequenceId: 303,
+            Type: "handoff",
+            Message: "Minato -> Tsunade",
+            Timestamp: now,
+            AgentId: "sender-1",
+            TargetAgentId: "recipient-1",
+            FromIsConcreteId: true,
+            ToIsConcreteId: true);
+
+        var stateInitial = new HqState(
+            Agents: initialAgents,
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: new[] { handoffEvent },
+            Timestamp: now);
+
+        // Advance into WalkingToTarget
+        for (int i = 0; i < 6; i++)
+        {
+            renderer.Render(buf, stateInitial, theme, i * 0.1f, showIdleChill: true, nowOverride: now.AddSeconds(i * 0.1));
+        }
+        Assert.True(renderer.IsHandoffActive);
+
+        // Now recipient-1 disappears and is replaced by a different concrete agent id with the same sprite
+        var replacementState = stateInitial with
+        {
+            Agents = new[]
+            {
+                new AgentSnapshot("sender-1", "Minato", AgentRole.Coder, "minato", AgentState.Working, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("recipient-other", "Tsunade 2", AgentRole.Tester, "tsunade", AgentState.Working, Source: "orca", IsBotHome: true)
+            },
+            PendingVisualEvents = Array.Empty<HqEvent>()
+        };
+
+        bool everDelivered = false;
+        bool sawWalkBack = false;
+        for (int i = 6; i < 40; i++)
+        {
+            renderer.Render(buf, replacementState, theme, i * 0.1f, showIdleChill: true, nowOverride: now.AddSeconds(i * 0.1));
+            int activeIdx = renderer.MotionSystem.ActiveHandoffStationIndex;
+            if (activeIdx >= 0)
+            {
+                var st = renderer.MotionSystem.GetMotion(activeIdx).State;
+                if (st == KageDesk.Rendering.Sprites.ActorMotionState.Delivering) everDelivered = true;
+                if (st == KageDesk.Rendering.Sprites.ActorMotionState.WalkingBack) sawWalkBack = true;
+            }
+        }
+
+        Assert.False(everDelivered, "Concrete recipient vanished — sender must NOT deliver to a replacement agent.");
+        Assert.True(sawWalkBack, "Expected sender to smoothly walk back to desk when concrete recipient departed.");
+    }
+
+    [Fact]
+    public void Render_AllIdle_WithShowMixiEnabled_RendersExclusiveDoMixiAcrossAllFiveActivities()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+
+        var idleState = MakeState(
+            new AgentSnapshot("o1", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle, Source: "orca", IsBotHome: true),
+            new AgentSnapshot("o2", "Minato", AgentRole.Coder, "minato", AgentState.Idle, Source: "orca", IsBotHome: true));
+
+        var checksums = new HashSet<long>();
+        var labels = new HashSet<string>();
+        var activities = new HashSet<KageDesk.Rendering.Sprites.MixiChillActivity>();
+        float[] sampleTimes = { 1.0f, 9.0f, 17.0f, 25.0f, 33.0f };
+
+        foreach (float t in sampleTimes)
+        {
+            var regions = renderer.Render(buf, idleState, theme, t, showIdleChill: true, showMixiWhenAllIdle: true);
+            Assert.True(renderer.IsMixiChillActive);
+            Assert.NotNull(renderer.ActiveMixiActivity);
+            activities.Add(renderer.ActiveMixiActivity!.Value);
+
+            var hit = Assert.Single(regions);
+            Assert.Equal("agent:mixi-chill", hit.ActionId);
+            Assert.StartsWith("DO MIXI", hit.Label);
+            AssertValidRegionInBounds(hit);
+            Assert.True(ComputeTransparentRatio(buf) > 0.65);
+
+            labels.Add(hit.Label!);
+            checksums.Add(ComputeChecksum(buf));
+        }
+
+        Assert.Equal(5, activities.Count);
+        Assert.Equal(5, labels.Count);
+        Assert.Equal(5, checksums.Count);
+    }
+
+    [Fact]
+    public void Render_AllIdleToActiveTransition_ImmediatelyHidesDoMixi()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+
+        var allIdleState = MakeState(
+            new AgentSnapshot("o1", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle, Source: "orca", IsBotHome: true));
+
+        renderer.Render(buf, allIdleState, theme, 1.0f, showIdleChill: true, showMixiWhenAllIdle: true);
+        Assert.True(renderer.IsMixiChillActive);
+
+        // Any active agent (Orca or CLI) immediately hides Do Mixi
+        var workingState = MakeState(
+            new AgentSnapshot("o1", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle, Source: "orca", IsBotHome: true),
+            new AgentSnapshot("proc:omp:1", "OMP", AgentRole.External, "dj-synth", AgentState.Working, ToolName: "edit", Source: "process"));
+
+        var workingRegions = renderer.Render(buf, workingState, theme, 2.0f, showIdleChill: true, showMixiWhenAllIdle: true);
+        Assert.False(renderer.IsMixiChillActive);
+        Assert.DoesNotContain(workingRegions, r => r.ActionId == "agent:mixi-chill");
+        Assert.Contains(workingRegions, r => r.ActionId == "agent:proc:omp:1");
+
+        // DemoScenario == "mixi" forces Do Mixi Chill Mode even if showMixiWhenAllIdle == false
+        var demoMixiState = allIdleState with { DemoScenario = "mixi" };
+        var demoRegions = renderer.Render(buf, demoMixiState, theme, 3.0f, showIdleChill: true, showMixiWhenAllIdle: false);
+        Assert.True(renderer.IsMixiChillActive);
+        Assert.Contains(demoRegions, r => r.ActionId == "agent:mixi-chill");
     }
 
     private static long ComputeChecksum(PixelBuffer buf)

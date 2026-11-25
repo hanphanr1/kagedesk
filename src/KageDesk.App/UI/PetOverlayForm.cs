@@ -21,6 +21,7 @@ public class PetOverlayForm : Form
     private ThemePack _currentTheme;
     private int _scale = 2;
     private string _idleMode = "chill"; // "chill" | "auto-hide" | "off"
+    private bool _showMixiWhenAllIdle = true;
     private int? _petX;
     private bool _isPaused;
     private bool _isHiddenByDndOrLock;
@@ -34,6 +35,9 @@ public class PetOverlayForm : Form
     public int PetScale => _scale;
     public int? PetX => _petX;
     public string IdleMode => _idleMode;
+    public bool ShowMixiWhenAllIdle => _showMixiWhenAllIdle;
+    public bool IsHandoffActive => _renderer.IsHandoffActive;
+    public bool IsMixiChillActive => _renderer.IsMixiChillActive;
     public bool IsHiddenByDndOrLock
     {
         get => _isHiddenByDndOrLock;
@@ -62,12 +66,19 @@ public class PetOverlayForm : Form
         }
     }
 
-    public PetOverlayForm(ThemePack initialTheme, int initialScale = 2, int? initialPetX = null, string idleMode = "chill", int targetFps = 15)
+    public PetOverlayForm(
+        ThemePack initialTheme,
+        int initialScale = 2,
+        int? initialPetX = null,
+        string idleMode = "chill",
+        int targetFps = 15,
+        bool showMixiWhenAllIdle = true)
     {
         _currentTheme = initialTheme ?? throw new ArgumentNullException(nameof(initialTheme));
         _scale = Math.Clamp(initialScale, 1, 2);
         _petX = initialPetX;
         _idleMode = idleMode;
+        _showMixiWhenAllIdle = showMixiWhenAllIdle;
 
         _currentState = new HqState(
             Agents: Array.Empty<AgentSnapshot>(),
@@ -165,6 +176,12 @@ public class PetOverlayForm : Form
         ApplyEffectiveVisibility();
     }
 
+    public void SetShowMixiWhenAllIdle(bool enabled)
+    {
+        _showMixiWhenAllIdle = enabled;
+        ApplyEffectiveVisibility();
+    }
+
     public void SetPetX(int? x)
     {
         _petX = x;
@@ -232,6 +249,46 @@ public class PetOverlayForm : Form
         _cachedRenderState = _currentState with { Agents = filtered };
     }
 
+    private bool ShouldStayVisibleInAutoHide()
+    {
+        // Stay visible when Do Mixi All-Idle Chill Mode is enabled or explicitly demoed
+        if (_showMixiWhenAllIdle ||
+            string.Equals(_currentState.DemoScenario, "mixi", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        // Stay visible while a living handoff is actively walking or newly queued
+        if (_renderer.IsHandoffActive || HasPendingHandoffEvent(_cachedRenderState))
+        {
+            return true;
+        }
+
+        var agents = _currentState.Agents;
+        for (int i = 0; i < agents.Count; i++)
+        {
+            if (agents[i].State != AgentState.Idle)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool HasPendingHandoffEvent(HqState state)
+    {
+        if (state.PendingVisualEvents == null) return false;
+        for (int i = 0; i < state.PendingVisualEvents.Count; i++)
+        {
+            if (string.Equals(state.PendingVisualEvents[i].Type, "handoff", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public void ApplyEffectiveVisibility()
     {
         if (_disposed) return;
@@ -243,25 +300,11 @@ public class PetOverlayForm : Form
             return;
         }
 
-        if (_idleMode == "auto-hide")
+        if (_idleMode == "auto-hide" && !ShouldStayVisibleInAutoHide())
         {
-            bool hasActiveAgent = false;
-            var agents = _currentState.Agents;
-            for (int i = 0; i < agents.Count; i++)
-            {
-                if (agents[i].State != AgentState.Idle)
-                {
-                    hasActiveAgent = true;
-                    break;
-                }
-            }
-
-            if (!hasActiveAgent)
-            {
-                _renderTimer.Stop();
-                if (Visible) Hide();
-                return;
-            }
+            _renderTimer.Stop();
+            if (Visible) Hide();
+            return;
         }
 
         if (!Visible)
@@ -293,25 +336,11 @@ public class PetOverlayForm : Form
     {
         if (_disposed || _isPaused || _isHiddenByDndOrLock || _idleMode == "off") return;
 
-        if (_idleMode == "auto-hide")
+        if (_idleMode == "auto-hide" && !ShouldStayVisibleInAutoHide())
         {
-            bool hasActiveAgent = false;
-            var agents = _currentState.Agents;
-            for (int i = 0; i < agents.Count; i++)
-            {
-                if (agents[i].State != AgentState.Idle)
-                {
-                    hasActiveAgent = true;
-                    break;
-                }
-            }
-
-            if (!hasActiveAgent)
-            {
-                _renderTimer.Stop();
-                if (Visible) Hide();
-                return;
-            }
+            _renderTimer.Stop();
+            if (Visible) Hide();
+            return;
         }
 
         if (!Visible) Show();
@@ -325,7 +354,7 @@ public class PetOverlayForm : Form
         float timeSeconds = (float)_stopwatch.Elapsed.TotalSeconds;
         bool showIdle = _idleMode != "off";
 
-        _renderer.Render(_petBuffer, _cachedRenderState, _currentTheme, timeSeconds, showIdle, DateTimeOffset.UtcNow);
+        _renderer.Render(_petBuffer, _cachedRenderState, _currentTheme, timeSeconds, showIdle, DateTimeOffset.UtcNow, _showMixiWhenAllIdle);
 
         if (_scale == 1)
         {
@@ -388,7 +417,21 @@ public class PetOverlayForm : Form
                 {
                     string agentId = hit.ActionId["agent:".Length..];
                     var agent = _currentState.Agents.FirstOrDefault(a => a.Id == agentId);
-                    if (agent == null)
+                    if (agent == null && string.Equals(agentId, "mixi-chill", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var activity = _renderer.ActiveMixiActivity ?? KageDesk.Rendering.Sprites.MixiChillActivity.EatingNoodles;
+                        string activityLabel = KageDesk.Rendering.Sprites.MixiChillRenderer.GetFullBadge(activity);
+                        agent = new AgentSnapshot(
+                            Id: "mixi-chill",
+                            Name: "Do Mixi Gaming",
+                            Role: AgentRole.Clone,
+                            SpriteKey: "mixi",
+                            State: AgentState.Idle,
+                            TaskTitle: $"Chill Mode: {activityLabel}",
+                            Source: "idle-chill"
+                        );
+                    }
+                    else if (agent == null)
                     {
                         agent = new AgentSnapshot(
                             Id: agentId,

@@ -203,13 +203,13 @@ public class KageDeskRuntime : IDisposable
         // 1. Wallpaper Host Form
         if (!_noWallpaperMode)
         {
-            _wallpaperForm = new WallpaperHostForm(_activeTheme, _config.TargetFps);
+            _wallpaperForm = new WallpaperHostForm(_activeTheme, _config.TargetFps, _config.ShowMixiWhenAllIdle);
         }
 
         // 2. Pet Overlay Form
         if (_config.PetOverlayEnabled)
         {
-            _petForm = new PetOverlayForm(_activeTheme, _config.PetScale, _config.PetX, _config.PetIdleMode, _config.TargetFps);
+            _petForm = new PetOverlayForm(_activeTheme, _config.PetScale, _config.PetX, _config.PetIdleMode, _config.TargetFps, _config.ShowMixiWhenAllIdle);
             _petForm.PetPositionChanged += newX =>
             {
                 UpdateConfig(c => c.PetX = newX);
@@ -243,7 +243,7 @@ public class KageDeskRuntime : IDisposable
                 {
                     if ((_wallpaperForm == null || _wallpaperForm.IsDisposed) && !_noWallpaperMode)
                     {
-                        _wallpaperForm = new WallpaperHostForm(_activeTheme, _config.TargetFps);
+                        _wallpaperForm = new WallpaperHostForm(_activeTheme, _config.TargetFps, _config.ShowMixiWhenAllIdle);
                     }
                     if (_wallpaperForm != null)
                     {
@@ -279,6 +279,13 @@ public class KageDeskRuntime : IDisposable
             {
                 UpdateConfig(c => c.PetX = null);
                 _petForm?.SetPetX(null);
+            },
+            OnShowMixiWhenAllIdleToggled = enabled =>
+            {
+                UpdateConfig(c => c.ShowMixiWhenAllIdle = enabled);
+                _wallpaperForm?.SetShowMixiWhenAllIdle(enabled);
+                _petForm?.SetShowMixiWhenAllIdle(enabled);
+                RequestUiSync();
             },
             OnAutoPauseToggled = enabled =>
             {
@@ -513,7 +520,7 @@ public class KageDeskRuntime : IDisposable
                         {
                             if (_wallpaperForm == null || _wallpaperForm.IsDisposed)
                             {
-                                _wallpaperForm = new WallpaperHostForm(_activeTheme, _config.TargetFps);
+                                _wallpaperForm = new WallpaperHostForm(_activeTheme, _config.TargetFps, _config.ShowMixiWhenAllIdle);
                             }
 
                             SyncUiOnDispatcher();

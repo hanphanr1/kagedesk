@@ -608,4 +608,75 @@ public class HqWallpaperRendererTests
         _output.WriteLine($"Full 9-agent variety scene: median={medianMs:F3} ms/frame, avg={avgMs:F3} ms/frame");
         Assert.True(medianMs < 1.2, $"Expected full 9-agent variety scene median < 1.2 ms/frame, got median={medianMs:F3} ms/frame (avg={avgMs:F3} ms)");
     }
+
+    [Fact]
+    public void Render_AllIdle_DoMixiChillCorner_CyclesFiveActivitiesAndHidesImmediatelyOnAnyActiveAgent()
+    {
+        var renderer = new HqWallpaperRenderer();
+        using var bufMixi = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
+        using var bufNoMixi = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        var allIdleState = new HqState(
+            Agents: new[]
+            {
+                new AgentSnapshot("o1", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o2", "Minato", AgentRole.Coder, "minato", AgentState.Idle, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o3", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Idle, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o4", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle, Source: "orca", IsBotHome: true)
+            },
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Calm,
+            PendingVisualEvents: Array.Empty<HqEvent>(),
+            Timestamp: now);
+
+        // 1. All-idle with ShowMixiWhenAllIdle=true renders Do Mixi chill corner across all 5 activities
+        var activityHashes = new HashSet<long>();
+        var observedActivities = new HashSet<KageDesk.Rendering.Sprites.MixiChillActivity>();
+        float[] sampleTimes = { 1.0f, 9.0f, 17.0f, 25.0f, 33.0f };
+        foreach (float t in sampleTimes)
+        {
+            renderer.Render(bufMixi, allIdleState, theme, t, now, showMixiWhenAllIdle: true);
+            Assert.True(renderer.IsMixiChillActive);
+            Assert.NotNull(renderer.ActiveMixiActivity);
+            observedActivities.Add(renderer.ActiveMixiActivity!.Value);
+            activityHashes.Add(ComputeRegionChecksum(bufMixi, 148, 140, 88, 66));
+        }
+
+        Assert.Equal(5, observedActivities.Count);
+        Assert.Equal(5, activityHashes.Count);
+
+        // 2. All-idle with ShowMixiWhenAllIdle=false hides Do Mixi completely
+        renderer.Render(bufNoMixi, allIdleState, theme, 1.0f, now, showMixiWhenAllIdle: false);
+        Assert.False(renderer.IsMixiChillActive);
+        Assert.Null(renderer.ActiveMixiActivity);
+        Assert.NotEqual(
+            ComputeRegionChecksum(bufMixi, 148, 140, 88, 66),
+            ComputeRegionChecksum(bufNoMixi, 148, 140, 88, 66));
+
+        // 3. As soon as ANY agent becomes active, Do Mixi immediately yields the stage
+        var activeState = allIdleState with
+        {
+            Agents = new[]
+            {
+                new AgentSnapshot("o1", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o2", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", Source: "orca", IsBotHome: true, WorkStartedAt: now),
+                new AgentSnapshot("o3", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Idle, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o4", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle, Source: "orca", IsBotHome: true)
+            },
+            Mood = HqMood.Busy
+        };
+
+        renderer.Render(bufMixi, activeState, theme, 2.0f, now, showMixiWhenAllIdle: true);
+        Assert.False(renderer.IsMixiChillActive);
+        Assert.Null(renderer.ActiveMixiActivity);
+
+        // 4. DemoScenario="mixi" forces Do Mixi Chill Mode even if showMixiWhenAllIdle=false
+        var demoMixiState = allIdleState with { DemoScenario = "mixi" };
+        renderer.Render(bufMixi, demoMixiState, theme, 1.0f, now, showMixiWhenAllIdle: false);
+        Assert.True(renderer.IsMixiChillActive);
+    }
 }

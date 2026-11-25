@@ -230,6 +230,11 @@ public class AgentDetailToast : Form
 
     public static string FormatSourceLabel(AgentSnapshot agent)
     {
+        if (string.Equals(agent.Source, "idle-chill", StringComparison.OrdinalIgnoreCase))
+        {
+            return "All-Idle Chill Corner";
+        }
+
         if (string.Equals(agent.Source, "process", StringComparison.OrdinalIgnoreCase))
         {
             string provider = ResolveTerminalProvider(agent);

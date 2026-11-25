@@ -100,6 +100,8 @@ public class AgentDetailToastAndOverlayClickTests
             PendingVisualEvents: Array.Empty<HqEvent>()
         );
 
+        // Test standard fallback idle click when Do Mixi idle mode is disabled
+        form.SetShowMixiWhenAllIdle(false);
         form.ApplyRenderState(emptyState, theme, petPaused: false, petHiddenByDndOrLock: false);
 
         int invokeCount = 0;
@@ -119,6 +121,38 @@ public class AgentDetailToastAndOverlayClickTests
         Assert.Equal("fallback", capturedAgent.Source);
         Assert.False(string.IsNullOrWhiteSpace(capturedAgent.Name));
         Assert.False(string.IsNullOrWhiteSpace(capturedAgent.Id));
+    }
+
+    [Fact]
+    public void PetOverlayForm_AllIdleMixiClick_InvokesAgentClickedWithDoMixiChillSnapshot()
+    {
+        var theme = ThemePackLoader.BuiltInFallback;
+        using var form = new PetOverlayForm(theme, initialScale: 1, idleMode: "chill", showMixiWhenAllIdle: true);
+        form.Start();
+
+        var emptyState = new HqState(
+            Agents: Array.Empty<AgentSnapshot>(),
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Calm,
+            PendingVisualEvents: Array.Empty<HqEvent>()
+        );
+
+        form.ApplyRenderState(emptyState, theme, petPaused: false, petHiddenByDndOrLock: false);
+        Assert.True(form.IsMixiChillActive);
+
+        AgentSnapshot? capturedAgent = null;
+        form.AgentClicked += ag => capturedAgent = ag;
+
+        // Click inside Do Mixi chill corner region (centered near X=330, Y=95)
+        form.SimulateMouseDown(330, 95, MouseButtons.Left);
+
+        Assert.NotNull(capturedAgent);
+        Assert.Equal("mixi-chill", capturedAgent.Id);
+        Assert.Equal("Do Mixi Gaming", capturedAgent.Name);
+        Assert.Equal("idle-chill", capturedAgent.Source);
+        Assert.Equal("All-Idle Chill Corner", AgentDetailToast.FormatSourceLabel(capturedAgent));
     }
 
     [Fact]

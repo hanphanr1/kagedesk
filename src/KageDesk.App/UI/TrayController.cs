@@ -34,6 +34,7 @@ public class TrayController : IDisposable
     public Action<string>? OnPetModeChanged { get; set; }
     public Action<int>? OnPetScaleChanged { get; set; }
     public Action? OnResetPetPosition { get; set; }
+    public Action<bool>? OnShowMixiWhenAllIdleToggled { get; set; }
     public Action<bool>? OnAutoPauseToggled { get; set; }
     public Action<bool>? OnGameDndToggled { get; set; }
     public Action<bool>? OnProcessAgentCollectorToggled { get; set; }
@@ -174,9 +175,18 @@ public class TrayController : IDisposable
             OnPetModeChanged?.Invoke("off");
         }) { Checked = config.PetIdleMode == "off" };
 
+        var mixiIdleItem = new ToolStripMenuItem("Do Mixi Idle Mode", null, (_, _) =>
+        {
+            bool next = !config.ShowMixiWhenAllIdle;
+            UpdateConfig?.Invoke(c => c.ShowMixiWhenAllIdle = next);
+            OnShowMixiWhenAllIdleToggled?.Invoke(next);
+        }) { Checked = config.ShowMixiWhenAllIdle };
+
         petMenu.DropDownItems.Add(chillItem);
         petMenu.DropDownItems.Add(autoHideItem);
         petMenu.DropDownItems.Add(offItem);
+        petMenu.DropDownItems.Add(new ToolStripSeparator());
+        petMenu.DropDownItems.Add(mixiIdleItem);
         petMenu.DropDownItems.Add(new ToolStripSeparator());
 
         var scale1x = new ToolStripMenuItem("Scale: 1x (Retro 384px)", null, (_, _) =>
@@ -255,7 +265,8 @@ public class TrayController : IDisposable
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Done (Celebration)", null, (_, _) => OnDemoTrigger?.Invoke("done")));
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Failure Alert", null, (_, _) => OnDemoTrigger?.Invoke("fail")));
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Multi-Terminal Variety", null, (_, _) => OnDemoTrigger?.Invoke("clone")));
-        demoMenu.DropDownItems.Add(new ToolStripMenuItem("Preview \u0110\u1ed9 Mixi Gaming & Variety", null, (_, _) => OnDemoTrigger?.Invoke("variety")));
+        demoMenu.DropDownItems.Add(new ToolStripMenuItem("Preview Multi-Agent Variety", null, (_, _) => OnDemoTrigger?.Invoke("variety")));
+        demoMenu.DropDownItems.Add(new ToolStripMenuItem("Do Mixi Chill Mode", null, (_, _) => OnDemoTrigger?.Invoke("mixi")));
         demoMenu.DropDownItems.Add(new ToolStripSeparator());
         _exportGifMenuItem = new ToolStripMenuItem("Export 6s Demo GIF...", null, (_, _) => OnExportGif?.Invoke());
         demoMenu.DropDownItems.Add(_exportGifMenuItem);

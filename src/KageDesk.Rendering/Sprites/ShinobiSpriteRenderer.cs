@@ -202,12 +202,14 @@ public static class ShinobiSpriteRenderer
                 "astro-dev" => ColorUtil.FromRgb(226, 232, 240),
                 "mecha-droid" => ColorUtil.FromRgb(71, 85, 105),
                 "mixi" => ColorUtil.FromRgb(20, 22, 30),
+                "dj-synth" => ColorUtil.FromRgb(24, 24, 48),
                 "street-gamer" => ColorUtil.FromRgb(30, 41, 59),
                 _ => ShinobiPants
             };
             int shoeColor = key switch
             {
                 "mixi" => ColorUtil.FromRgb(185, 28, 28),
+                "dj-synth" => ColorUtil.FromRgb(236, 72, 153),
                 "astro-dev" => ColorUtil.FromRgb(234, 88, 12),
                 "street-gamer" => ColorUtil.FromRgb(248, 250, 252),
                 "mecha-droid" => ColorUtil.FromRgb(51, 65, 85),
@@ -367,6 +369,13 @@ public static class ShinobiSpriteRenderer
             buf.BlendPixel(x - 8, headTop + 4, ColorUtil.FromRgb(239, 68, 68), pulse);
             buf.BlendPixel(x + 7, headTop + 4, ColorUtil.FromRgb(239, 68, 68), pulse);
         }
+        else if (key == "dj-synth" && state == AgentState.Working)
+        {
+            // Synthwave DJ dual neon earcup equalizer pulse (magenta/cyan)
+            int pulse = 145 + (int)(MathF.Sin(t * 9f) * 65f);
+            buf.BlendPixel(x - 8, headTop + 4, ColorUtil.FromRgb(236, 72, 153), pulse);
+            buf.BlendPixel(x + 7, headTop + 4, ColorUtil.FromRgb(34, 211, 238), pulse);
+        }
         else if (key == "wizard-dev" && state == AgentState.Working)
         {
             int orbit = (int)(t * 8f) % 4;
@@ -407,6 +416,7 @@ public static class ShinobiSpriteRenderer
         "claude" => ColorUtil.FromRgb(194, 65, 12),
         "codex" => ColorUtil.FromRgb(16, 185, 129),
         "mixi" => ColorUtil.FromRgb(20, 22, 30),
+        "dj-synth" => ColorUtil.FromRgb(13, 148, 136),
         "neko-dev" => ColorUtil.FromRgb(167, 139, 250),
         "cyber-hacker" => ColorUtil.FromRgb(20, 26, 42),
         "ronin-dev" => ColorUtil.FromRgb(153, 27, 27),
@@ -801,6 +811,29 @@ public static class ShinobiSpriteRenderer
                     // Crimson shoulder piping
                     buf.FillRect(x - 5, torsoTop, 2, 1, crimson);
                     buf.FillRect(x + 3, torsoTop, 2, 1, crimson);
+                    break;
+                }
+
+            case "dj-synth":
+                {
+                    // Synthwave DJ Dev: vibrant teal bomber jacket + dark shirt + neon magenta/cyan EQ chest bar
+                    int teal = ColorUtil.FromRgb(13, 148, 136);
+                    int tealHi = ColorUtil.FromRgb(45, 212, 191);
+                    int tealDark = ColorUtil.FromRgb(17, 94, 89);
+                    int teeDark = ColorUtil.FromRgb(20, 20, 38);
+                    int magenta = ColorUtil.FromRgb(236, 72, 153);
+                    int gold = ColorUtil.FromRgb(250, 204, 21);
+
+                    buf.FillRect(x - 5, torsoTop, 10, 8, teal);
+                    buf.FillRect(x - 5, torsoTop + 6, 10, 2, tealDark);
+                    buf.FillRect(x - 5, torsoTop, 2, 2, tealHi);
+                    buf.FillRect(x + 3, torsoTop, 2, 2, tealHi);
+                    buf.FillRect(x - 3, torsoTop, 6, 7, teeDark);
+                    // Mini synthwave equalizer graphic on chest
+                    buf.FillRect(x - 2, torsoTop + 3, 1, 3, magenta);
+                    buf.FillRect(x - 1, torsoTop + 2, 1, 4, ColorUtil.FromRgb(34, 211, 238));
+                    buf.FillRect(x, torsoTop + 1, 1, 5, gold);
+                    buf.FillRect(x + 1, torsoTop + 3, 1, 3, magenta);
                     break;
                 }
 
@@ -1372,6 +1405,40 @@ public static class ShinobiSpriteRenderer
                     buf.FillRect(x + 1, headTop + 6, 4, 2, SkinBase);
                     buf.SetPixel(x + 2, headTop + 6, SkinHighlight);
                     buf.SetPixel(x + 3, headTop + 6, ColorUtil.FromRgb(18, 12, 14)); // Iconic mole!
+                    break;
+                }
+
+            case "dj-synth":
+                {
+                    // Synthwave DJ Dev: electric mint-teal swept hair + glowing magenta/cyan DJ studio headphones
+                    int mint = ColorUtil.FromRgb(45, 212, 191);
+                    int mintHi = ColorUtil.FromRgb(153, 246, 228);
+                    int mintShade = ColorUtil.FromRgb(13, 148, 136);
+                    int hsMag = ColorUtil.FromRgb(236, 72, 153);
+                    int hsCyan = ColorUtil.FromRgb(34, 211, 238);
+                    int hsDark = ColorUtil.FromRgb(24, 24, 48);
+
+                    buf.FillRect(x - 6, headTop - 3, 12, 5, Outline);
+                    buf.FillRect(x - 5, headTop - 5, 4, 2, Outline);
+                    buf.FillRect(x, headTop - 5, 5, 2, Outline);
+                    buf.FillRect(x - 5, headTop - 2, 10, 4, mint);
+                    buf.FillRect(x - 4, headTop - 4, 3, 2, mintHi);
+                    buf.FillRect(x + 1, headTop - 4, 3, 2, mintHi);
+                    buf.FillRect(x - 5, headTop + 1, 10, 1, mintShade);
+
+                    // Studio DJ headphone crown & vibrant dual-tone earcups
+                    buf.FillRect(x - 7, headTop - 3, 2, 6, Outline);
+                    buf.FillRect(x + 5, headTop - 3, 2, 6, Outline);
+                    buf.FillRect(x - 6, headTop - 3, 1, 5, hsDark);
+                    buf.FillRect(x + 5, headTop - 3, 1, 5, hsDark);
+
+                    buf.FillRect(x - 8, headTop + 2, 3, 5, Outline);
+                    buf.FillRect(x - 7, headTop + 3, 2, 3, hsMag);
+                    buf.SetPixel(x - 7, headTop + 3, ColorUtil.FromRgb(251, 207, 232));
+
+                    buf.FillRect(x + 5, headTop + 2, 3, 5, Outline);
+                    buf.FillRect(x + 5, headTop + 3, 2, 3, hsCyan);
+                    buf.SetPixel(x + 6, headTop + 3, ColorUtil.FromRgb(224, 242, 254));
                     break;
                 }
 
@@ -2508,6 +2575,7 @@ public static class ShinobiSpriteRenderer
         if (string.Equals(trimmed, "tsunade", StringComparison.OrdinalIgnoreCase)) return "tsunade";
         if (string.Equals(trimmed, "kakashi", StringComparison.OrdinalIgnoreCase)) return "kakashi";
         if (string.Equals(trimmed, "mixi", StringComparison.OrdinalIgnoreCase) || string.Equals(trimmed, "domixi", StringComparison.OrdinalIgnoreCase)) return "mixi";
+        if (string.Equals(trimmed, "dj-synth", StringComparison.OrdinalIgnoreCase)) return "dj-synth";
         if (string.Equals(trimmed, "neko-dev", StringComparison.OrdinalIgnoreCase)) return "neko-dev";
         if (string.Equals(trimmed, "cyber-hacker", StringComparison.OrdinalIgnoreCase)) return "cyber-hacker";
         if (string.Equals(trimmed, "ronin-dev", StringComparison.OrdinalIgnoreCase)) return "ronin-dev";
