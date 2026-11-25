@@ -317,4 +317,41 @@ public class Win32ProcessInspectorTests
         Assert.Equal(0, inspector.CacheCount);
         Assert.False(inspector.TryGetCachedClassification(5555, 111111L, out _));
     }
+
+    [Fact]
+    public void ResolveClassification_NullCommandLine_Python_DoesNotPoisonCacheAndRetriesNextPoll()
+    {
+        var inspector = new Win32ProcessInspector();
+        inspector.ClearCache();
+
+        const int pid = 6789;
+        const long startTicks = 123456789L;
+        const string exe = "python.exe";
+
+        // Poll 1: Command line read returns null -> returns execute fallback and does NOT cache it
+        var poll1 = inspector.ResolveClassification(
+            pid,
+            startTicks,
+            exe,
+            readCommandLine: () => null,
+            capturedGen: inspector.CacheGeneration);
+
+        Assert.Equal("execute", poll1.RoleHint);
+        Assert.False(inspector.TryGetCachedClassification(pid, startTicks, out _));
+        Assert.Equal(0, inspector.CacheCount);
+
+        // Poll 2: Same PID & startTicks with "python.exe -m pytest" retries reading command line and returns test
+        var poll2 = inspector.ResolveClassification(
+            pid,
+            startTicks,
+            exe,
+            readCommandLine: () => "python.exe -m pytest",
+            capturedGen: inspector.CacheGeneration);
+
+        Assert.Equal("test", poll2.RoleHint);
+        Assert.True(inspector.TryGetCachedClassification(pid, startTicks, out var cached));
+        Assert.NotNull(cached);
+        Assert.Equal("test", cached.RoleHint);
+        Assert.Equal(1, inspector.CacheCount);
+    }
 }

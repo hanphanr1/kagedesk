@@ -354,4 +354,69 @@ public class ProcessAgentCollectorTests
         Assert.Equal(0, collector.OpaqueTokensCount);
         Assert.True(blockingInspector.CacheCleared);
     }
+
+    [Fact]
+    public void CollectOnce_RaceEnabledFalseAtPublication_RejectsStalePublishAndPublishesWhenReEnabled()
+    {
+        var aggregator = new HqStateAggregator();
+        var mockInspector = new MockProcessInspector
+        {
+            Processes = new List<ProcessItem>
+            {
+                new(100, 10, "claude.exe", "claude.exe", 1000, 20)
+            }
+        };
+
+        var collector = new ProcessAgentCollector(aggregator, enabled: true, inspector: mockInspector);
+
+        var publicationPaused = new ManualResetEventSlim(false);
+        var publicationContinue = new ManualResetEventSlim(false);
+        var emittedStates = new List<HqState>();
+        aggregator.StateChanged += (_, state) =>
+        {
+            emittedStates.Add(state);
+        };
+
+        collector.BeforePublishAction = () =>
+        {
+            publicationPaused.Set();
+            publicationContinue.Wait(5000);
+        };
+
+        // Run CollectOnce on background thread
+        var thread = new Thread(() =>
+        {
+            collector.CollectOnce();
+        });
+        thread.Start();
+
+        // Wait until CollectOnce finished DetectProcesses and is paused right before UpdateProcessAgents
+        Assert.True(publicationPaused.Wait(2000));
+
+        // Disable collector while publication is pending
+        collector.Enabled = false;
+
+        // Verify aggregator state has 0 agents and capture emitted states count
+        Assert.Empty(aggregator.GetState().Agents);
+        int emittedCountWhileDisabled = emittedStates.Count;
+
+        // Unblock publication
+        publicationContinue.Set();
+        thread.Join(2000);
+
+        // Verify aggregator state stays 0 agents and no stale process agent was published
+        Assert.Empty(aggregator.GetState().Agents);
+        Assert.Equal(emittedCountWhileDisabled, emittedStates.Count);
+
+        // Re-enable collector and collect once
+        collector.BeforePublishAction = null;
+        collector.Enabled = true;
+        collector.CollectOnce();
+
+        // Verify re-enabling publishes normally under the new generation
+        var finalState = aggregator.GetState();
+        Assert.Single(finalState.Agents);
+        Assert.Equal("CLAUDE", finalState.Agents[0].Name);
+        Assert.Equal("process", finalState.Agents[0].Source);
+    }
 }

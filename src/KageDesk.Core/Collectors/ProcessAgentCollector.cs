@@ -104,6 +104,7 @@ public class ProcessAgentCollector
             if (shouldClearInspector)
             {
                 _inspector.ClearCache();
+                _aggregator.DisableAndClearProcessAgents();
             }
         }
     }
@@ -574,6 +575,8 @@ public class ProcessAgentCollector
         return sum;
     }
 
+    internal Action? BeforePublishAction { get; set; }
+
     public void CollectOnce()
     {
         long capturedGen;
@@ -583,6 +586,7 @@ public class ProcessAgentCollector
             capturedGen = _generation;
         }
 
+        long gen = _aggregator.GetProcessGeneration();
         var detected = DetectProcesses();
 
         lock (_lock)
@@ -590,6 +594,8 @@ public class ProcessAgentCollector
             if (!_enabled || _generation != capturedGen) return;
         }
 
-        _aggregator.UpdateProcessAgents(detected);
+        BeforePublishAction?.Invoke();
+
+        _aggregator.UpdateProcessAgents(detected, gen);
     }
 }

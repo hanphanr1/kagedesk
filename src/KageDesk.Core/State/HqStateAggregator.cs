@@ -38,6 +38,7 @@ public class HqStateAggregator
     private readonly Dictionary<string, (BuildInfo Build, DateTimeOffset ExpiresAt)> _pushedBuilds = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, BuildInfo> _collectorBuilds = new(StringComparer.OrdinalIgnoreCase);
     private long _ciGeneration;
+    private long _processGeneration;
 
     private readonly List<HqEvent> _visualEvents = new();
     private readonly Dictionary<string, (AgentSnapshot LastSnapshot, DateTimeOffset EnteredAt)> _departedDoneAgents = new(StringComparer.OrdinalIgnoreCase);
@@ -177,11 +178,43 @@ public class HqStateAggregator
         }
     }
 
-    public void UpdateProcessAgents(IReadOnlyList<AgentSnapshot> agents)
+    public long DisableAndClearProcessAgents()
+    {
+        HqState? toEmit = null;
+        long newGen;
+        lock (_lock)
+        {
+            newGen = ++_processGeneration;
+            _processAgents.Clear();
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
+        }
+
+        return newGen;
+    }
+
+    public long GetProcessGeneration()
+    {
+        lock (_lock)
+        {
+            return _processGeneration;
+        }
+    }
+
+    public bool UpdateProcessAgents(IReadOnlyList<AgentSnapshot> agents, long? expectedGeneration = null)
     {
         HqState? toEmit = null;
         lock (_lock)
         {
+            if (expectedGeneration.HasValue && expectedGeneration.Value != _processGeneration)
+            {
+                return false;
+            }
+
             _processAgents.Clear();
             foreach (var a in agents)
             {
@@ -195,21 +228,13 @@ public class HqStateAggregator
         {
             StateChanged?.Invoke(this, toEmit);
         }
+
+        return true;
     }
 
     public void ClearProcessAgentEntries()
     {
-        HqState? toEmit = null;
-        lock (_lock)
-        {
-            _processAgents.Clear();
-            toEmit = RecalculateStateLocked();
-        }
-
-        if (toEmit != null)
-        {
-            StateChanged?.Invoke(this, toEmit);
-        }
+        DisableAndClearProcessAgents();
     }
 
     public void UpdateCiBuilds(IReadOnlyList<BuildInfo> builds)

@@ -275,7 +275,7 @@ public class KageDeskRuntime : IDisposable
                 else
                 {
                     if (_procCollector != null) _procCollector.Enabled = false;
-                    _aggregator.ClearProcessAgentEntries();
+                    _aggregator.DisableAndClearProcessAgents();
                 }
             },
             OnGitHubCiCollectorToggled = enabled =>
@@ -435,7 +435,7 @@ public class KageDeskRuntime : IDisposable
                     _procCollector.CollectOnce();
                     if (Interlocked.Read(ref _processCollectorGen) != procGen || !_config.EnableProcessAgentCollector)
                     {
-                        _aggregator.ClearProcessAgentEntries();
+                        _aggregator.DisableAndClearProcessAgents();
                     }
                 }
 

@@ -525,5 +525,28 @@ public class HqStateAggregatorTests
         Assert.NotEqual(EffectiveWeather.StormAlert, state.Weather);
         Assert.DoesNotContain(state.PendingVisualEvents, e => e.Type == "BuildFailed");
     }
+
+    [Fact]
+    public void SerializedProcessGeneration_RejectsStalePublication_NoStaleAgentsEmitted()
+    {
+        var aggregator = new HqStateAggregator();
+        long gen = aggregator.GetProcessGeneration();
+
+        // Simulate disabling process agents: clears agents and bumps generation
+        long disabledGen = aggregator.DisableAndClearProcessAgents();
+        Assert.True(disabledGen > gen);
+
+        // Attempt in-flight publication from the captured earlier generation
+        var inFlightAgents = new[]
+        {
+            new AgentSnapshot("proc-stale", "Stale Agent", AgentRole.Coder, "kakashi", AgentState.Working)
+        };
+
+        bool accepted = aggregator.UpdateProcessAgents(inFlightAgents, expectedGeneration: gen);
+
+        Assert.False(accepted);
+        var state = aggregator.GetState();
+        Assert.Empty(state.Agents);
+    }
 }
 

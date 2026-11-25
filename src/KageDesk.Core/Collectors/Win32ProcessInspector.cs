@@ -161,12 +161,11 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
             }
         }
 
-        bool requiresCmd = RequiresCommandLineClassification(exeName);
         string? cmd = readCommandLine();
 
-        if (requiresCmd && cmd == null)
+        if (cmd == null)
         {
-            // Exe-only fallback for THIS poll; do NOT poison cache!
+            // Exe-only fallback for THIS poll; do NOT poison cache for ANY process!
             return ClassifyProcess(exeName, null);
         }
 
