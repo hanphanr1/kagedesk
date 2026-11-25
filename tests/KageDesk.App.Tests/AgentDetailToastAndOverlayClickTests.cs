@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Windows.Forms;
+using KageDesk.App.Native;
 using KageDesk.App.UI;
 using KageDesk.Core.Models;
 using KageDesk.Core.Themes;
@@ -103,4 +104,126 @@ public class AgentDetailToastAndOverlayClickTests
         Assert.False(string.IsNullOrWhiteSpace(capturedAgent.Name));
         Assert.False(string.IsNullOrWhiteSpace(capturedAgent.Id));
     }
+
+    [Fact]
+    public void WindowFocuser_VerificationHelpers_ValidatePidAndParentAge()
+    {
+        // 1. IsPidAgeValid
+        Assert.True(WindowFocuser.IsPidAgeValid(123456789L, 123456789L));
+        Assert.False(WindowFocuser.IsPidAgeValid(123456789L, 987654321L));
+
+        // 2. IsParentAgeValid (parent must have been created at or before child)
+        Assert.True(WindowFocuser.IsParentAgeValid(1000L, 2000L));
+        Assert.True(WindowFocuser.IsParentAgeValid(1000L, 1000L));
+        Assert.False(WindowFocuser.IsParentAgeValid(2000L, 1000L)); // Recycled parent created after child!
+
+        // 3. VerifyHwndOwnership with mock delegates
+        var mockHwnd = new IntPtr(0x1234);
+        const int expectedPid = 4242;
+        const long expectedTicks = 555555L;
+
+        // Valid match
+        bool valid = WindowFocuser.VerifyHwndOwnership(
+            mockHwnd,
+            expectedPid,
+            expectedTicks,
+            getStartTime: pid => expectedTicks,
+            getOwnerPid: hwnd => (uint)expectedPid,
+            isWindowValid: hwnd => true);
+        Assert.True(valid);
+
+        // PID mismatch
+        bool pidMismatch = WindowFocuser.VerifyHwndOwnership(
+            mockHwnd,
+            expectedPid,
+            expectedTicks,
+            getStartTime: pid => expectedTicks,
+            getOwnerPid: hwnd => 9999,
+            isWindowValid: hwnd => true);
+        Assert.False(pidMismatch);
+
+        // Start ticks mismatch (recycled PID)
+        bool ticksMismatch = WindowFocuser.VerifyHwndOwnership(
+            mockHwnd,
+            expectedPid,
+            expectedTicks,
+            getStartTime: pid => 888888L,
+            getOwnerPid: hwnd => (uint)expectedPid,
+            isWindowValid: hwnd => true);
+        Assert.False(ticksMismatch);
+
+        // Invalid window
+        bool invalidWindow = WindowFocuser.VerifyHwndOwnership(
+            mockHwnd,
+            expectedPid,
+            expectedTicks,
+            getStartTime: pid => expectedTicks,
+            getOwnerPid: hwnd => (uint)expectedPid,
+            isWindowValid: hwnd => false);
+        Assert.False(invalidWindow);
+    }
+
+    [Fact]
+    public void AgentDetailToast_SingleInstanceReplacement_RaceSafety()
+    {
+        var snap1 = new AgentSnapshot("t1", "Agent One", AgentRole.Leader, "kakashi", AgentState.Working);
+        var snap2 = new AgentSnapshot("t2", "Agent Two", AgentRole.Coder, "minato", AgentState.Working);
+
+        AgentDetailToast.ShowToast(snap1);
+        var toast1 = AgentDetailToast.ActiveToast;
+        Assert.NotNull(toast1);
+
+        AgentDetailToast.ShowToast(snap2);
+        var toast2 = AgentDetailToast.ActiveToast;
+        Assert.NotNull(toast2);
+        Assert.NotSame(toast1, toast2);
+
+        // Disposing or closing toast1 should NEVER clear toast2 from ActiveToast
+        toast1.Close();
+        Assert.Same(toast2, AgentDetailToast.ActiveToast);
+
+        // Only closing toast2 clears ActiveToast
+        toast2.Close();
+        Assert.Null(AgentDetailToast.ActiveToast);
+    }
+
+    [Fact]
+    public void PetOverlayForm_FocusAgentAction_DispatchesToProcessWindowOrToast()
+    {
+        var theme = ThemePackLoader.BuiltInFallback;
+        using var form = new PetOverlayForm(theme, initialScale: 1);
+
+        var procAgent = new AgentSnapshot(
+            Id: "proc:test:abc123",
+            Name: "Test Proc",
+            Role: AgentRole.Coder,
+            SpriteKey: "minato",
+            State: AgentState.Working,
+            ProcessId: 99999999, // Non-existent PID to test toast fallback
+            ProcessStartTicks: 12345L,
+            Source: "process"
+        );
+
+        var state = new HqState(
+            Agents: new List<AgentSnapshot> { procAgent },
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: Array.Empty<HqEvent>()
+        );
+
+        form.ApplyRenderState(state, theme, petPaused: false, petHiddenByDndOrLock: false);
+
+        // In single process working mode, the working pill emits focus_agent:proc:test:abc123
+        // Clicking on working pill coordinates (X=346, Y=75) triggers focus_agent
+        form.SimulateMouseDown(346, 75, MouseButtons.Left);
+
+        // Since PID 99999999 doesn't exist, WindowFocuser returns false and falls back to AgentDetailToast
+        var toast = AgentDetailToast.ActiveToast;
+        Assert.NotNull(toast);
+        Assert.Equal("proc:test:abc123", toast.Agent.Id);
+        toast.Close();
+    }
 }
+

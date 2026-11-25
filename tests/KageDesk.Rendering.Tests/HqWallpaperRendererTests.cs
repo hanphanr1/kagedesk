@@ -344,6 +344,36 @@ public class HqWallpaperRendererTests
         Assert.Equal(toolNames.Length, checksums.Count);
     }
 
+    [Fact]
+    public void NameplateLayout_Row2FiveSlots_NeverOverlap()
+    {
+        // 5 workstations on row 2 have centers at: 48, 120, 192, 264, 336 (dx = 72)
+        int[] centers = { 48, 120, 192, 264, 336 };
+        var layouts = new HqWallpaperRenderer.NameplateLayout[centers.Length];
+
+        for (int i = 0; i < centers.Length; i++)
+        {
+            layouts[i] = HqWallpaperRenderer.ComputeNameplateLayout(
+                cx: centers[i],
+                y: 160,
+                nameSpan: "LongAgentName",
+                badgeSpan: "APPROVE",
+                maxPlateWidth: 68);
+        }
+
+        for (int i = 0; i < centers.Length - 1; i++)
+        {
+            int currentRight = layouts[i].Right;
+            int nextLeft = layouts[i + 1].Left;
+
+            Assert.True(currentRight < nextLeft,
+                $"Plate {i} (right={currentRight}) overlaps or touches plate {i + 1} (left={nextLeft})");
+            Assert.True(layouts[i].TotalWidth <= 68,
+                $"Plate {i} width {layouts[i].TotalWidth} exceeds maxPlateWidth 68");
+        }
+    }
+
+
     private static long ComputeFrameChecksum(PixelBuffer buf)
         => ComputeRegionChecksum(buf, 0, 0, buf.Width, buf.Height);
 

@@ -3,18 +3,27 @@ using System.Runtime.InteropServices;
 
 namespace KageDesk.Core.Collectors;
 
+public record ProcessClassification(
+    string? Provider,
+    bool IsInternalDaemon,
+    bool IsElectronHelper,
+    string? RoleHint
+);
+
 public record ProcessItem(
     int ProcessId,
     int ParentProcessId,
     string ExeName,
     string? CommandLine,
     long StartTimeTicks,
-    long TotalCpuTimeMs
+    long TotalCpuTimeMs,
+    ProcessClassification? Classification = null
 );
 
 public interface IProcessInspectionProvider
 {
     IReadOnlyList<ProcessItem> InspectProcesses();
+    void ClearCache() { }
 }
 
 public sealed class Win32ProcessInspector : IProcessInspectionProvider
@@ -46,7 +55,7 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct UNICODE_STRING
+    internal struct UNICODE_STRING
     {
         public ushort Length;
         public ushort MaximumLength;
@@ -84,9 +93,56 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
         int processInformationLength,
         out int returnLength);
 
-    // Cache command line by (PID, StartTimeTicks)
-    private readonly Dictionary<(int Pid, long StartTimeTicks), string> _cmdLineCache = new();
+    // Cache ONLY derived ProcessClassification by (PID, StartTimeTicks)
+    private readonly Dictionary<(int Pid, long StartTimeTicks), ProcessClassification> _classificationCache = new();
     private readonly object _lock = new();
+
+    public void ClearCache()
+    {
+        lock (_lock)
+        {
+            _classificationCache.Clear();
+        }
+    }
+
+    public static Dictionary<int, int> GetProcessAncestrySnapshot()
+    {
+        IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1))
+        {
+            return new Dictionary<int, int>();
+        }
+
+        var parentMap = new Dictionary<int, int>(256);
+        try
+        {
+            var entry = new PROCESSENTRY32W();
+            entry.dwSize = (uint)Marshal.SizeOf<PROCESSENTRY32W>();
+
+            if (Process32FirstW(snapshot, ref entry))
+            {
+                do
+                {
+                    int pid = (int)entry.th32ProcessID;
+                    if (pid > 0)
+                    {
+                        parentMap[pid] = (int)entry.th32ParentProcessID;
+                    }
+                }
+                while (Process32NextW(snapshot, ref entry));
+            }
+        }
+        catch
+        {
+            // Fallback gracefully
+        }
+        finally
+        {
+            CloseHandle(snapshot);
+        }
+
+        return parentMap;
+    }
 
     public IReadOnlyList<ProcessItem> InspectProcesses()
     {
@@ -134,14 +190,14 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
             {
                 if (!IsRelevantExecutable(exeName))
                 {
-                    results.Add(new ProcessItem(pid, parentPid, exeName, null, 0, 0));
+                    results.Add(new ProcessItem(pid, parentPid, exeName, null, 0, 0, null));
                     continue;
                 }
 
                 IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
                 if (hProcess == IntPtr.Zero)
                 {
-                    results.Add(new ProcessItem(pid, parentPid, exeName, null, 0, 0));
+                    results.Add(new ProcessItem(pid, parentPid, exeName, null, 0, 0, null));
                     continue;
                 }
 
@@ -152,7 +208,15 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
 
                     if (GetProcessTimes(hProcess, out var createTime, out _, out var kernelTime, out var userTime))
                     {
-                        startTicks = ((long)createTime.dwHighDateTime << 32) | (uint)createTime.dwLowDateTime;
+                        long ft = ((long)createTime.dwHighDateTime << 32) | (uint)createTime.dwLowDateTime;
+                        try
+                        {
+                            startTicks = DateTime.FromFileTimeUtc(ft).Ticks;
+                        }
+                        catch
+                        {
+                            startTicks = ft;
+                        }
                         long kTicks = ((long)kernelTime.dwHighDateTime << 32) | (uint)kernelTime.dwLowDateTime;
                         long uTicks = ((long)userTime.dwHighDateTime << 32) | (uint)userTime.dwLowDateTime;
                         totalCpuMs = (kTicks + uTicks) / 10000; // 100-ns ticks to ms
@@ -161,16 +225,14 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
                     var key = (pid, startTicks);
                     activeKeys.Add(key);
 
-                    if (!_cmdLineCache.TryGetValue(key, out string? cmdLine))
+                    if (!_classificationCache.TryGetValue(key, out var classification))
                     {
-                        cmdLine = ReadProcessCommandLine(hProcess);
-                        if (!string.IsNullOrEmpty(cmdLine))
-                        {
-                            _cmdLineCache[key] = cmdLine;
-                        }
+                        string? cmdLine = ReadProcessCommandLine(hProcess);
+                        classification = ClassifyProcess(exeName, cmdLine);
+                        _classificationCache[key] = classification;
                     }
 
-                    results.Add(new ProcessItem(pid, parentPid, exeName, cmdLine, startTicks, totalCpuMs));
+                    results.Add(new ProcessItem(pid, parentPid, exeName, null, startTicks, totalCpuMs, classification));
                 }
                 finally
                 {
@@ -178,21 +240,18 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
                 }
             }
 
-            // Evict exited PIDs from command line cache
-            if (_cmdLineCache.Count > activeKeys.Count)
+            // Strictly evict stale entries not in activeKeys (never rely on count heuristics)
+            var staleKeys = new List<(int Pid, long StartTimeTicks)>();
+            foreach (var k in _classificationCache.Keys)
             {
-                var staleKeys = new List<(int Pid, long StartTimeTicks)>();
-                foreach (var k in _cmdLineCache.Keys)
+                if (!activeKeys.Contains(k))
                 {
-                    if (!activeKeys.Contains(k))
-                    {
-                        staleKeys.Add(k);
-                    }
+                    staleKeys.Add(k);
                 }
-                foreach (var k in staleKeys)
-                {
-                    _cmdLineCache.Remove(k);
-                }
+            }
+            foreach (var k in staleKeys)
+            {
+                _classificationCache.Remove(k);
             }
         }
 
@@ -201,61 +260,207 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
 
     private static string? ReadProcessCommandLine(IntPtr hProcess)
     {
-        int bufSize = 2048;
-        IntPtr pBuf = Marshal.AllocHGlobal(bufSize);
+        int capacity = 2048;
+        const int maxCapacity = 65536; // 64 KB cap
+        int attempts = 0;
+
+        while (attempts < 4)
+        {
+            attempts++;
+            IntPtr pBuf = IntPtr.Zero;
+            try
+            {
+                pBuf = Marshal.AllocHGlobal(capacity);
+                int status = NtQueryInformationProcess(hProcess, ProcessCommandLineInformation, pBuf, capacity, out int retLen);
+
+                if (status == STATUS_INFO_LENGTH_MISMATCH || status == STATUS_BUFFER_TOO_SMALL || status == STATUS_BUFFER_OVERFLOW)
+                {
+                    if (capacity >= maxCapacity)
+                    {
+                        return null;
+                    }
+                    capacity = Math.Clamp(Math.Max(retLen, capacity * 2), capacity + 1, maxCapacity);
+                    continue;
+                }
+
+                if (status != STATUS_SUCCESS)
+                {
+                    return null;
+                }
+
+                return TryDecodeUnicodeStringFromBuffer(pBuf, retLen, capacity);
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                if (pBuf != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(pBuf);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    internal static string? TryDecodeUnicodeStringFromBuffer(IntPtr pBuf, int retLen, int capacity)
+    {
+        if (pBuf == IntPtr.Zero) return null;
+
+        int headerSize = Marshal.SizeOf<UNICODE_STRING>();
+        if (headerSize > retLen || retLen > capacity)
+        {
+            return null;
+        }
+
+        UNICODE_STRING ustr;
         try
         {
-            int status = NtQueryInformationProcess(hProcess, ProcessCommandLineInformation, pBuf, bufSize, out int retLen);
-            if (status == STATUS_INFO_LENGTH_MISMATCH || status == STATUS_BUFFER_TOO_SMALL || status == STATUS_BUFFER_OVERFLOW)
-            {
-                Marshal.FreeHGlobal(pBuf);
-                bufSize = Math.Max(retLen, bufSize * 2);
-                pBuf = Marshal.AllocHGlobal(bufSize);
-                status = NtQueryInformationProcess(hProcess, ProcessCommandLineInformation, pBuf, bufSize, out retLen);
-            }
-
-            if (status != STATUS_SUCCESS || retLen < Marshal.SizeOf<UNICODE_STRING>())
-            {
-                return null;
-            }
-
-            var ustr = Marshal.PtrToStructure<UNICODE_STRING>(pBuf);
-            if (ustr.Length == 0 || ustr.Buffer == IntPtr.Zero)
-            {
-                return null;
-            }
-
-            int charCount = ustr.Length / 2;
-            long bufStart = pBuf.ToInt64();
-            long strStart = ustr.Buffer.ToInt64();
-            long bufEnd = bufStart + retLen;
-
-            // Verify pointer falls within the returned buffer for security
-            if (strStart >= bufStart && (strStart + ustr.Length) <= bufEnd)
-            {
-                return Marshal.PtrToStringUni(ustr.Buffer, charCount);
-            }
-
-            // Fallback: characters immediately follow UNICODE_STRING
-            IntPtr fallbackPtr = IntPtr.Add(pBuf, Marshal.SizeOf<UNICODE_STRING>());
-            if (fallbackPtr.ToInt64() + ustr.Length <= bufEnd)
-            {
-                return Marshal.PtrToStringUni(fallbackPtr, charCount);
-            }
-
-            return null;
+            ustr = Marshal.PtrToStructure<UNICODE_STRING>(pBuf);
         }
         catch
         {
             return null;
         }
-        finally
+
+        ushort length = ustr.Length;
+        ushort maxLen = ustr.MaximumLength;
+        IntPtr unicodeBufPtr = ustr.Buffer;
+
+        if ((length & 1) != 0 || length > maxLen)
         {
-            if (pBuf != IntPtr.Zero)
+            return null;
+        }
+
+        if (length == 0)
+        {
+            return string.Empty;
+        }
+
+        if (unicodeBufPtr == IntPtr.Zero)
+        {
+            return null;
+        }
+
+        ulong baseAddr = (ulong)pBuf;
+        ulong payloadStart = baseAddr + (ulong)headerSize;
+        ulong payloadEnd = baseAddr + (ulong)retLen;
+        ulong strAddr = (ulong)unicodeBufPtr;
+
+        if (strAddr < payloadStart || strAddr > payloadEnd || (ulong)length > (payloadEnd - strAddr))
+        {
+            return null;
+        }
+
+        try
+        {
+            return Marshal.PtrToStringUni(unicodeBufPtr, length / 2);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static ProcessClassification ClassifyProcess(string exeName, string? cmdLine)
+    {
+        if (string.IsNullOrEmpty(exeName))
+        {
+            return new ProcessClassification(null, false, false, null);
+        }
+
+        string name = exeName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+            ? exeName[..^4].ToLowerInvariant()
+            : exeName.ToLowerInvariant();
+        string cmd = cmdLine?.ToLowerInvariant() ?? string.Empty;
+
+        bool isInternalDaemon = cmd.Contains("__omp_worker_");
+        bool isElectronHelper = cmd.Contains("--type=") ||
+                                cmd.Contains("--crashpad") ||
+                                cmd.Contains("crashpad-handler");
+
+        string? provider = null;
+
+        if (name is "omp")
+        {
+            provider = "OMP";
+        }
+        else if (name is "agy" or "antigravity")
+        {
+            provider = "AGY";
+        }
+        else if (name is "claude")
+        {
+            provider = "CLAUDE";
+        }
+        else if (name is "codex")
+        {
+            provider = "CODEX";
+        }
+        else if (name is "opencode")
+        {
+            provider = "OPENCODE";
+        }
+        else if (name is "gemini")
+        {
+            provider = "GEMINI";
+        }
+        else if (name is "node" or "bun")
+        {
+            if (cmd.Contains("claude-code") || cmd.Contains("@anthropic-ai/claude") ||
+                cmd.Contains("\\claude.js") || cmd.Contains("/claude.js") ||
+                cmd.Contains("/claude") || cmd.Contains("\\claude"))
             {
-                Marshal.FreeHGlobal(pBuf);
+                provider = "CLAUDE";
+            }
+            else if (cmd.Contains("@openai/codex") || cmd.Contains("\\codex") || cmd.Contains("/codex"))
+            {
+                provider = "CODEX";
+            }
+            else if (cmd.Contains("opencode"))
+            {
+                provider = "OPENCODE";
+            }
+            else if (cmd.Contains("gemini-cli") || cmd.Contains("@google/gemini"))
+            {
+                provider = "GEMINI";
             }
         }
+
+        string? roleHint = null;
+        if (name is "git" or "gh")
+        {
+            roleHint = "git";
+        }
+        else if (name.StartsWith("vstest", StringComparison.Ordinal) ||
+                 name.StartsWith("testhost", StringComparison.Ordinal) ||
+                 name.StartsWith("pytest", StringComparison.Ordinal) ||
+                 name.StartsWith("vitest", StringComparison.Ordinal) ||
+                 name.StartsWith("jest", StringComparison.Ordinal) ||
+                 cmd.Contains("pytest") || cmd.Contains("vitest") || cmd.Contains("jest"))
+        {
+            roleHint = "test";
+        }
+        else if (name is "dotnet" or "msbuild" or "csc" or "cargo" or "rustc" or "gcc" or "clang" or "tsc" or "esbuild" or "vite" ||
+                 name.StartsWith("npm", StringComparison.Ordinal) ||
+                 name.StartsWith("pnpm", StringComparison.Ordinal) ||
+                 cmd.Contains("dotnet build") || cmd.Contains("msbuild") || cmd.Contains("cargo build"))
+        {
+            roleHint = "build";
+        }
+        else if (name is "rg" or "grep" or "findstr" or "fd")
+        {
+            roleHint = "search";
+        }
+        else if (name is "pwsh" or "powershell" or "cmd" or "bash" or "sh" or "python" or "node")
+        {
+            roleHint = "execute";
+        }
+
+        return new ProcessClassification(provider, isInternalDaemon, isElectronHelper, roleHint);
     }
 
     public static int? FindAncestorWithVisibleWindow(

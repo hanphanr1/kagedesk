@@ -39,7 +39,26 @@ public sealed class TaskbarPetRenderer
     private readonly List<PetHitRegion> _hitRegions = new(16);
     private readonly ParticleSystem _particles = new();
     private readonly AgentSnapshot[] _workingScratch = new AgentSnapshot[6];
+    private readonly AgentSnapshot[] _idleScratch = new AgentSnapshot[2];
+    private int _idleTerminalCount = 0;
+    private AgentSnapshot? _idlePrimaryNonProcess = null;
     private readonly char[] _textScratch = new char[64];
+
+    private struct WorkingCacheItem
+    {
+        public AgentActionKind ActionKind;
+        public string ShortLabel;
+        public string HitRegionAction;
+    }
+
+    private readonly WorkingCacheItem[] _cachedWorkingItems = new WorkingCacheItem[6];
+    private string? _cachedSingleWorkingFocusActionId;
+    private string? _cachedSingleWorkingShortName;
+    private string? _cachedIdlePrimaryActionId;
+    private readonly string?[] _cachedIdleTerminalActionIds = new string?[2];
+    private string? _cachedIdleTopText;
+    private string? _cachedWorkingMultiLabel;
+    private HqState? _lastRenderedState;
 
     private ThemePack? _cachedTheme;
     private ResolvedScenePalette _palette;
@@ -53,6 +72,7 @@ public sealed class TaskbarPetRenderer
         _particles.Reset();
         _lastTime = -1f;
         _emitAccum = 0f;
+        _lastRenderedState = null;
     }
 
     public IReadOnlyList<PetHitRegion> Render(
@@ -108,6 +128,80 @@ public sealed class TaskbarPetRenderer
                 {
                     _workingScratch[workingCount++] = ag;
                 }
+            }
+        }
+
+        if (!ReferenceEquals(state, _lastRenderedState))
+        {
+            _lastRenderedState = state;
+            for (int i = 0; i < workingCount; i++)
+            {
+                var ag = _workingScratch[i];
+                var (kind, label) = AgentActionClassifier.Classify(ag.State, ag.ToolName, ag.TaskTitle);
+                _cachedWorkingItems[i] = new WorkingCacheItem
+                {
+                    ActionKind = kind,
+                    ShortLabel = label,
+                    HitRegionAction = $"agent:{ag.Id}"
+                };
+            }
+            if (workingCount == 1)
+            {
+                _cachedSingleWorkingShortName = ShortenName(_workingScratch[0].Name);
+                _cachedSingleWorkingFocusActionId = string.Equals(_workingScratch[0].Source, "process", StringComparison.OrdinalIgnoreCase)
+                    ? $"focus_agent:{_workingScratch[0].Id}"
+                    : "open_orca";
+                _cachedWorkingMultiLabel = null;
+            }
+            else
+            {
+                _cachedSingleWorkingShortName = null;
+                _cachedSingleWorkingFocusActionId = null;
+                if (totalWorking > 6)
+                {
+                    int extra = totalWorking - workingCount;
+                    _cachedWorkingMultiLabel = $"{workingCount} WORKING (+{extra})";
+                }
+                else
+                {
+                    _cachedWorkingMultiLabel = $"{totalWorking} AGENTS WORKING";
+                }
+            }
+
+            _idleTerminalCount = 0;
+            _idlePrimaryNonProcess = null;
+            for (int i = 0; i < agents.Count; i++)
+            {
+                AgentSnapshot ag = agents[i];
+                if (ag.State == AgentState.Idle)
+                {
+                    if (string.Equals(ag.Source, "process", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (_idleTerminalCount < 2)
+                        {
+                            _idleScratch[_idleTerminalCount] = ag;
+                            _cachedIdleTerminalActionIds[_idleTerminalCount] = $"agent:{ag.Id}";
+                            _idleTerminalCount++;
+                        }
+                    }
+                    else if (_idlePrimaryNonProcess == null)
+                    {
+                        _idlePrimaryNonProcess = ag;
+                    }
+                }
+            }
+            string primaryId = _idlePrimaryNonProcess?.Id ?? (_idlePrimaryNonProcess != null ? ShinobiSpriteRenderer.NormalizeSpriteKey(_idlePrimaryNonProcess.SpriteKey) : "kakashi");
+            _cachedIdlePrimaryActionId = $"agent:{primaryId}";
+
+            if (_idleTerminalCount > 0)
+            {
+                _cachedIdleTopText = _idleTerminalCount == 1
+                    ? $"{ShortenName(_idleScratch[0].Name)} READY"
+                    : $"{_idleTerminalCount} TERMINALS";
+            }
+            else
+            {
+                _cachedIdleTopText = null;
             }
         }
 
@@ -297,7 +391,7 @@ public sealed class TaskbarPetRenderer
             AgentSnapshot ag = _workingScratch[i];
             int cx = rightmostX - i * spacing;
             string sprite = ShinobiSpriteRenderer.NormalizeSpriteKey(ag.SpriteKey);
-            var (actionKind, _) = AgentActionClassifier.Classify(ag.State, ag.ToolName, ag.TaskTitle);
+            AgentActionKind actionKind = _cachedWorkingItems[i].ActionKind;
 
             // Character behind mini desk with clear head & shoulders visible
             ShinobiSpriteRenderer.DrawCharacter(
@@ -320,7 +414,7 @@ public sealed class TaskbarPetRenderer
                 timeSeconds,
                 actionKind: actionKind);
 
-            _hitRegions.Add(new PetHitRegion($"agent:{ag.Id}", cx - 18, GroundY - 36, 36, 38, ag.Name));
+            _hitRegions.Add(new PetHitRegion(_cachedWorkingItems[i].HitRegionAction, cx - 18, GroundY - 36, 36, 38, ag.Name));
 
             if (emitTick)
             {
@@ -334,8 +428,8 @@ public sealed class TaskbarPetRenderer
         if (workingCount == 1)
         {
             AgentSnapshot a = _workingScratch[0];
-            string shortName = ShortenName(a.Name);
-            var (_, shortLabel) = AgentActionClassifier.Classify(a.State, a.ToolName, a.TaskTitle);
+            string shortName = _cachedSingleWorkingShortName ?? ShortenName(a.Name);
+            string shortLabel = _cachedWorkingItems[0].ShortLabel;
             int written = 0;
             ReadOnlySpan<char> sn = shortName.AsSpan();
             int c1 = Math.Min(sn.Length, _textScratch.Length);
@@ -354,19 +448,10 @@ public sealed class TaskbarPetRenderer
         }
         else
         {
-            string label;
-            if (totalWorking > 6)
-            {
-                int extra = totalWorking - workingCount;
-                label = $"{workingCount} WORKING (+{extra})";
-            }
-            else
-            {
-                label = $"{totalWorking} AGENTS WORKING";
-            }
-            int len = Math.Min(label.Length, _textScratch.Length);
-            label.AsSpan(0, len).CopyTo(_textScratch.AsSpan());
-            pillText = _textScratch.AsSpan(0, len);
+            string label = _cachedWorkingMultiLabel ?? (totalWorking > 6
+                ? $"{workingCount} WORKING (+{totalWorking - workingCount})"
+                : $"{totalWorking} AGENTS WORKING");
+            pillText = label.AsSpan();
         }
 
         int textW = PixelFont.MeasureWidth(pillText, PixelFontSize.Small);
@@ -384,49 +469,33 @@ public sealed class TaskbarPetRenderer
         buf.BlendRect(pillX + 7, pillY + 7, 4, 4, ColorCyan, ledAlpha);
         PixelFont.DrawTextTruncated(buf, pillX + 15, pillY + 6, pillW - 21, pillText, ColorWhite, PixelFontSize.Small);
 
-        _hitRegions.Add(new PetHitRegion("open_orca", pillX, pillY, pillW, pillH, "Open Orca"));
+        string actionId = (workingCount == 1 && string.Equals(_workingScratch[0].Source, "process", StringComparison.OrdinalIgnoreCase))
+            ? (_cachedSingleWorkingFocusActionId ?? $"focus_agent:{_workingScratch[0].Id}")
+            : "open_orca";
+        string actionLabel = (workingCount == 1 && string.Equals(_workingScratch[0].Source, "process", StringComparison.OrdinalIgnoreCase))
+            ? _workingScratch[0].Name
+            : "Open Orca";
+
+        _hitRegions.Add(new PetHitRegion(actionId, pillX, pillY, pillW, pillH, actionLabel));
     }
 
     private void RenderIdleChillMode(PixelBuffer buf, HqState state, float timeSeconds, bool emitTick)
     {
         const int primaryX = 346;
 
-        AgentSnapshot? primaryNonProcess = null;
-        var idleTerminalAgents = new List<AgentSnapshot>(2);
-
-        var agents = state.Agents;
-        for (int i = 0; i < agents.Count; i++)
-        {
-            AgentSnapshot ag = agents[i];
-            if (ag.State == AgentState.Idle)
-            {
-                if (string.Equals(ag.Source, "process", StringComparison.OrdinalIgnoreCase))
-                {
-                    if (idleTerminalAgents.Count < 2)
-                    {
-                        idleTerminalAgents.Add(ag);
-                    }
-                }
-                else if (primaryNonProcess == null)
-                {
-                    primaryNonProcess = ag;
-                }
-            }
-        }
-
-        string primarySprite = primaryNonProcess != null
-            ? ShinobiSpriteRenderer.NormalizeSpriteKey(primaryNonProcess.SpriteKey)
+        string primarySprite = _idlePrimaryNonProcess != null
+            ? ShinobiSpriteRenderer.NormalizeSpriteKey(_idlePrimaryNonProcess.SpriteKey)
             : "kakashi";
         if (primarySprite is not ("kakashi" or "shikamaru"))
         {
             primarySprite = "kakashi";
         }
-        string primaryId = primaryNonProcess?.Id ?? primarySprite;
-        string primaryName = primaryNonProcess?.Name ?? primarySprite;
+        string primaryName = _idlePrimaryNonProcess?.Name ?? primarySprite;
+        string primaryActionId = _cachedIdlePrimaryActionId ?? $"agent:{primarySprite}";
 
         // Draw primary idle agent
         ShinobiSpriteRenderer.DrawCharacter(buf, primarySprite, AgentState.Idle, primaryX, GroundY, timeSeconds);
-        _hitRegions.Add(new PetHitRegion($"agent:{primaryId}", primaryX - 16, GroundY - 30, 32, 32, primaryName));
+        _hitRegions.Add(new PetHitRegion(primaryActionId, primaryX - 16, GroundY - 30, 32, 32, primaryName));
 
         if (primarySprite == "shikamaru")
         {
@@ -435,28 +504,29 @@ public sealed class TaskbarPetRenderer
         }
 
         // Draw up to 2 chilling idle terminal agents to the left
-        for (int i = 0; i < idleTerminalAgents.Count; i++)
+        for (int i = 0; i < _idleTerminalCount; i++)
         {
-            var tAg = idleTerminalAgents[i];
+            var tAg = _idleScratch[i];
             int tx = primaryX - (i + 1) * 38;
             string tSprite = ShinobiSpriteRenderer.NormalizeSpriteKey(tAg.SpriteKey);
+            string actionId = _cachedIdleTerminalActionIds[i] ?? $"agent:{tAg.Id}";
 
             ShinobiSpriteRenderer.DrawCharacter(buf, tSprite, AgentState.Idle, tx, GroundY, timeSeconds, phaseOffset: i + 1);
-            _hitRegions.Add(new PetHitRegion($"agent:{tAg.Id}", tx - 16, GroundY - 30, 32, 32, tAg.Name));
+            _hitRegions.Add(new PetHitRegion(actionId, tx - 16, GroundY - 30, 32, 32, tAg.Name));
         }
 
         // Chill bubble
-        int leftmostCharX = primaryX - idleTerminalAgents.Count * 38;
-        int bW = idleTerminalAgents.Count > 0 ? 84 : 76;
+        int leftmostCharX = primaryX - _idleTerminalCount * 38;
+        int bW = _idleTerminalCount > 0 ? 84 : 76;
         int bX = Math.Max(8, leftmostCharX - bW - 12);
         const int bY = 92;
         const int bH = 22;
 
         buf.DrawPixelCard(bX, bY, bW, bH, ColorUtil.FromRgb(22, 26, 38), ColorSlate);
 
-        if (idleTerminalAgents.Count > 0)
+        if (_idleTerminalCount > 0)
         {
-            string topText = idleTerminalAgents.Count == 1 ? $"{ShortenName(idleTerminalAgents[0].Name)} READY" : $"{idleTerminalAgents.Count} TERMINALS";
+            string topText = _cachedIdleTopText ?? (_idleTerminalCount == 1 ? $"{ShortenName(_idleScratch[0].Name)} READY" : $"{_idleTerminalCount} TERMINALS");
             PixelFont.DrawTextCentered(buf, bX + bW / 2, bY + 5, topText, ColorUtil.FromRgb(203, 213, 225), PixelFontSize.Small);
             PixelFont.DrawTextCentered(buf, bX + bW / 2, bY + 13, "HQ IDLE", ColorSlate, PixelFontSize.Small);
         }

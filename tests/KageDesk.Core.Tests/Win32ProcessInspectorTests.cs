@@ -1,0 +1,227 @@
+using System.Runtime.InteropServices;
+using KageDesk.Core.Collectors;
+using Xunit;
+
+namespace KageDesk.Core.Tests;
+
+public class Win32ProcessInspectorTests
+{
+    [Fact]
+    public void TryDecodeUnicodeStringFromBuffer_NullPointer_ReturnsNull()
+    {
+        var result = Win32ProcessInspector.TryDecodeUnicodeStringFromBuffer(IntPtr.Zero, 100, 100);
+        Assert.Null(result);
+    }
+
+    [Theory]
+    [InlineData(0, 100)]   // retLen < headerSize
+    [InlineData(15, 100)]  // retLen < headerSize (header is 16 bytes on x64)
+    [InlineData(101, 100)] // retLen > capacity
+    public void TryDecodeUnicodeStringFromBuffer_InvalidRetLen_ReturnsNull(int retLen, int capacity)
+    {
+        int headerSize = Marshal.SizeOf<Win32ProcessInspector.UNICODE_STRING>();
+        int allocSize = Math.Max(retLen, capacity) + 16;
+        IntPtr pBuf = Marshal.AllocHGlobal(allocSize);
+        try
+        {
+            var result = Win32ProcessInspector.TryDecodeUnicodeStringFromBuffer(pBuf, retLen, capacity);
+            Assert.Null(result);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pBuf);
+        }
+    }
+
+    [Fact]
+    public void TryDecodeUnicodeStringFromBuffer_OddLength_ReturnsNull()
+    {
+        int headerSize = Marshal.SizeOf<Win32ProcessInspector.UNICODE_STRING>();
+        int capacity = 256;
+        IntPtr pBuf = Marshal.AllocHGlobal(capacity);
+        try
+        {
+            var ustr = new Win32ProcessInspector.UNICODE_STRING
+            {
+                Length = 7, // Odd length!
+                MaximumLength = 10,
+                Buffer = IntPtr.Add(pBuf, headerSize)
+            };
+            Marshal.StructureToPtr(ustr, pBuf, false);
+
+            var result = Win32ProcessInspector.TryDecodeUnicodeStringFromBuffer(pBuf, headerSize + 32, capacity);
+            Assert.Null(result);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pBuf);
+        }
+    }
+
+    [Fact]
+    public void TryDecodeUnicodeStringFromBuffer_LengthGreaterThanMaxLen_ReturnsNull()
+    {
+        int headerSize = Marshal.SizeOf<Win32ProcessInspector.UNICODE_STRING>();
+        int capacity = 256;
+        IntPtr pBuf = Marshal.AllocHGlobal(capacity);
+        try
+        {
+            var ustr = new Win32ProcessInspector.UNICODE_STRING
+            {
+                Length = 20,
+                MaximumLength = 10, // Length > MaxLength!
+                Buffer = IntPtr.Add(pBuf, headerSize)
+            };
+            Marshal.StructureToPtr(ustr, pBuf, false);
+
+            var result = Win32ProcessInspector.TryDecodeUnicodeStringFromBuffer(pBuf, headerSize + 32, capacity);
+            Assert.Null(result);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pBuf);
+        }
+    }
+
+    [Fact]
+    public void TryDecodeUnicodeStringFromBuffer_ZeroLength_ReturnsEmptyString()
+    {
+        int headerSize = Marshal.SizeOf<Win32ProcessInspector.UNICODE_STRING>();
+        int capacity = 256;
+        IntPtr pBuf = Marshal.AllocHGlobal(capacity);
+        try
+        {
+            var ustr = new Win32ProcessInspector.UNICODE_STRING
+            {
+                Length = 0,
+                MaximumLength = 10,
+                Buffer = IntPtr.Add(pBuf, headerSize)
+            };
+            Marshal.StructureToPtr(ustr, pBuf, false);
+
+            var result = Win32ProcessInspector.TryDecodeUnicodeStringFromBuffer(pBuf, headerSize + 32, capacity);
+            Assert.Equal(string.Empty, result);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pBuf);
+        }
+    }
+
+    [Fact]
+    public void TryDecodeUnicodeStringFromBuffer_ZeroBufferPtr_ReturnsNull()
+    {
+        int headerSize = Marshal.SizeOf<Win32ProcessInspector.UNICODE_STRING>();
+        int capacity = 256;
+        IntPtr pBuf = Marshal.AllocHGlobal(capacity);
+        try
+        {
+            var ustr = new Win32ProcessInspector.UNICODE_STRING
+            {
+                Length = 10,
+                MaximumLength = 20,
+                Buffer = IntPtr.Zero // Zero buffer ptr with non-zero length
+            };
+            Marshal.StructureToPtr(ustr, pBuf, false);
+
+            var result = Win32ProcessInspector.TryDecodeUnicodeStringFromBuffer(pBuf, headerSize + 32, capacity);
+            Assert.Null(result);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pBuf);
+        }
+    }
+
+    [Theory]
+    [InlineData(-4)] // Before payloadStart
+    [InlineData(100)] // Past payloadEnd
+    public void TryDecodeUnicodeStringFromBuffer_OutOfRangeBufferPointer_ReturnsNull(int offsetFromPayloadStart)
+    {
+        int headerSize = Marshal.SizeOf<Win32ProcessInspector.UNICODE_STRING>();
+        int payloadLen = 32;
+        int retLen = headerSize + payloadLen;
+        int capacity = 256;
+        IntPtr pBuf = Marshal.AllocHGlobal(capacity);
+        try
+        {
+            IntPtr bufferPtr = IntPtr.Add(pBuf, headerSize + offsetFromPayloadStart);
+            var ustr = new Win32ProcessInspector.UNICODE_STRING
+            {
+                Length = 10,
+                MaximumLength = 20,
+                Buffer = bufferPtr
+            };
+            Marshal.StructureToPtr(ustr, pBuf, false);
+
+            var result = Win32ProcessInspector.TryDecodeUnicodeStringFromBuffer(pBuf, retLen, capacity);
+            Assert.Null(result);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pBuf);
+        }
+    }
+
+    [Fact]
+    public void TryDecodeUnicodeStringFromBuffer_LengthExceedingPayloadEnd_ReturnsNull()
+    {
+        int headerSize = Marshal.SizeOf<Win32ProcessInspector.UNICODE_STRING>();
+        int payloadLen = 16;
+        int retLen = headerSize + payloadLen;
+        int capacity = 256;
+        IntPtr pBuf = Marshal.AllocHGlobal(capacity);
+        try
+        {
+            // Buffer starts at headerSize + 10, length is 10 bytes -> ends at headerSize + 20 > headerSize + 16
+            IntPtr bufferPtr = IntPtr.Add(pBuf, headerSize + 10);
+            var ustr = new Win32ProcessInspector.UNICODE_STRING
+            {
+                Length = 10,
+                MaximumLength = 20,
+                Buffer = bufferPtr
+            };
+            Marshal.StructureToPtr(ustr, pBuf, false);
+
+            var result = Win32ProcessInspector.TryDecodeUnicodeStringFromBuffer(pBuf, retLen, capacity);
+            Assert.Null(result);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pBuf);
+        }
+    }
+
+    [Fact]
+    public void TryDecodeUnicodeStringFromBuffer_ValidBuffer_ReturnsDecodedString()
+    {
+        string expected = "codex --agent -p \"test\"";
+        byte[] expectedBytes = System.Text.Encoding.Unicode.GetBytes(expected);
+
+        int headerSize = Marshal.SizeOf<Win32ProcessInspector.UNICODE_STRING>();
+        int payloadLen = expectedBytes.Length + 4; // slight extra room
+        int retLen = headerSize + payloadLen;
+        int capacity = 512;
+        IntPtr pBuf = Marshal.AllocHGlobal(capacity);
+        try
+        {
+            IntPtr bufferPtr = IntPtr.Add(pBuf, headerSize);
+            Marshal.Copy(expectedBytes, 0, bufferPtr, expectedBytes.Length);
+
+            var ustr = new Win32ProcessInspector.UNICODE_STRING
+            {
+                Length = (ushort)expectedBytes.Length,
+                MaximumLength = (ushort)(expectedBytes.Length + 2),
+                Buffer = bufferPtr
+            };
+            Marshal.StructureToPtr(ustr, pBuf, false);
+
+            var result = Win32ProcessInspector.TryDecodeUnicodeStringFromBuffer(pBuf, retLen, capacity);
+            Assert.Equal(expected, result);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pBuf);
+        }
+    }
+}

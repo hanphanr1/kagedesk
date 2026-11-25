@@ -359,28 +359,23 @@ public class PetOverlayForm : Form
             {
                 if (hit.ActionId == "open_orca")
                 {
-                    AgentSnapshot? soleTerminal = null;
-                    int workingCount = 0;
-                    var agents = _currentState.Agents;
-                    for (int i = 0; i < agents.Count; i++)
+                    WindowFocuser.TryFocusOrca();
+                    return;
+                }
+                if (hit.ActionId.StartsWith("focus_agent:"))
+                {
+                    string agentId = hit.ActionId["focus_agent:".Length..];
+                    var agent = _currentState.Agents.FirstOrDefault(a => a.Id == agentId);
+                    if (agent?.ProcessId.HasValue == true)
                     {
-                        if (agents[i].State == AgentState.Working)
+                        if (!WindowFocuser.TryFocusProcessWindow(agent.ProcessId.Value, agent.ProcessStartTicks))
                         {
-                            workingCount++;
-                            if (string.Equals(agents[i].Source, "process", StringComparison.OrdinalIgnoreCase) && agents[i].ProcessId.HasValue)
-                            {
-                                soleTerminal = agents[i];
-                            }
+                            AgentDetailToast.ShowToast(agent);
                         }
                     }
-
-                    if (workingCount == 1 && soleTerminal != null && soleTerminal.ProcessId.HasValue)
+                    else if (agent != null)
                     {
-                        WindowFocuser.TryFocusProcessWindow(soleTerminal.ProcessId.Value);
-                    }
-                    else
-                    {
-                        WindowFocuser.TryFocusOrca();
+                        AgentDetailToast.ShowToast(agent);
                     }
                     return;
                 }

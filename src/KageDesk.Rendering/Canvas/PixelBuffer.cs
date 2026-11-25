@@ -215,8 +215,10 @@ public sealed class PixelBuffer : IDisposable
     {
         if (w < 4 || h < 4) return;
         // Cut 1px corners for crisp retro pixel-art panel feel
-        FillRect(x + 1, y, w - 2, h, borderArgb);
-        FillRect(x, y + 1, w, h - 2, borderArgb);
+        FillRect(x + 1, y, w - 2, 1, borderArgb);
+        FillRect(x + 1, y + h - 1, w - 2, 1, borderArgb);
+        FillRect(x, y + 1, 1, h - 2, borderArgb);
+        FillRect(x + w - 1, y + 1, 1, h - 2, borderArgb);
         FillRect(x + 1, y + 1, w - 2, h - 2, fillArgb);
 
         if (innerHighlightArgb != 0)

@@ -27,7 +27,7 @@ public sealed class HqWallpaperRenderer
     private static readonly string[] CoreDefaultNames = { "SHIKAMARU", "MINATO", "TSUNADE", "KAKASHI" };
     private static readonly string[] CoreDefaultSprites = { "shikamaru", "minato", "tsunade", "kakashi" };
 
-    private struct StationSlot
+    internal struct StationSlot
     {
         public bool Occupied;
         public string Name;
@@ -36,6 +36,12 @@ public sealed class HqWallpaperRenderer
         public AgentState State;
         public string? ToolName;
         public int VariantSeed;
+        public AgentActionKind ActionKind;
+        public string BadgeLabel;
+        public NameplateLayout Layout;
+        public int BorderCol;
+        public int BadgeBg;
+        public int BadgeFg;
     }
 
     private readonly StationSlot[] _coreSlots = new StationSlot[4];
@@ -48,12 +54,22 @@ public sealed class HqWallpaperRenderer
 
     private ThemePack? _cachedTheme;
     private ResolvedScenePalette _palette;
+    private readonly int[] _cachedBackdropNoExtra = new int[CanvasWidth * CanvasHeight];
+    private readonly int[] _cachedBackdropWithExtra = new int[CanvasWidth * CanvasHeight];
+    private ThemePack? _backdropTheme;
+    private bool _backdropNoExtraValid;
+    private bool _backdropWithExtraValid;
+
     private float _lastTime = -1f;
     private float _emitAccum;
     private int _lastCloneCount;
     private string? _cachedPrimaryBranch;
     private string? _cachedPrimaryWorkflow;
     private string? _cachedBranchText;
+    private HqState? _lastAssignedState;
+    private int _cachedExtraCount;
+    private AccountInfo? _cachedActiveAccount;
+    private string? _cachedFirstAgentRepo;
 
     public void ResetEffects()
     {
@@ -61,6 +77,7 @@ public sealed class HqWallpaperRenderer
         _lastTime = -1f;
         _emitAccum = 0f;
         _lastCloneCount = 0;
+        _lastAssignedState = null;
     }
 
     public void Render(PixelBuffer buf, HqState state, ThemePack theme, float timeSeconds)
@@ -74,12 +91,23 @@ public sealed class HqWallpaperRenderer
         {
             _cachedTheme = theme;
             _palette = new ResolvedScenePalette(theme);
+            _backdropNoExtraValid = false;
+            _backdropWithExtraValid = false;
+            _backdropTheme = theme;
+            _lastAssignedState = null;
         }
 
         float dt = _lastTime < 0f ? 0.033f : Math.Clamp(timeSeconds - _lastTime, 0f, 0.2f);
         _lastTime = timeSeconds;
 
-        int extraCount = AssignStations(state);
+        int extraCount;
+        if (!ReferenceEquals(state, _lastAssignedState))
+        {
+            _lastAssignedState = state;
+            _cachedExtraCount = AssignStations(state);
+        }
+        extraCount = _cachedExtraCount;
+
         bool hasExtraRow = extraCount > 0;
         bool anyApproval = false;
         int approvalAlertX = -1;
@@ -127,7 +155,7 @@ public sealed class HqWallpaperRenderer
             DrawWorkstation(buf, ref _coreSlots[i], CoreStationCentersX[i], coreDeskY, timeSeconds, i);
         }
 
-        // 6. Row 2: Dynamic Clone / External Workstations (up to 4)
+        // 6. Row 2: Dynamic Clone / External Workstations (up to 5)
         for (int i = 0; i < extraCount; i++)
         {
             int cx = GetExtraStationCenterX(i, extraCount);
@@ -156,7 +184,9 @@ public sealed class HqWallpaperRenderer
                 StationType = CoreDefaultSprites[i],
                 State = AgentState.Idle,
                 ToolName = null,
-                VariantSeed = i
+                VariantSeed = i,
+                ActionKind = AgentActionKind.None,
+                BadgeLabel = "IDLE"
             };
         }
         for (int i = 0; i < 5; i++)
@@ -174,6 +204,7 @@ public sealed class HqWallpaperRenderer
 
             if (coreIndex >= 0 && !_coreSlots[coreIndex].Occupied)
             {
+                var (actionKind, badgeLabel) = AgentActionClassifier.Classify(ag.State, ag.ToolName, ag.TaskTitle);
                 _coreSlots[coreIndex] = new StationSlot
                 {
                     Occupied = true,
@@ -182,7 +213,9 @@ public sealed class HqWallpaperRenderer
                     StationType = CoreDefaultSprites[coreIndex],
                     State = ag.State,
                     ToolName = ag.ToolName,
-                    VariantSeed = HashString(ag.Id)
+                    VariantSeed = HashString(ag.Id),
+                    ActionKind = actionKind,
+                    BadgeLabel = badgeLabel
                 };
             }
             else
@@ -201,6 +234,7 @@ public sealed class HqWallpaperRenderer
             string sprite = ShinobiSpriteRenderer.NormalizeSpriteKey(ag.SpriteKey);
             if (ag.Role == AgentRole.Clone) sprite = "clone";
 
+            var (actionKind, badgeLabel) = AgentActionClassifier.Classify(ag.State, ag.ToolName, ag.TaskTitle);
             _extraSlots[i] = new StationSlot
             {
                 Occupied = true,
@@ -209,11 +243,69 @@ public sealed class HqWallpaperRenderer
                 StationType = "clone",
                 State = ag.State,
                 ToolName = ag.ToolName,
-                VariantSeed = HashString(ag.Id)
+                VariantSeed = HashString(ag.Id),
+                ActionKind = actionKind,
+                BadgeLabel = badgeLabel
             };
         }
 
+        bool hasExtraRow = extraCount > 0;
+        int coreDeskY = hasExtraRow ? 104 : 126;
+        int extraDeskY = 168;
+
+        int coreY = coreDeskY + 20;
+        for (int i = 0; i < 4; i++)
+        {
+            FinalizeSlotLayout(ref _coreSlots[i], CoreStationCentersX[i], coreY, 84);
+        }
+
+        int extraY = extraDeskY + 20;
+        int maxExtraPlateWidth = extraCount == 5 ? 68 : 84;
+        for (int i = 0; i < extraCount; i++)
+        {
+            int cx = GetExtraStationCenterX(i, extraCount);
+            FinalizeSlotLayout(ref _extraSlots[i], cx, extraY, maxExtraPlateWidth);
+        }
+
+        _cachedActiveAccount = null;
+        for (int i = 0; i < state.Accounts.Count; i++)
+        {
+            if (state.Accounts[i].IsActive) { _cachedActiveAccount = state.Accounts[i]; break; }
+        }
+        if (_cachedActiveAccount == null && state.Accounts.Count > 0) _cachedActiveAccount = state.Accounts[0];
+
+        _cachedFirstAgentRepo = null;
+        for (int i = 0; i < state.Agents.Count; i++)
+        {
+            if (!string.IsNullOrWhiteSpace(state.Agents[i].Repo)) { _cachedFirstAgentRepo = state.Agents[i].Repo; break; }
+        }
+
         return extraCount;
+    }
+
+    private void FinalizeSlotLayout(ref StationSlot slot, int cx, int y, int maxPlateWidth)
+    {
+        ReadOnlySpan<char> badge = (slot.BadgeLabel ?? "IDLE").AsSpan();
+        ReadOnlySpan<char> nameSpan = slot.Name.AsSpan();
+        if (nameSpan.Length > 10) nameSpan = nameSpan.Slice(0, 10);
+        slot.Layout = ComputeNameplateLayout(cx, y, nameSpan, badge, maxPlateWidth);
+
+        (slot.BadgeBg, slot.BadgeFg) = slot.State switch
+        {
+            AgentState.Working => (ColorCyanDark, ColorCyan),
+            AgentState.NeedsApproval => (ColorAmberDark, ColorAmberBright),
+            AgentState.Done => (ColorEmeraldDark, ColorEmerald),
+            AgentState.Failed => (ColorCrimsonDark, ColorCrimson),
+            _ => (ColorSlateDark, ColorSlate)
+        };
+        slot.BorderCol = slot.State switch
+        {
+            AgentState.NeedsApproval => ColorAmber,
+            AgentState.Failed => ColorCrimson,
+            AgentState.Done => ColorEmerald,
+            AgentState.Working => ColorCyan,
+            _ => _palette.Border
+        };
     }
 
     private static int ComputeExtraStationPriority(AgentSnapshot ag)
@@ -255,6 +347,48 @@ public sealed class HqWallpaperRenderer
     }
 
     private void DrawRoomBackdrop(PixelBuffer buf, float timeSeconds, bool hasExtraRow)
+    {
+        if (hasExtraRow)
+        {
+            if (_backdropWithExtraValid && ReferenceEquals(_backdropTheme, _cachedTheme))
+            {
+                _cachedBackdropWithExtra.AsSpan().CopyTo(buf.Pixels);
+            }
+            else
+            {
+                RenderStaticBackdropTo(buf, hasExtraRow: true);
+                buf.ReadOnlyPixels.CopyTo(_cachedBackdropWithExtra);
+                _backdropWithExtraValid = true;
+                _backdropTheme = _cachedTheme;
+            }
+        }
+        else
+        {
+            if (_backdropNoExtraValid && ReferenceEquals(_backdropTheme, _cachedTheme))
+            {
+                _cachedBackdropNoExtra.AsSpan().CopyTo(buf.Pixels);
+            }
+            else
+            {
+                RenderStaticBackdropTo(buf, hasExtraRow: false);
+                buf.ReadOnlyPixels.CopyTo(_cachedBackdropNoExtra);
+                _backdropNoExtraValid = true;
+                _backdropTheme = _cachedTheme;
+            }
+        }
+
+        if (_palette.SkylineStyle == "cyber")
+        {
+            int rugX = 24;
+            int rugY = hasExtraRow ? 98 : 112;
+            int rugW = 336;
+            int rugH = hasExtraRow ? 104 : 88;
+            int pulse = 140 + (int)(MathF.Sin(timeSeconds * 3.5f) * 55f);
+            buf.DrawOutlineRect(rugX + 2, rugY + 2, rugW - 4, rugH - 4, ColorUtil.WithAlpha(ColorCyan, pulse));
+        }
+    }
+
+    private void RenderStaticBackdropTo(PixelBuffer buf, bool hasExtraRow)
     {
         // Upper wall (y: 0..71)
         buf.FillVerticalGradient(0, 0, CanvasWidth, 72, _palette.WallTop, _palette.WallBottom);
@@ -319,10 +453,8 @@ public sealed class HqWallpaperRenderer
 
         if (_palette.SkylineStyle == "cyber")
         {
-            // Cyber holo mat neon corner brackets & pulsing circuit border
-            int pulse = 140 + (int)(MathF.Sin(timeSeconds * 3.5f) * 55f);
+            // Cyber holo mat neon corner brackets
             int magenta = ColorUtil.FromRgb(236, 72, 153);
-            buf.DrawOutlineRect(rugX + 2, rugY + 2, rugW - 4, rugH - 4, ColorUtil.WithAlpha(ColorCyan, pulse));
             buf.FillRect(rugX + 1, rugY + 1, 10, 2, magenta);
             buf.FillRect(rugX + 1, rugY + 1, 2, 10, magenta);
             buf.FillRect(rugX + rugW - 11, rugY + 1, 10, 2, magenta);
@@ -368,17 +500,8 @@ public sealed class HqWallpaperRenderer
         PixelFont.DrawText(buf, bx + 4, by + 4, "ACCOUNTS", _palette.Accent, PixelFontSize.Small);
         buf.FillRect(bx + 2, by + 11, bw - 4, 1, _palette.Border);
 
-        AccountInfo? active = null;
+        AccountInfo? active = _cachedActiveAccount;
         var accounts = state.Accounts;
-        for (int i = 0; i < accounts.Count; i++)
-        {
-            if (accounts[i].IsActive)
-            {
-                active = accounts[i];
-                break;
-            }
-        }
-        if (active == null && accounts.Count > 0) active = accounts[0];
 
         if (active != null)
         {
@@ -799,7 +922,7 @@ public sealed class HqWallpaperRenderer
         PixelFont.DrawText(buf, lx + 13, ly + 1, statusText, lanternColor, PixelFontSize.Regular);
 
         // Active repo & branch
-        string repo = primary?.Repo ?? FindFirstAgentRepo(state) ?? "KAGEDESK";
+        string repo = primary?.Repo ?? _cachedFirstAgentRepo ?? "KAGEDESK";
         string branch;
         if (primary != null)
         {
@@ -1059,9 +1182,41 @@ public sealed class HqWallpaperRenderer
         }
     }
 
+    public readonly record struct NameplateLayout(
+        int TotalWidth,
+        int Height,
+        int X,
+        int Y,
+        int NameAvailableWidth,
+        int BadgeX,
+        int BadgeWidth,
+        int BadgeHeight
+    )
+    {
+        public int Left => X;
+        public int Right => X + TotalWidth;
+    }
+
+    internal static NameplateLayout ComputeNameplateLayout(
+        int cx,
+        int y,
+        ReadOnlySpan<char> nameSpan,
+        ReadOnlySpan<char> badgeSpan,
+        int maxPlateWidth)
+    {
+        int badgeW = PixelFont.MeasureWidth(badgeSpan, PixelFontSize.Small) + 4;
+        int nameW = PixelFont.MeasureWidth(nameSpan, PixelFontSize.Small) + 5;
+        int totalW = Math.Min(maxPlateWidth, nameW + badgeW + 3);
+        int x = cx - totalW / 2;
+        int h = 11;
+        int nameAvail = Math.Max(0, totalW - badgeW - 5);
+        int bx = x + totalW - badgeW - 1;
+        return new NameplateLayout(totalW, h, x, y, nameAvail, bx, badgeW, h - 2);
+    }
+
     private void DrawWorkstation(PixelBuffer buf, ref StationSlot slot, int cx, int deskY, float timeSeconds, int phase)
     {
-        var (actionKind, _) = AgentActionClassifier.Classify(slot.State, slot.ToolName);
+        AgentActionKind actionKind = slot.ActionKind;
 
         // Character sits behind desk with full face & upper outfit clearly visible above desk & monitors
         ShinobiSpriteRenderer.DrawCharacter(
@@ -1105,55 +1260,23 @@ public sealed class HqWallpaperRenderer
         }
 
         // Crisp nameplate & tool/state badge strictly below desk (y = deskY + 20 .. deskY + 31)
-        DrawNameplateAndBadge(buf, ref slot, cx, deskY + 20);
+        DrawNameplateAndBadge(buf, ref slot);
     }
 
-    private void DrawNameplateAndBadge(PixelBuffer buf, ref StationSlot slot, int cx, int y)
+    private void DrawNameplateAndBadge(PixelBuffer buf, ref StationSlot slot)
     {
-        // Compact pill: [NAME | BADGE] max width 84px so adjacent stations (spacing 90px) NEVER overlap
-        ReadOnlySpan<char> badge = ResolveBadgeText(slot.State, slot.ToolName);
-        (int badgeBg, int badgeFg) = slot.State switch
-        {
-            AgentState.Working => (ColorCyanDark, ColorCyan),
-            AgentState.NeedsApproval => (ColorAmberDark, ColorAmberBright),
-            AgentState.Done => (ColorEmeraldDark, ColorEmerald),
-            AgentState.Failed => (ColorCrimsonDark, ColorCrimson),
-            _ => (ColorSlateDark, ColorSlate)
-        };
-
-        int badgeW = PixelFont.MeasureWidth(badge, PixelFontSize.Small) + 4;
-        int maxNameChars = 10;
+        ReadOnlySpan<char> badge = (slot.BadgeLabel ?? "IDLE").AsSpan();
         ReadOnlySpan<char> nameSpan = slot.Name.AsSpan();
-        if (nameSpan.Length > maxNameChars) nameSpan = nameSpan.Slice(0, maxNameChars);
-        int nameW = PixelFont.MeasureWidth(nameSpan, PixelFontSize.Small) + 5;
+        if (nameSpan.Length > 10) nameSpan = nameSpan.Slice(0, 10);
 
-        int totalW = Math.Min(84, nameW + badgeW + 3);
-        int x = cx - totalW / 2;
-        int h = 11;
+        ref readonly var layout = ref slot.Layout;
 
-        int borderCol = slot.State switch
-        {
-            AgentState.NeedsApproval => ColorAmber,
-            AgentState.Failed => ColorCrimson,
-            AgentState.Done => ColorEmerald,
-            AgentState.Working => ColorCyan,
-            _ => _palette.Border
-        };
+        buf.DrawPixelCard(layout.X, layout.Y, layout.TotalWidth, layout.Height, _palette.BoardBg, slot.BorderCol);
 
-        buf.DrawPixelCard(x, y, totalW, h, _palette.BoardBg, borderCol);
+        PixelFont.DrawTextTruncated(buf, layout.X + 3, layout.Y + 3, layout.NameAvailableWidth, nameSpan, _palette.Text, PixelFontSize.Small);
 
-        int nameAvail = totalW - badgeW - 5;
-        PixelFont.DrawTextTruncated(buf, x + 3, y + 3, nameAvail, nameSpan, _palette.Text, PixelFontSize.Small);
-
-        int bx = x + totalW - badgeW - 1;
-        buf.FillRect(bx, y + 1, badgeW, h - 2, badgeBg);
-        PixelFont.DrawText(buf, bx + 2, y + 3, badge, badgeFg, PixelFontSize.Small);
-    }
-
-    private static ReadOnlySpan<char> ResolveBadgeText(AgentState state, string? toolName)
-    {
-        var (_, shortLabel) = AgentActionClassifier.Classify(state, toolName);
-        return shortLabel.AsSpan();
+        buf.FillRect(layout.BadgeX, layout.Y + 1, layout.BadgeWidth, layout.BadgeHeight, slot.BadgeBg);
+        PixelFont.DrawText(buf, layout.BadgeX + 2, layout.Y + 3, badge, slot.BadgeFg, PixelFontSize.Small);
     }
 
     private static void DrawApprovalSpotlight(PixelBuffer buf, int focusX, int focusY, float timeSeconds)

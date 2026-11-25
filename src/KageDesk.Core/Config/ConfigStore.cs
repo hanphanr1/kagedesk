@@ -49,10 +49,14 @@ public class ConfigStore
             try
             {
                 using var doc = JsonDocument.Parse(json);
-                if (doc.RootElement.TryGetProperty("ConfigVersion", out var verProp) && verProp.TryGetInt32(out var v))
+                foreach (var prop in doc.RootElement.EnumerateObject())
                 {
-                    hasExplicitVersion = true;
-                    fileVersion = v;
+                    if (string.Equals(prop.Name, "ConfigVersion", StringComparison.OrdinalIgnoreCase) && prop.Value.TryGetInt32(out var v))
+                    {
+                        hasExplicitVersion = true;
+                        fileVersion = v;
+                        break;
+                    }
                 }
             }
             catch { }

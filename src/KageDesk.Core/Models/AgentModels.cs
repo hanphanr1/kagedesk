@@ -73,7 +73,8 @@ public record AgentSnapshot(
     bool Unread = false,
     string? QuestionPrompt = null,
     string? Source = null,
-    [property: JsonIgnore] int? ProcessId = null
+    [property: JsonIgnore] int? ProcessId = null,
+    [property: JsonIgnore] long? ProcessStartTicks = null
 );
 
 public record AccountInfo(

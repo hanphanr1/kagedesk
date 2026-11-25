@@ -84,4 +84,65 @@ public class PublicStateDtosTests
         // Ensure RecentBuilds is ignored in JSON serialization (does not duplicate builds array)
         Assert.False(root.TryGetProperty("recentBuilds", out _));
     }
+
+    [Fact]
+    public void AgentSerialization_ZeroNumericPidOrTicksLeakage()
+    {
+        const int numericPid = 54321;
+        const long startTicks = 638000000000000000L;
+        const string opaqueId = "proc:claude:a1b2c3d4";
+
+        var agent = new AgentSnapshot(
+            Id: opaqueId,
+            Name: "Claude CLI",
+            Role: AgentRole.External,
+            SpriteKey: "generic",
+            State: AgentState.Working,
+            ProcessId: numericPid,
+            ProcessStartTicks: startTicks,
+            Source: "process"
+        );
+
+        // 1. Direct AgentSnapshot serialization
+        var snapshotJson = JsonSerializer.Serialize(agent);
+        Assert.DoesNotContain("54321", snapshotJson);
+        Assert.DoesNotContain("ProcessId", snapshotJson, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("ProcessStartTicks", snapshotJson, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(opaqueId, snapshotJson);
+
+        // 2. PublicAgentDto projection & serialization
+        var publicDto = new PublicAgentDto(
+            Id: agent.Id,
+            Name: agent.Name,
+            Role: agent.Role,
+            SpriteKey: agent.SpriteKey,
+            State: agent.State,
+            ToolName: agent.ToolName,
+            TaskTitle: agent.TaskTitle
+        );
+
+        var publicJson = JsonSerializer.Serialize(publicDto);
+        Assert.DoesNotContain("54321", publicJson);
+        Assert.DoesNotContain("ProcessId", publicJson, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("ProcessStartTicks", publicJson, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(opaqueId, publicJson);
+
+        // 3. Verify public state DTO containing process agents has zero PID leakage
+        var stateDto = new PublicHqStateDto(
+            Agents: new List<PublicAgentDto> { publicDto },
+            Accounts: Array.Empty<PublicAccountDto>(),
+            Builds: Array.Empty<PublicBuildDto>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: Array.Empty<PublicVisualEventDto>(),
+            DemoScenario: null,
+            Timestamp: DateTimeOffset.UtcNow
+        );
+
+        var stateJson = JsonSerializer.Serialize(stateDto);
+        Assert.DoesNotContain("54321", stateJson);
+        Assert.DoesNotContain("638000000000000000", stateJson);
+        Assert.DoesNotContain("processId", stateJson, StringComparison.OrdinalIgnoreCase);
+    }
 }
+

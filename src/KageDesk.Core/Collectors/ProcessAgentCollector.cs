@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Security.Cryptography;
 using KageDesk.Core.Models;
 using KageDesk.Core.State;
 
@@ -34,9 +35,29 @@ public class ProcessAgentCollector
     private readonly IProcessInspectionProvider _inspector;
     private readonly Func<DateTimeOffset> _timeProvider;
     private readonly Dictionary<int, AgentPidState> _history = new();
+    private readonly Dictionary<(int Pid, long StartTicks), string> _opaqueTokens = new();
+    private readonly HashSet<string> _usedTokens = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _lock = new();
 
-    public bool Enabled { get; set; }
+    private bool _enabled;
+    public bool Enabled
+    {
+        get => _enabled;
+        set
+        {
+            if (_enabled && !value)
+            {
+                lock (_lock)
+                {
+                    _history.Clear();
+                    _opaqueTokens.Clear();
+                    _usedTokens.Clear();
+                }
+                _inspector.ClearCache();
+            }
+            _enabled = value;
+        }
+    }
 
     public ProcessAgentCollector(
         HqStateAggregator aggregator,
@@ -45,9 +66,26 @@ public class ProcessAgentCollector
         Func<DateTimeOffset>? timeProvider = null)
     {
         _aggregator = aggregator ?? throw new ArgumentNullException(nameof(aggregator));
-        Enabled = enabled;
         _inspector = inspector ?? Win32ProcessInspector.Instance;
         _timeProvider = timeProvider ?? (() => DateTimeOffset.UtcNow);
+        Enabled = enabled;
+    }
+
+    private string GetOrCreateOpaqueToken(int pid, long startTicks)
+    {
+        var key = (pid, startTicks);
+        if (_opaqueTokens.TryGetValue(key, out var token))
+        {
+            return token;
+        }
+
+        do
+        {
+            token = Convert.ToHexString(RandomNumberGenerator.GetBytes(4)).ToLowerInvariant();
+        } while (!_usedTokens.Add(token));
+
+        _opaqueTokens[key] = token;
+        return token;
     }
 
     public IReadOnlyList<AgentSnapshot> DetectProcesses()
@@ -60,7 +98,12 @@ public class ProcessAgentCollector
             var processes = _inspector.InspectProcesses();
             if (processes.Count == 0)
             {
-                lock (_lock) { _history.Clear(); }
+                lock (_lock)
+                {
+                    _history.Clear();
+                    _opaqueTokens.Clear();
+                    _usedTokens.Clear();
+                }
                 return Array.Empty<AgentSnapshot>();
             }
 
@@ -122,170 +165,31 @@ public class ProcessAgentCollector
                     continue; // Exclude Orca and any of its child processes
                 }
 
-                string exeLower = p.ExeName.ToLowerInvariant();
-                string cmdLower = p.CommandLine?.ToLowerInvariant() ?? string.Empty;
-
-                // 1. omp.exe (exclude __omp_worker_ helper daemons)
-                if (exeLower is "omp.exe" or "omp")
+                var cl = p.Classification ?? Win32ProcessInspector.ClassifyProcess(p.ExeName, p.CommandLine);
+                if (cl.IsInternalDaemon || cl.IsElectronHelper || cl.Provider == null)
                 {
-                    if (cmdLower.Contains("__omp_worker_"))
-                        continue;
-
-                    candidates.Add(new MatchedCandidate(
-                        p.ProcessId,
-                        p.StartTimeTicks,
-                        "OMP",
-                        "omp",
-                        AgentRole.Coder,
-                        "omp"
-                    ));
                     continue;
                 }
 
-                // 2. agy.exe or antigravity.exe
-                if (exeLower is "agy.exe" or "agy" or "antigravity.exe" or "antigravity")
+                (AgentRole role, string spriteKey) = cl.Provider switch
                 {
-                    if (cmdLower.Contains("--type=") ||
-                        cmdLower.Contains("--crashpad") ||
-                        cmdLower.Contains("crashpad-handler"))
-                    {
-                        continue;
-                    }
+                    "OMP" => (AgentRole.Coder, "omp"),
+                    "AGY" => (AgentRole.Leader, "agy"),
+                    "CLAUDE" => (AgentRole.Coder, "claude"),
+                    "CODEX" => (AgentRole.Coder, "codex"),
+                    "OPENCODE" => (AgentRole.External, "generic"),
+                    "GEMINI" => (AgentRole.External, "agy"),
+                    _ => (AgentRole.Coder, "generic")
+                };
 
-                    candidates.Add(new MatchedCandidate(
-                        p.ProcessId,
-                        p.StartTimeTicks,
-                        "AGY",
-                        "agy",
-                        AgentRole.Leader,
-                        "agy"
-                    ));
-                    continue;
-                }
-
-                // 3. claude.exe OR node.exe / bun.exe running claude-code
-                if (exeLower is "claude.exe" or "claude")
-                {
-                    candidates.Add(new MatchedCandidate(
-                        p.ProcessId,
-                        p.StartTimeTicks,
-                        "CLAUDE",
-                        "claude",
-                        AgentRole.Coder,
-                        "claude"
-                    ));
-                    continue;
-                }
-                if (exeLower is "node.exe" or "node" or "bun.exe" or "bun")
-                {
-                    if (cmdLower.Contains("claude-code") ||
-                        cmdLower.Contains("@anthropic-ai/claude") ||
-                        cmdLower.Contains("\\claude.js") ||
-                        cmdLower.Contains("/claude.js") ||
-                        cmdLower.Contains("/claude") ||
-                        cmdLower.Contains("\\claude"))
-                    {
-                        candidates.Add(new MatchedCandidate(
-                            p.ProcessId,
-                            p.StartTimeTicks,
-                            "CLAUDE",
-                            "claude",
-                            AgentRole.Coder,
-                            "claude"
-                        ));
-                        continue;
-                    }
-                }
-
-                // 4. codex.exe OR node.exe / bun.exe running codex
-                if (exeLower is "codex.exe" or "codex")
-                {
-                    candidates.Add(new MatchedCandidate(
-                        p.ProcessId,
-                        p.StartTimeTicks,
-                        "CODEX",
-                        "codex",
-                        AgentRole.Coder,
-                        "codex"
-                    ));
-                    continue;
-                }
-                if (exeLower is "node.exe" or "node" or "bun.exe" or "bun")
-                {
-                    if (cmdLower.Contains("@openai/codex") ||
-                        cmdLower.Contains("\\codex") ||
-                        cmdLower.Contains("/codex"))
-                    {
-                        candidates.Add(new MatchedCandidate(
-                            p.ProcessId,
-                            p.StartTimeTicks,
-                            "CODEX",
-                            "codex",
-                            AgentRole.Coder,
-                            "codex"
-                        ));
-                        continue;
-                    }
-                }
-
-                // 5. opencode.exe OR node.exe / bun.exe running opencode
-                if (exeLower is "opencode.exe" or "opencode")
-                {
-                    candidates.Add(new MatchedCandidate(
-                        p.ProcessId,
-                        p.StartTimeTicks,
-                        "OPENCODE",
-                        "opencode",
-                        AgentRole.External,
-                        "generic"
-                    ));
-                    continue;
-                }
-                if (exeLower is "node.exe" or "node" or "bun.exe" or "bun")
-                {
-                    if (cmdLower.Contains("opencode"))
-                    {
-                        candidates.Add(new MatchedCandidate(
-                            p.ProcessId,
-                            p.StartTimeTicks,
-                            "OPENCODE",
-                            "opencode",
-                            AgentRole.External,
-                            "generic"
-                        ));
-                        continue;
-                    }
-                }
-
-                // 6. gemini.exe OR node.exe / bun.exe running gemini-cli
-                if (exeLower is "gemini.exe" or "gemini")
-                {
-                    candidates.Add(new MatchedCandidate(
-                        p.ProcessId,
-                        p.StartTimeTicks,
-                        "GEMINI",
-                        "gemini",
-                        AgentRole.External,
-                        "agy"
-                    ));
-                    continue;
-                }
-                if (exeLower is "node.exe" or "node" or "bun.exe" or "bun")
-                {
-                    if (cmdLower.Contains("gemini-cli") ||
-                        cmdLower.Contains("@google/gemini"))
-                    {
-                        candidates.Add(new MatchedCandidate(
-                            p.ProcessId,
-                            p.StartTimeTicks,
-                            "GEMINI",
-                            "gemini",
-                            AgentRole.External,
-                            "agy"
-                        ));
-                        continue;
-                    }
-                }
+                candidates.Add(new MatchedCandidate(
+                    p.ProcessId,
+                    p.StartTimeTicks,
+                    cl.Provider,
+                    cl.Provider.ToLowerInvariant(),
+                    role,
+                    spriteKey
+                ));
             }
 
             var detected = new List<AgentSnapshot>(candidates.Count);
@@ -293,6 +197,7 @@ public class ProcessAgentCollector
             lock (_lock)
             {
                 var liveCandidatePids = new HashSet<int>(candidates.Count);
+                var liveKeys = new HashSet<(int Pid, long StartTicks)>(candidates.Count);
 
                 // Group by Provider to number multiple instances stably
                 var byProvider = candidates.GroupBy(c => c.Provider, StringComparer.OrdinalIgnoreCase);
@@ -307,9 +212,11 @@ public class ProcessAgentCollector
                     {
                         var cand = sorted[i];
                         liveCandidatePids.Add(cand.Pid);
+                        liveKeys.Add((cand.Pid, cand.StartTimeTicks));
 
                         string name = multi ? $"{cand.Provider} #{i + 1}" : cand.Provider;
-                        string id = $"proc:{cand.ProviderLower}:{cand.Pid}";
+                        string opaqueToken = GetOrCreateOpaqueToken(cand.Pid, cand.StartTimeTicks);
+                        string id = $"proc:{cand.ProviderLower}:{opaqueToken}";
 
                         if (!_history.TryGetValue(cand.Pid, out var stateEntry) || stateEntry.StartTimeTicks != cand.StartTimeTicks)
                         {
@@ -427,9 +334,20 @@ public class ProcessAgentCollector
                             ToolName: stateEntry.ToolName,
                             Source: "process",
                             ProcessId: cand.Pid,
+                            ProcessStartTicks: cand.StartTimeTicks,
                             LastActivityAt: stateEntry.WorkingStartedAt ?? stateEntry.FirstSeenAt,
                             UpdatedAt: now
                         ));
+                    }
+                }
+
+                // Evict stale opaque tokens
+                var staleTokenKeys = _opaqueTokens.Keys.Where(k => !liveKeys.Contains(k)).ToList();
+                foreach (var k in staleTokenKeys)
+                {
+                    if (_opaqueTokens.Remove(k, out var token))
+                    {
+                        _usedTokens.Remove(token);
                     }
                 }
 
@@ -479,52 +397,32 @@ public class ProcessAgentCollector
 
             if (procByPid.TryGetValue(cPid, out var item))
             {
-                string exeLower = item.ExeName.ToLowerInvariant();
-                string cmdLower = item.CommandLine?.ToLowerInvariant() ?? string.Empty;
+                var cl = item.Classification ?? Win32ProcessInspector.ClassifyProcess(item.ExeName, item.CommandLine);
 
                 // Exclude __omp_worker_* daemons and console hosts
-                if (cmdLower.Contains("__omp_worker_") ||
-                    exeLower is "conhost.exe" or "openconsole.exe")
+                if (cl.IsInternalDaemon ||
+                    item.ExeName.Equals("conhost.exe", StringComparison.OrdinalIgnoreCase) ||
+                    item.ExeName.Equals("openconsole.exe", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
 
-                // Check priority
-                // 1. git.exe, gh.exe -> "git"
-                if (exeLower is "git.exe" or "git" or "gh.exe" or "gh")
+                if (cl.RoleHint != null)
                 {
-                    if (bestPriority > 1) { bestPriority = 1; bestTool = "git"; }
-                }
-                // 2. vstest*, testhost*, pytest*, vitest*, jest* -> "test"
-                else if (exeLower.StartsWith("vstest", StringComparison.OrdinalIgnoreCase) ||
-                         exeLower.StartsWith("testhost", StringComparison.OrdinalIgnoreCase) ||
-                         exeLower.StartsWith("pytest", StringComparison.OrdinalIgnoreCase) ||
-                         exeLower.StartsWith("vitest", StringComparison.OrdinalIgnoreCase) ||
-                         exeLower.StartsWith("jest", StringComparison.OrdinalIgnoreCase) ||
-                         cmdLower.Contains("pytest") || cmdLower.Contains("vitest") || cmdLower.Contains("jest"))
-                {
-                    if (bestPriority > 2) { bestPriority = 2; bestTool = "test"; }
-                }
-                // 3. dotnet.exe, msbuild.exe, csc.exe, cargo.exe, rustc.exe, npm*, pnpm*, tsc*, esbuild*, vite*, gcc.exe, clang.exe -> "build"
-                else if (exeLower is "dotnet.exe" or "dotnet" or "msbuild.exe" or "msbuild" or "csc.exe" or "csc" or
-                         "cargo.exe" or "cargo" or "rustc.exe" or "rustc" or "gcc.exe" or "clang.exe" or
-                         "tsc.exe" or "esbuild.exe" or "vite.exe" ||
-                         exeLower.StartsWith("npm", StringComparison.OrdinalIgnoreCase) ||
-                         exeLower.StartsWith("pnpm", StringComparison.OrdinalIgnoreCase) ||
-                         cmdLower.Contains("dotnet build") || cmdLower.Contains("msbuild") || cmdLower.Contains("cargo build"))
-                {
-                    if (bestPriority > 3) { bestPriority = 3; bestTool = "build"; }
-                }
-                // 4. rg.exe, grep.exe, findstr.exe, fd.exe -> "search"
-                else if (exeLower is "rg.exe" or "rg" or "grep.exe" or "grep" or "findstr.exe" or "findstr" or "fd.exe" or "fd")
-                {
-                    if (bestPriority > 4) { bestPriority = 4; bestTool = "search"; }
-                }
-                // 5. pwsh.exe, powershell.exe, cmd.exe, bash.exe, sh.exe, python.exe, node.exe -> "execute"
-                else if (exeLower is "pwsh.exe" or "pwsh" or "powershell.exe" or "powershell" or "cmd.exe" or
-                         "bash.exe" or "bash" or "sh.exe" or "sh" or "python.exe" or "python" or "node.exe")
-                {
-                    if (bestPriority > 5) { bestPriority = 5; bestTool = "execute"; }
+                    int priority = cl.RoleHint switch
+                    {
+                        "git" => 1,
+                        "test" => 2,
+                        "build" => 3,
+                        "search" => 4,
+                        "execute" => 5,
+                        _ => int.MaxValue
+                    };
+                    if (priority < bestPriority)
+                    {
+                        bestPriority = priority;
+                        bestTool = cl.RoleHint;
+                    }
                 }
             }
 
@@ -569,8 +467,8 @@ public class ProcessAgentCollector
 
             if (procByPid.TryGetValue(cPid, out var childItem))
             {
-                string cmd = childItem.CommandLine ?? string.Empty;
-                if (cmd.Contains("__omp_worker_"))
+                var cl = childItem.Classification ?? Win32ProcessInspector.ClassifyProcess(childItem.ExeName, childItem.CommandLine);
+                if (cl.IsInternalDaemon)
                 {
                     sum += childItem.TotalCpuTimeMs;
                 }

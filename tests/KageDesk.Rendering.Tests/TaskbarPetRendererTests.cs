@@ -56,6 +56,42 @@ public class TaskbarPetRendererTests
     }
 
     [Fact]
+    public void Render_NeedsApprovalOrca_AlongsideWorkingTerminal_EmitsOpenOrcaAndNeverFocusAgent()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+
+        var approvalAgent = new AgentSnapshot(
+            Id: "orca-leader-1",
+            Name: "Shikamaru",
+            Role: AgentRole.Leader,
+            SpriteKey: "shikamaru",
+            State: AgentState.NeedsApproval,
+            QuestionPrompt: "Approve deployment?",
+            Source: "orca");
+
+        var workingProcessAgent = new AgentSnapshot(
+            Id: "proc:omp:1234abcd",
+            Name: "OMP",
+            Role: AgentRole.Coder,
+            SpriteKey: "omp",
+            State: AgentState.Working,
+            ProcessId: 1234,
+            Source: "process");
+
+        var state = MakeState(approvalAgent, workingProcessAgent);
+
+        IReadOnlyList<PetHitRegion> regions = renderer.Render(buf, state, ThemePackLoader.BuiltInFallback, 1.0f);
+
+        // 1. Must render approval card with "open_orca" button
+        var openOrca = Assert.Single(regions, r => r.ActionId == "open_orca");
+        Assert.NotNull(openOrca);
+
+        // 2. Must NEVER emit focus_agent: (approval takes priority, never routes to terminal window!)
+        Assert.DoesNotContain(regions, r => r.ActionId.StartsWith("focus_agent:", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Render_WorkingMultipleAgents_RendersUpToSixMiniDesksAndAgentHitRegions()
     {
         var renderer = new TaskbarPetRenderer();
@@ -134,6 +170,38 @@ public class TaskbarPetRendererTests
         Assert.Equal(AgentActionKind.Reading, kind);
         Assert.Equal("READ", shortLabel);
         Assert.NotEqual("READ_FIL", shortLabel);
+    }
+
+    [Fact]
+    public void Render_WorkingMode_HitRegionPill_ProcessAgentVsOrca()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+
+        // Case 1: Single process working agent -> emits focus_agent:<id>
+        var singleProcessState = MakeState(
+            new AgentSnapshot("proc:omp:abcd1234", "OMP", AgentRole.Coder, "omp", AgentState.Working, Source: "process", ProcessId: 100));
+
+        var regions1 = renderer.Render(buf, singleProcessState, ThemePackLoader.BuiltInFallback, 1.0f);
+        Assert.Contains(regions1, r => r.ActionId == "focus_agent:proc:omp:abcd1234");
+        Assert.DoesNotContain(regions1, r => r.ActionId == "open_orca");
+
+        // Case 2: Single Orca/non-process working agent -> emits open_orca
+        var singleOrcaState = MakeState(
+            new AgentSnapshot("a1", "Minato", AgentRole.Coder, "minato", AgentState.Working, Source: "orca"));
+
+        var regions2 = renderer.Render(buf, singleOrcaState, ThemePackLoader.BuiltInFallback, 1.0f);
+        Assert.Contains(regions2, r => r.ActionId == "open_orca");
+        Assert.DoesNotContain(regions2, r => r.ActionId.StartsWith("focus_agent:", StringComparison.Ordinal));
+
+        // Case 3: Multiple working agents (even if processes) -> emits open_orca
+        var multiState = MakeState(
+            new AgentSnapshot("proc:omp:1", "OMP", AgentRole.Coder, "omp", AgentState.Working, Source: "process"),
+            new AgentSnapshot("proc:agy:2", "AGY", AgentRole.Leader, "agy", AgentState.Working, Source: "process"));
+
+        var regions3 = renderer.Render(buf, multiState, ThemePackLoader.BuiltInFallback, 1.0f);
+        Assert.Contains(regions3, r => r.ActionId == "open_orca");
+        Assert.DoesNotContain(regions3, r => r.ActionId.StartsWith("focus_agent:", StringComparison.Ordinal));
     }
 
     [Fact]

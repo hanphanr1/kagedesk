@@ -177,4 +177,38 @@ public class ConfigStoreTests
             }
         }
     }
+
+    [Fact]
+    public void Load_V2ConfigWithCamelCaseConfigVersion_PreservesFalseAndDoesNotRewrite()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "kagedesk_cfg_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var tempFile = Path.Combine(dir, "config.json");
+
+        try
+        {
+            string camelCaseJson = "{\n  \"configVersion\": 2,\n  \"enableProcessAgentCollector\": false\n}";
+            File.WriteAllText(tempFile, camelCaseJson);
+            var initialWriteTime = File.GetLastWriteTimeUtc(tempFile);
+
+            var store = new ConfigStore(tempFile);
+            var loaded = store.Load();
+
+            Assert.Equal(2, loaded.ConfigVersion);
+            Assert.False(loaded.EnableProcessAgentCollector);
+
+            // Verify file content was not overwritten/flipped to true
+            string currentContent = File.ReadAllText(tempFile);
+            Assert.Contains("\"enableProcessAgentCollector\": false", currentContent);
+            Assert.Equal(camelCaseJson, currentContent);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+            {
+                try { Directory.Delete(dir, recursive: true); } catch { }
+            }
+        }
+    }
 }
+

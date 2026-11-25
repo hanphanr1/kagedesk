@@ -22,8 +22,6 @@ public enum AgentActionKind
 
 public static class AgentActionClassifier
 {
-    private static readonly char[] Delimiters = { ' ', '_', '-', '/', '\\', '.', ':', ',', ';' };
-
     public static (AgentActionKind Kind, string ShortLabel) Classify(
         AgentState state,
         string? toolName,
@@ -44,7 +42,7 @@ public static class AgentActionClassifier
         // When state == Working
         if (!string.IsNullOrWhiteSpace(toolName))
         {
-            var classified = MatchAction(toolName);
+            var classified = MatchAction(toolName.AsSpan());
             if (classified.HasValue && classified.Value.Kind != AgentActionKind.Thinking)
             {
                 return classified.Value;
@@ -53,7 +51,7 @@ public static class AgentActionClassifier
 
         if (!string.IsNullOrWhiteSpace(taskTitle))
         {
-            var classified = MatchAction(taskTitle);
+            var classified = MatchAction(taskTitle.AsSpan());
             if (classified.HasValue && classified.Value.Kind != AgentActionKind.Thinking)
             {
                 return classified.Value;
@@ -61,6 +59,53 @@ public static class AgentActionClassifier
         }
 
         if (!string.IsNullOrWhiteSpace(toolName))
+        {
+            var classified = MatchAction(toolName.AsSpan());
+            if (classified.HasValue)
+            {
+                return classified.Value;
+            }
+        }
+
+        return (AgentActionKind.Thinking, "THINK");
+    }
+
+    public static (AgentActionKind Kind, string ShortLabel) Classify(
+        AgentState state,
+        ReadOnlySpan<char> toolName,
+        ReadOnlySpan<char> taskTitle = default)
+    {
+        switch (state)
+        {
+            case AgentState.NeedsApproval:
+                return (AgentActionKind.Approval, "APPROVE");
+            case AgentState.Failed:
+                return (AgentActionKind.Failed, "FAIL");
+            case AgentState.Done:
+                return (AgentActionKind.Done, "PASS");
+            case AgentState.Idle:
+                return (AgentActionKind.None, "IDLE");
+        }
+
+        if (!toolName.IsEmpty && !toolName.IsWhiteSpace())
+        {
+            var classified = MatchAction(toolName);
+            if (classified.HasValue && classified.Value.Kind != AgentActionKind.Thinking)
+            {
+                return classified.Value;
+            }
+        }
+
+        if (!taskTitle.IsEmpty && !taskTitle.IsWhiteSpace())
+        {
+            var classified = MatchAction(taskTitle);
+            if (classified.HasValue && classified.Value.Kind != AgentActionKind.Thinking)
+            {
+                return classified.Value;
+            }
+        }
+
+        if (!toolName.IsEmpty && !toolName.IsWhiteSpace())
         {
             var classified = MatchAction(toolName);
             if (classified.HasValue)
@@ -72,90 +117,116 @@ public static class AgentActionClassifier
         return (AgentActionKind.Thinking, "THINK");
     }
 
-    private static (AgentActionKind Kind, string ShortLabel)? MatchAction(string input)
+    private static bool IsDelimiter(char c) =>
+        c is ' ' or '_' or '-' or '/' or '\\' or '.' or ':' or ',' or ';' or '\t' or '\r' or '\n';
+
+    private static (AgentActionKind Kind, string ShortLabel)? MatchAction(ReadOnlySpan<char> input)
     {
-        if (string.IsNullOrWhiteSpace(input))
+        input = input.Trim();
+        if (input.IsEmpty)
             return null;
 
-        string text = input.Trim().ToLowerInvariant();
-        string[] tokens = text.Split(Delimiters, StringSplitOptions.RemoveEmptyEntries);
+        Span<Range> tokens = stackalloc Range[32];
+        int tokenCount = 0;
+        int start = 0;
+        int n = input.Length;
 
-        // 1. Reading
-        // read_file, view_file, read_resource, list_dir, list_files, list_resources, cat, read
-        if (text.Contains("read_file") || text.Contains("view_file") || text.Contains("read_resource") ||
-            text.Contains("list_dir") || text.Contains("list_files") || text.Contains("list_resources") ||
-            HasToken(tokens, "cat") || text.Contains("read"))
+        for (int i = 0; i <= n; i++)
         {
-            return (AgentActionKind.Reading, "READ");
+            bool isEnd = i == n;
+            bool isDelim = !isEnd && IsDelimiter(input[i]);
+            bool isCamelTransition = !isEnd && i > start && char.IsLower(input[i - 1]) && char.IsUpper(input[i]);
+            bool isAcronymTransition = !isEnd && i >= start + 2 && char.IsUpper(input[i - 2]) && char.IsUpper(input[i - 1]) && char.IsLower(input[i]);
+
+            if (isEnd || isDelim || isCamelTransition || isAcronymTransition)
+            {
+                int tokenEnd = isAcronymTransition ? i - 1 : i;
+                if (tokenEnd > start)
+                {
+                    if (tokenCount < tokens.Length)
+                    {
+                        tokens[tokenCount++] = new Range(start, tokenEnd);
+                    }
+                }
+
+                if (isAcronymTransition)
+                {
+                    start = i - 1;
+                }
+                else if (isDelim)
+                {
+                    start = i + 1;
+                }
+                else // isCamelTransition
+                {
+                    start = i;
+                }
+            }
         }
 
-        // 2. Searching
-        // search, grep, rg, find, glob, fd, web_search, query-docs, resolve-library
-        if (text.Contains("web_search") || text.Contains("query-docs") || text.Contains("resolve-library") ||
-            text.Contains("search") || text.Contains("grep") || text.Contains("find") || text.Contains("glob") ||
-            HasToken(tokens, "rg") || HasToken(tokens, "fd"))
-        {
-            return (AgentActionKind.Searching, "SCAN");
-        }
+        if (tokenCount == 0)
+            return null;
 
-        // 3. Coding
-        // edit, write, patch, replace, multi_replace, create_file, code
-        if (text.Contains("create_file") || text.Contains("multi_replace") || text.Contains("replace") ||
-            text.Contains("patch") || text.Contains("edit") || text.Contains("write") || text.Contains("code"))
-        {
-            return (AgentActionKind.Coding, "CODE");
-        }
+        ReadOnlySpan<Range> validTokens = tokens.Slice(0, tokenCount);
 
-        // 4. Testing
-        // test, vitest, jest, pytest, vstest, xunit, nunit
-        if (text.Contains("vitest") || text.Contains("pytest") || text.Contains("vstest") ||
-            text.Contains("xunit") || text.Contains("nunit") || text.Contains("jest") ||
-            text.Contains("test"))
+        // Precedence 1: Testing (test, tests, vitest, jest, pytest, vstest, xunit, nunit)
+        if (HasAnyToken(input, validTokens, TestingTokens))
         {
             return (AgentActionKind.Testing, "TEST");
         }
 
-        // 5. Building
-        // build, compile, dotnet, msbuild, tsc, webpack, vite, cargo, gradle, npm, pnpm
-        if (text.Contains("compile") || text.Contains("msbuild") || text.Contains("dotnet") ||
-            text.Contains("webpack") || text.Contains("gradle") || text.Contains("build") ||
-            HasToken(tokens, "tsc") || HasToken(tokens, "vite") || HasToken(tokens, "cargo") ||
-            HasToken(tokens, "npm") || HasToken(tokens, "pnpm"))
-        {
-            return (AgentActionKind.Building, "BUILD");
-        }
-
-        // 6. GitOps
-        // git, gh, commit, push, merge, pr
-        if (text.Contains("commit") || text.Contains("push") || text.Contains("merge") ||
-            HasToken(tokens, "git") || HasToken(tokens, "gh") || HasToken(tokens, "pr"))
-        {
-            return (AgentActionKind.GitOps, "GIT");
-        }
-
-        // 7. Reviewing
-        // review, diff, audit, lint, inspect
-        if (text.Contains("review") || text.Contains("diff") || text.Contains("audit") ||
-            text.Contains("lint") || text.Contains("inspect"))
+        // Precedence 2: Reviewing (review, diff, audit, lint, inspect)
+        if (HasAnyToken(input, validTokens, ReviewingTokens))
         {
             return (AgentActionKind.Reviewing, "REVIEW");
         }
 
-        // 8. Executing
-        // exec, run_command, bash, pwsh, powershell, cmd, shell, terminal, run_workflow
-        if (text.Contains("run_command") || text.Contains("run_workflow") || text.Contains("powershell") ||
-            text.Contains("terminal") || text.Contains("shell") || text.Contains("bash") ||
-            text.Contains("pwsh") || text.Contains("exec") || text.Contains("execute") ||
-            HasToken(tokens, "cmd"))
+        // Precedence 3: GitOps (git, gh, commit, push, merge, pr)
+        if (HasAnyToken(input, validTokens, GitOpsTokens))
+        {
+            return (AgentActionKind.GitOps, "GIT");
+        }
+
+        // Precedence 4: Building (build, compile, dotnet, msbuild, tsc, webpack, vite, cargo, gradle, npm, pnpm)
+        if (HasAnyToken(input, validTokens, BuildingTokens))
+        {
+            return (AgentActionKind.Building, "BUILD");
+        }
+
+        // Precedence 5: Coding (edit, write, patch, replace, code, create)
+        if (HasAnyToken(input, validTokens, CodingTokens))
+        {
+            return (AgentActionKind.Coding, "CODE");
+        }
+
+        // Precedence 6: Searching (search, grep, rg, find, glob, fd, findstr, docs, web, resolve-library)
+        if (HasAnyToken(input, validTokens, SearchingTokens) ||
+            (HasToken(input, validTokens, "resolve") && HasToken(input, validTokens, "library")) ||
+            (HasToken(input, validTokens, "query") && HasToken(input, validTokens, "docs")) ||
+            HasToken(input, validTokens, "web"))
+        {
+            return (AgentActionKind.Searching, "SCAN");
+        }
+
+        // Precedence 7: Reading (read, cat, view, open, dir, files, resources)
+        // Note: resources / dir / files when paired with read/view/list or exact file-reading tool — NOT list_threads!
+        bool hasReadingPrimary = HasAnyToken(input, validTokens, ReadingTokens);
+        bool hasList = HasToken(input, validTokens, "list");
+        bool hasFileDirResources = HasAnyToken(input, validTokens, FileDirResourceTokens);
+
+        if (hasReadingPrimary || (hasList && hasFileDirResources))
+        {
+            return (AgentActionKind.Reading, "READ");
+        }
+
+        // Precedence 8: Executing (exec, execute, command, bash, pwsh, powershell, cmd, shell, terminal, run)
+        if (HasAnyToken(input, validTokens, ExecutingTokens))
         {
             return (AgentActionKind.Executing, "EXEC");
         }
 
-        // 9. Thinking
-        // think, plan, chat, stream, subagent, orchestration, ask
-        if (text.Contains("think") || text.Contains("plan") || text.Contains("chat") ||
-            text.Contains("stream") || text.Contains("subagent") || text.Contains("orchestration") ||
-            text.Contains("ask"))
+        // Precedence 9: Explicit Thinking tokens
+        if (HasAnyToken(input, validTokens, ThinkingTokens))
         {
             return (AgentActionKind.Thinking, "THINK");
         }
@@ -163,13 +234,40 @@ public static class AgentActionClassifier
         return (AgentActionKind.Thinking, "THINK");
     }
 
-    private static bool HasToken(string[] tokens, string target)
+    private static readonly string[] TestingTokens = { "test", "tests", "testing", "vitest", "jest", "pytest", "vstest", "xunit", "nunit" };
+    private static readonly string[] ReviewingTokens = { "review", "reviewing", "reviews", "diff", "audit", "lint", "linting", "inspect", "inspecting" };
+    private static readonly string[] GitOpsTokens = { "git", "gh", "commit", "commits", "committing", "push", "pushes", "pushing", "merge", "merges", "merging", "pr" };
+    private static readonly string[] BuildingTokens = { "build", "building", "builds", "compile", "compiling", "dotnet", "msbuild", "tsc", "webpack", "vite", "cargo", "gradle", "npm", "pnpm" };
+    private static readonly string[] CodingTokens = { "edit", "editing", "edits", "write", "writing", "writes", "patch", "patching", "replace", "replacing", "code", "coding", "create", "creating" };
+    private static readonly string[] SearchingTokens = { "search", "searching", "grep", "rg", "find", "finding", "glob", "fd", "findstr", "docs" };
+    private static readonly string[] ReadingTokens = { "read", "reading", "reads", "cat", "view", "viewing", "open" };
+    private static readonly string[] FileDirResourceTokens = { "dir", "files", "resources", "resource", "file" };
+    private static readonly string[] ExecutingTokens = { "exec", "execute", "executing", "execution", "command", "bash", "pwsh", "powershell", "cmd", "shell", "terminal", "run", "running" };
+    private static readonly string[] ThinkingTokens = { "think", "thinking", "plan", "planning", "chat", "stream", "subagent", "orchestration", "ask" };
+
+    private static bool HasToken(ReadOnlySpan<char> span, ReadOnlySpan<Range> tokens, string match)
     {
         for (int i = 0; i < tokens.Length; i++)
         {
-            if (string.Equals(tokens[i], target, StringComparison.OrdinalIgnoreCase))
+            if (span[tokens[i]].Equals(match, StringComparison.OrdinalIgnoreCase))
             {
                 return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool HasAnyToken(ReadOnlySpan<char> span, ReadOnlySpan<Range> tokens, string[] matches)
+    {
+        for (int i = 0; i < tokens.Length; i++)
+        {
+            ReadOnlySpan<char> token = span[tokens[i]];
+            for (int m = 0; m < matches.Length; m++)
+            {
+                if (token.Equals(matches[m], StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
             }
         }
         return false;

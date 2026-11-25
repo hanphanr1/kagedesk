@@ -68,7 +68,10 @@ public class ProcessAgentCollectorTests
         var detected = collector.DetectProcesses();
 
         var single = Assert.Single(detected);
-        Assert.Equal("proc:omp:100", single.Id);
+        Assert.StartsWith("proc:omp:", single.Id);
+        Assert.NotEqual("proc:omp:100", single.Id);
+        Assert.DoesNotContain("100", single.Id);
+        Assert.Equal(17, single.Id.Length);
         Assert.Equal("OMP", single.Name);
         Assert.Equal(AgentRole.Coder, single.Role);
         Assert.Equal("omp", single.SpriteKey);
@@ -120,7 +123,10 @@ public class ProcessAgentCollectorTests
         var detected = collector.DetectProcesses();
 
         var agent = Assert.Single(detected);
-        Assert.Equal("proc:agy:81", agent.Id);
+        Assert.StartsWith("proc:agy:", agent.Id);
+        Assert.NotEqual("proc:agy:81", agent.Id);
+        Assert.DoesNotContain("81", agent.Id);
+        Assert.Equal(17, agent.Id.Length);
         Assert.Equal("AGY", agent.Name);
         Assert.Equal("agy", agent.SpriteKey);
     }

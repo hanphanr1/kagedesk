@@ -19,6 +19,8 @@ public class AgentDetailToast : Form
     private readonly System.Windows.Forms.Timer _dismissTimer;
     private readonly AgentSnapshot _agent;
 
+    public AgentSnapshot Agent => _agent;
+
     private readonly Rectangle _focusBtnBounds;
     private readonly Rectangle _closeBtnBounds;
 
@@ -68,7 +70,6 @@ public class AgentDetailToast : Form
         try
         {
             Close();
-            Dispose();
         }
         catch { }
     }
@@ -83,7 +84,7 @@ public class AgentDetailToast : Form
             {
                 if (string.Equals(_agent.Source, "process", StringComparison.OrdinalIgnoreCase) && _agent.ProcessId.HasValue)
                 {
-                    WindowFocuser.TryFocusProcessWindow(_agent.ProcessId.Value);
+                    WindowFocuser.TryFocusProcessWindow(_agent.ProcessId.Value, _agent.ProcessStartTicks);
                 }
                 else
                 {
@@ -244,16 +245,16 @@ public class AgentDetailToast : Form
     {
         lock (_toastLock)
         {
-            try
-            {
-                if (_activeToast != null && !_activeToast.IsDisposed)
-                {
-                    _activeToast.Close();
-                    _activeToast.Dispose();
-                }
-            }
-            catch { }
+            AgentDetailToast? prev = _activeToast;
             _activeToast = null;
+            if (prev != null && !prev.IsDisposed)
+            {
+                try
+                {
+                    prev.Close();
+                }
+                catch { }
+            }
 
             try
             {
@@ -264,7 +265,6 @@ public class AgentDetailToast : Form
             }
             catch
             {
-                _activeToast?.Dispose();
                 _activeToast = null;
             }
         }
