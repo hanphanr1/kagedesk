@@ -38,7 +38,7 @@ public class LocalEventBridgeTests
         var root = doc.RootElement;
 
         Assert.True(root.GetProperty("ok").GetBoolean());
-        Assert.Equal("1.0.0", root.GetProperty("version").GetString());
+        Assert.Equal("2.0.0", root.GetProperty("version").GetString());
         Assert.Equal("shinobi-hq", root.GetProperty("activeTheme").GetString());
         Assert.True(root.GetProperty("workingSetMb").GetDouble() > 0);
         Assert.True(root.TryGetProperty("uptimeSec", out _));
@@ -543,5 +543,92 @@ public class LocalEventBridgeTests
         await Task.WhenAll(tasks);
 
         Assert.False(bridge.IsRunning);
+    }
+
+    [Fact]
+    public async Task PostEvent_HandoffType_EmitsVisualHandoffEvent_WithFromAndToAgents()
+    {
+        var port = GetAvailablePort();
+        var aggregator = new HqStateAggregator();
+        const string token = "test-token-handoff";
+
+        await using var bridge = new LocalEventBridge(aggregator, port, requiredToken: token);
+        bridge.Start();
+
+        using var client = new HttpClient();
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{port}/api/event")
+        {
+            Content = new StringContent(
+                """{"type":"handoff","fromAgentId":"demo-minato","toAgentId":"demo-tsunade","message":"Passing scroll"}""",
+                Encoding.UTF8,
+                "application/json")
+        };
+        req.Headers.Add("X-KageDesk-Token", token);
+
+        var res = await client.SendAsync(req);
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+
+        var state = aggregator.GetState();
+        var ev = state.PendingVisualEvents.FirstOrDefault(e => e.Type == "handoff");
+        Assert.NotNull(ev);
+        Assert.Equal("demo-minato", ev.AgentId);
+        Assert.Equal("demo-tsunade", ev.TargetAgentId);
+    }
+
+    [Fact]
+    public async Task PostDemo_Handoff_ActivatesHandoffScenario()
+    {
+        var port = GetAvailablePort();
+        var aggregator = new HqStateAggregator();
+        const string token = "test-token-demo";
+
+        await using var bridge = new LocalEventBridge(aggregator, port, requiredToken: token);
+        bridge.Start();
+
+        using var client = new HttpClient();
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{port}/api/demo/handoff");
+        req.Headers.Add("X-KageDesk-Token", token);
+
+        var res = await client.SendAsync(req);
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+
+        var state = aggregator.GetState();
+        Assert.Equal("handoff", state.DemoScenario);
+        var ev = state.PendingVisualEvents.FirstOrDefault(e => e.Type == "handoff");
+        Assert.NotNull(ev);
+    }
+
+    [Fact]
+    public async Task GetState_PublicAgentDto_ExposesWorkStartedAt()
+    {
+        var port = GetAvailablePort();
+        var aggregator = new HqStateAggregator();
+        const string token = "test-token-state";
+        var expectedStartedAt = new DateTimeOffset(2026, 11, 25, 14, 0, 0, TimeSpan.Zero);
+
+        aggregator.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("ag-timer", "Timer Agent", AgentRole.Coder, "minato", AgentState.Working, WorkStartedAt: expectedStartedAt)
+        }, Array.Empty<AccountInfo>());
+
+        await using var bridge = new LocalEventBridge(aggregator, port, requiredToken: token);
+        bridge.Start();
+
+        using var client = new HttpClient();
+        using var req = new HttpRequestMessage(HttpMethod.Get, $"http://127.0.0.1:{port}/api/state");
+        req.Headers.Add("X-KageDesk-Token", token);
+
+        var res = await client.SendAsync(req);
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+
+        using var doc = JsonDocument.Parse(await res.Content.ReadAsStringAsync());
+        var agentsElem = doc.RootElement.GetProperty("agents");
+        Assert.Equal(1, agentsElem.GetArrayLength());
+
+        var firstAgent = agentsElem[0];
+        Assert.True(firstAgent.TryGetProperty("workStartedAt", out var prop));
+        Assert.NotNull(prop.GetString());
+        var parsedTime = DateTimeOffset.Parse(prop.GetString()!);
+        Assert.Equal(expectedStartedAt, parsedTime);
     }
 }

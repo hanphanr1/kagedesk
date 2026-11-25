@@ -42,6 +42,16 @@ public class AppConfigCompatibilityTests
         Assert.True(config.HidePetsInFullscreenGame);
         Assert.Equal(15, config.TargetFps);
         Assert.False(config.LaunchOnStartup);
+        Assert.True(config.SoundEnabled);
+    }
+
+    [Fact]
+    public void Deserialize_OldJsonOmittingSoundEnabled_DefaultsToTrue()
+    {
+        const string json = "{\"PollingIntervalMs\": 2500}";
+        var config = JsonSerializer.Deserialize<AppConfig>(json);
+        Assert.NotNull(config);
+        Assert.True(config.SoundEnabled);
     }
 
     [Fact]

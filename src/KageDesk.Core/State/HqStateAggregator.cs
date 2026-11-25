@@ -17,7 +17,9 @@ public record PushedEventPayload(
     string? AccountProvider = null,
     string? AccountName = null,
     double? QuotaPercent = null,
-    double? TtlSeconds = null
+    double? TtlSeconds = null,
+    string? FromAgentId = null,
+    string? ToAgentId = null
 );
 
 public class HqStateAggregator
@@ -43,6 +45,9 @@ public class HqStateAggregator
     private readonly List<HqEvent> _visualEvents = new();
     private readonly Dictionary<string, (AgentSnapshot LastSnapshot, DateTimeOffset EnteredAt)> _departedDoneAgents = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _doneStateEnteredAt = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTimeOffset> _workStartedAt = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTimeOffset> _lastWorkingFinishedAt = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTimeOffset> _lastWorkingStartedAt = new(StringComparer.OrdinalIgnoreCase);
 
     private string? _demoScenario;
     private HqState _currentState;
@@ -103,7 +108,7 @@ public class HqStateAggregator
             else
             {
                 var lower = scenario.Trim().ToLowerInvariant();
-                if (lower is not ("working" or "approve" or "done" or "fail" or "clone"))
+                if (lower is not ("working" or "approve" or "done" or "fail" or "clone" or "handoff"))
                 {
                     throw new ArgumentException($"Unknown demo scenario: '{scenario}'", nameof(scenario));
                 }
@@ -382,6 +387,15 @@ public class HqStateAggregator
                 _pushedAgents[id] = (snapshot, expiresAt);
             }
 
+            // 1b. Handoff event
+            if (string.Equals(payload.Type, "handoff", StringComparison.OrdinalIgnoreCase))
+            {
+                var fromId = payload.FromAgentId ?? payload.AgentId;
+                var toId = payload.ToAgentId;
+                var seq = Interlocked.Increment(ref _sequenceCounter);
+                _visualEvents.Add(new HqEvent(seq, "handoff", payload.Message ?? $"Handoff from {fromId} to {toId}", now, fromId, payload.TtlSeconds ?? 10.0, toId));
+            }
+
             // 2. Build event
             if (!string.IsNullOrEmpty(payload.Repo) && !string.IsNullOrEmpty(payload.BuildStatus))
             {
@@ -481,14 +495,14 @@ public class HqStateAggregator
         }
     }
 
-    public void AddVisualEvent(string type, string message, string? agentId = null, double ttlSeconds = 10.0)
+    public void AddVisualEvent(string type, string message, string? agentId = null, double ttlSeconds = 10.0, string? targetAgentId = null)
     {
         HqState? toEmit = null;
         lock (_lock)
         {
             var seq = Interlocked.Increment(ref _sequenceCounter);
             var now = _timeProvider();
-            _visualEvents.Add(new HqEvent(seq, type, message, now, agentId, ttlSeconds));
+            _visualEvents.Add(new HqEvent(seq, type, message, now, agentId, ttlSeconds, targetAgentId));
             toEmit = RecalculateStateLocked();
         }
 
@@ -598,6 +612,46 @@ public class HqStateAggregator
             _doneStateEnteredAt.Remove(exp);
         }
 
+        // 4b. Track WorkStartedAt for agents
+        for (int i = 0; i < finalAgents.Count; i++)
+        {
+            var a = finalAgents[i];
+            if (a.State == AgentState.Working || a.State == AgentState.NeedsApproval)
+            {
+                if (a.WorkStartedAt.HasValue)
+                {
+                    _workStartedAt[a.Id] = a.WorkStartedAt.Value;
+                }
+                else
+                {
+                    if (_workStartedAt.TryGetValue(a.Id, out var existingStart))
+                    {
+                        finalAgents[i] = a with { WorkStartedAt = existingStart };
+                    }
+                    else
+                    {
+                        _workStartedAt[a.Id] = now;
+                        finalAgents[i] = a with { WorkStartedAt = now };
+                    }
+                }
+            }
+            else if (a.State == AgentState.Idle)
+            {
+                _workStartedAt.Remove(a.Id);
+                if (a.WorkStartedAt.HasValue)
+                {
+                    finalAgents[i] = a with { WorkStartedAt = null };
+                }
+            }
+        }
+
+        var liveIds = finalAgents.Select(a => a.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var staleWorkKeys = _workStartedAt.Keys.Where(k => !liveIds.Contains(k)).ToList();
+        foreach (var k in staleWorkKeys)
+        {
+            _workStartedAt.Remove(k);
+        }
+
         // 5. Detect transitions for visual events
         var allBuildsMap = new Dictionary<string, BuildInfo>(StringComparer.OrdinalIgnoreCase);
         foreach (var (k, v) in _collectorBuilds) allBuildsMap[k] = v;
@@ -690,6 +744,66 @@ public class HqStateAggregator
                 _visualEvents.Add(new HqEvent(seq, "BuildFailed", $"Build {b.Repo} failed", now, null, 12.0));
             }
         }
+
+        // Handoff transitions: Agent A exits Working (Done/Idle/etc) within 15s of Agent B entering Working
+        var staleFinished = _lastWorkingFinishedAt.Where(kv => (now - kv.Value).TotalSeconds > 15.0).Select(kv => kv.Key).ToList();
+        foreach (var k in staleFinished) _lastWorkingFinishedAt.Remove(k);
+        var staleStarted = _lastWorkingStartedAt.Where(kv => (now - kv.Value).TotalSeconds > 15.0).Select(kv => kv.Key).ToList();
+        foreach (var k in staleStarted) _lastWorkingStartedAt.Remove(k);
+
+        // Detect agents exiting Working
+        foreach (var (prevId, prevAg) in prevAgentMap)
+        {
+            if (prevAg.State == AgentState.Working)
+            {
+                var currAg = currentAgents.FirstOrDefault(a => string.Equals(a.Id, prevId, StringComparison.OrdinalIgnoreCase));
+                if (currAg == null || currAg.State != AgentState.Working)
+                {
+                    _lastWorkingFinishedAt[prevId] = now;
+
+                    var matchB = _lastWorkingStartedAt
+                        .Where(kv => !string.Equals(kv.Key, prevId, StringComparison.OrdinalIgnoreCase) && (now - kv.Value).TotalSeconds <= 15.0)
+                        .OrderByDescending(kv => kv.Value)
+                        .Select(kv => kv.Key)
+                        .FirstOrDefault();
+
+                    if (matchB != null)
+                    {
+                        _lastWorkingStartedAt.Remove(matchB);
+                        _lastWorkingFinishedAt.Remove(prevId);
+                        var seq = Interlocked.Increment(ref _sequenceCounter);
+                        _visualEvents.Add(new HqEvent(seq, "handoff", $"Handoff from {prevAg.Name} to {matchB}", now, prevId, 10.0, matchB));
+                    }
+                }
+            }
+        }
+
+        // Detect agents entering Working
+        foreach (var currAg in currentAgents)
+        {
+            if (currAg.State == AgentState.Working)
+            {
+                var hadPrevWorking = prevAgentMap.TryGetValue(currAg.Id, out var prevAg) && prevAg.State == AgentState.Working;
+                if (!hadPrevWorking)
+                {
+                    _lastWorkingStartedAt[currAg.Id] = now;
+
+                    var matchA = _lastWorkingFinishedAt
+                        .Where(kv => !string.Equals(kv.Key, currAg.Id, StringComparison.OrdinalIgnoreCase) && (now - kv.Value).TotalSeconds <= 15.0)
+                        .OrderByDescending(kv => kv.Value)
+                        .Select(kv => kv.Key)
+                        .FirstOrDefault();
+
+                    if (matchA != null)
+                    {
+                        _lastWorkingFinishedAt.Remove(matchA);
+                        _lastWorkingStartedAt.Remove(currAg.Id);
+                        var seq = Interlocked.Increment(ref _sequenceCounter);
+                        _visualEvents.Add(new HqEvent(seq, "handoff", $"Handoff from {matchA} to {currAg.Name}", now, matchA, 10.0, currAg.Id));
+                    }
+                }
+            }
+        }
     }
 
     private IReadOnlyList<AccountInfo> GetMergedAccountsLocked(DateTimeOffset now)
@@ -752,6 +866,15 @@ public class HqStateAggregator
                 agents.Add(new AgentSnapshot("demo-leader", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Working, IsBotHome: true));
                 agents.Add(new AgentSnapshot("demo-clone-1", "Shadow Clone #1", AgentRole.Clone, "clone", AgentState.Working, WorktreeId: "wt:worker-1"));
                 agents.Add(new AgentSnapshot("demo-clone-2", "Shadow Clone #2", AgentRole.Clone, "clone", AgentState.Working, WorktreeId: "wt:worker-2"));
+                break;
+
+            case "handoff":
+                agents.Add(new AgentSnapshot("demo-leader", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Idle, IsBotHome: true));
+                agents.Add(new AgentSnapshot("demo-coder", "Minato (Senior Coder)", AgentRole.Coder, "minato", AgentState.Working, ToolName: "compile", TaskTitle: "Refactoring state engine", IsBotHome: true, WorkStartedAt: now.AddSeconds(-45)));
+                agents.Add(new AgentSnapshot("demo-tester", "Tsunade (QA Lead)", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test", TaskTitle: "Integration testing", IsBotHome: true, WorkStartedAt: now.AddSeconds(-10)));
+                agents.Add(new AgentSnapshot("demo-reviewer", "Kakashi (Code Reviewer)", AgentRole.Reviewer, "kakashi", AgentState.Idle, IsBotHome: true));
+                var handoffSeq = Interlocked.Increment(ref _sequenceCounter);
+                _visualEvents.Add(new HqEvent(handoffSeq, "handoff", "Scroll handoff from Minato to Tsunade", now, "demo-coder", 10.0, "demo-tester"));
                 break;
         }
 

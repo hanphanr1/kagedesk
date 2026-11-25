@@ -17,14 +17,16 @@ public record PublicAgentDto(
     bool Unread = false,
     string? Source = null,
     DateTimeOffset? LastActivityAt = null,
-    DateTimeOffset? UpdatedAt = null
+    DateTimeOffset? UpdatedAt = null,
+    DateTimeOffset? WorkStartedAt = null
 );
 
 public record PublicVisualEventDto(
     long SequenceId,
     string Type,
     string? AgentId,
-    DateTimeOffset Timestamp
+    DateTimeOffset Timestamp,
+    string? TargetAgentId = null
 );
 
 public record PublicAccountDto(

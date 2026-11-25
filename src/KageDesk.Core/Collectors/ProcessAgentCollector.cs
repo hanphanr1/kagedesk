@@ -411,6 +411,7 @@ public class ProcessAgentCollector
                             State: stateEntry.State,
                             ToolName: stateEntry.ToolName,
                             Source: "process",
+                            WorkStartedAt: stateEntry.State == AgentState.Working ? stateEntry.WorkingStartedAt : null,
                             ProcessId: cand.Pid,
                             ProcessStartTicks: cand.StartTimeTicks,
                             LastActivityAt: stateEntry.WorkingStartedAt ?? stateEntry.FirstSeenAt,

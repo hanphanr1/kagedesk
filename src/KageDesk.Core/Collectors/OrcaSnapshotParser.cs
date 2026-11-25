@@ -32,7 +32,7 @@ public static class OrcaSnapshotParser
 
     private static readonly HashSet<string> ApprovalStates = new(StringComparer.OrdinalIgnoreCase)
     {
-        "waiting", "needs-approval"
+        "waiting", "needs-approval", "needs_approval", "needs-you", "needs_you"
     };
 
     public static IReadOnlyList<OrcaBotInfo> ParseBotList(string? json)
@@ -188,6 +188,26 @@ public static class OrcaSnapshotParser
 
                     var agentState = ComputeState(status, sidebarStatus, terminalVerdict, agentStateStr, mainAgentOutcome, updatedAt, now);
 
+                    DateTimeOffset? workStartedAt = null;
+                    if (agentState == AgentState.Working || agentState == AgentState.NeedsApproval)
+                    {
+                        long startedMs = 0;
+                        if (ag.TryGetProperty("stateStartedAt", out var saProp) && saProp.TryGetInt64(out var ms1) && ms1 > 0)
+                        {
+                            startedMs = ms1;
+                        }
+                        else if (ag.TryGetProperty("mainAgent", out var maObj) && maObj.ValueKind == JsonValueKind.Object &&
+                                 maObj.TryGetProperty("stateStartedAt", out var maSsProp) && maSsProp.TryGetInt64(out var ms2) && ms2 > 0)
+                        {
+                            startedMs = ms2;
+                        }
+
+                        if (startedMs > 0)
+                        {
+                            try { workStartedAt = DateTimeOffset.FromUnixTimeMilliseconds(startedMs); } catch { }
+                        }
+                    }
+
                     var id = !string.IsNullOrEmpty(address) ? address : (worktreeId ?? bot ?? displayName ?? Guid.NewGuid().ToString());
                     var name = !string.IsNullOrEmpty(displayName) ? displayName : (bot ?? convName ?? "Orca Worker");
 
@@ -208,7 +228,8 @@ public static class OrcaSnapshotParser
                         UpdatedAt: updatedAt,
                         IsBotHome: botHome,
                         Unread: unread,
-                        Source: "orca"
+                        Source: "orca",
+                        WorkStartedAt: workStartedAt
                     ));
                 }
                 return;
@@ -216,7 +237,38 @@ public static class OrcaSnapshotParser
         }
 
         // If no agents in worktree array, treat worktree itself as an agent
-        var wtState = ComputeState(status, sidebarStatus, terminalVerdict, null, null, lastActivityAt, now);
+        string? fallbackAgentState = null;
+        string? fallbackMainOutcome = null;
+        bool hasWtMa = wt.TryGetProperty("mainAgent", out var wtMa) && wtMa.ValueKind == JsonValueKind.Object;
+        if (hasWtMa)
+        {
+            if (wtMa.TryGetProperty("state", out var wtMaState))
+                fallbackAgentState = wtMaState.GetString();
+            if (wtMa.TryGetProperty("outcome", out var wtMaOut))
+                fallbackMainOutcome = wtMaOut.GetString();
+        }
+
+        var wtState = ComputeState(status, sidebarStatus, terminalVerdict, fallbackAgentState, fallbackMainOutcome, lastActivityAt, now);
+        DateTimeOffset? fallbackWorkStartedAt = null;
+        if (wtState == AgentState.Working || wtState == AgentState.NeedsApproval)
+        {
+            long startedMs = 0;
+            if (wt.TryGetProperty("stateStartedAt", out var wtSs) && wtSs.TryGetInt64(out var ms1) && ms1 > 0)
+            {
+                startedMs = ms1;
+            }
+            else if (hasWtMa &&
+                     wtMa.TryGetProperty("stateStartedAt", out var wtMaSs) && wtMaSs.TryGetInt64(out var ms2) && ms2 > 0)
+            {
+                startedMs = ms2;
+            }
+
+            if (startedMs > 0)
+            {
+                try { fallbackWorkStartedAt = DateTimeOffset.FromUnixTimeMilliseconds(startedMs); } catch { }
+            }
+        }
+
         var fallbackId = worktreeId ?? bot ?? displayName ?? Guid.NewGuid().ToString();
         var fallbackName = displayName ?? bot ?? "Orca Worker";
 
@@ -233,7 +285,8 @@ public static class OrcaSnapshotParser
             UpdatedAt: lastActivityAt,
             IsBotHome: botHome,
             Unread: unread,
-            Source: "orca"
+            Source: "orca",
+            WorkStartedAt: fallbackWorkStartedAt
         ));
     }
 
@@ -278,6 +331,8 @@ public static class OrcaSnapshotParser
     {
         // 1. Needs Approval
         if (string.Equals(status, "needs-you", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(status, "needs-approval", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(status, "needs_approval", StringComparison.OrdinalIgnoreCase) ||
             (!string.IsNullOrEmpty(terminalVerdict) && ApprovalVerdicts.Contains(terminalVerdict)) ||
             (!string.IsNullOrEmpty(agentState) && ApprovalStates.Contains(agentState)))
         {

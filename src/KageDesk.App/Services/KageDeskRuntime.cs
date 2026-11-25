@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using KageDesk.App.Audio;
 using KageDesk.App.Native;
 using KageDesk.App.UI;
 using KageDesk.Core.Bridge;
@@ -7,6 +8,7 @@ using KageDesk.Core.Config;
 using KageDesk.Core.Models;
 using KageDesk.Core.State;
 using KageDesk.Core.Themes;
+using KageDesk.Rendering.Export;
 
 namespace KageDesk.App.Services;
 
@@ -25,6 +27,10 @@ public class KageDeskRuntime : IDisposable
     private ProcessAgentCollector? _procCollector;
     private GitHubCiCollector? _gitHubCollector;
     private LocalEventBridge? _localBridge;
+
+    private readonly RetroSoundEngine _soundEngine;
+    private readonly Dictionary<string, AgentState> _previousAgentStates = new(StringComparer.OrdinalIgnoreCase);
+    private long _lastSoundEventSequenceId;
 
     private readonly DesktopOcclusionMonitor _occlusionMonitor;
     private readonly Win32WallpaperBridge _wallpaperBridge;
@@ -63,6 +69,7 @@ public class KageDeskRuntime : IDisposable
     public PetOverlayForm? PetForm => _petForm;
     public TrayController? Tray => _trayController;
     public DesktopOcclusionMonitor OcclusionMonitor => _occlusionMonitor;
+    public RetroSoundEngine SoundEngine => _soundEngine;
     public bool WallpaperAttached => _wallpaperBridge.IsAttached;
     public string WallpaperStatusReason => _wallpaperBridge.StatusReason;
     public string BridgeToken => _bridgeToken;
@@ -91,6 +98,13 @@ public class KageDeskRuntime : IDisposable
         _orcaCollector = new OrcaCliCollector(_aggregator);
         _wallpaperBridge = new Win32WallpaperBridge();
         _occlusionMonitor = new DesktopOcclusionMonitor(500);
+
+        _soundEngine = new RetroSoundEngine
+        {
+            IsSoundEnabled = () => _config.SoundEnabled,
+            IsFullscreenGameDnd = () => _occlusionMonitor.IsFullscreenGame && _config.HidePetsInFullscreenGame,
+            IsSessionLocked = () => _occlusionMonitor.IsSessionLocked
+        };
 
         InitCollectorsAndBridge();
         InitFormsAndTray();
@@ -298,7 +312,31 @@ public class KageDeskRuntime : IDisposable
                     _aggregator.DisableAndClearCiBuilds();
                 }
             },
-            OnDemoTrigger = scenario => _aggregator.SetDemoScenario(scenario)
+            OnSoundToggled = enabled => UpdateConfig(c => c.SoundEnabled = enabled),
+            OnDemoTrigger = scenario => _aggregator.SetDemoScenario(scenario),
+            OnExportGif = () =>
+            {
+                string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+                string gifPath = Path.Combine(desktop, $"kagedesk-demo-{DateTime.Now:yyyyMMdd-HHmmss}.gif");
+                Task.Run(() =>
+                {
+                    try
+                    {
+                        DemoGifRecorder.RecordGif(gifPath, _activeTheme, "showcase", 2);
+                        _dispatcherForm.BeginInvoke(new Action(() =>
+                        {
+                            MessageBox.Show($"6-second showcase GIF exported to:\n{gifPath}", "KageDesk GIF Export", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }));
+                    }
+                    catch (Exception ex)
+                    {
+                        _dispatcherForm.BeginInvoke(new Action(() =>
+                        {
+                            MessageBox.Show($"Failed to export GIF:\n{ex.Message}", "KageDesk GIF Export Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        }));
+                    }
+                });
+            }
         };
 
         if (_petForm != null)
@@ -482,6 +520,49 @@ public class KageDeskRuntime : IDisposable
 
     private void OnHqStateChanged(object? sender, HqState state)
     {
+        // 1. Process visual events (handoff, etc.)
+        if (state.PendingVisualEvents != null)
+        {
+            foreach (var ev in state.PendingVisualEvents)
+            {
+                if (ev.SequenceId > _lastSoundEventSequenceId)
+                {
+                    if (string.Equals(ev.Type, "handoff", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _soundEngine.Play(SoundKind.Handoff);
+                    }
+                    if (ev.SequenceId > _lastSoundEventSequenceId)
+                    {
+                        _lastSoundEventSequenceId = ev.SequenceId;
+                    }
+                }
+            }
+        }
+
+        // 2. Process agent state transitions
+        if (state.Agents != null)
+        {
+            foreach (var agent in state.Agents)
+            {
+                if (_previousAgentStates.TryGetValue(agent.Id, out var oldState))
+                {
+                    if (oldState != AgentState.NeedsApproval && agent.State == AgentState.NeedsApproval)
+                    {
+                        _soundEngine.Play(SoundKind.Approval);
+                    }
+                    else if (oldState != AgentState.Done && agent.State == AgentState.Done)
+                    {
+                        _soundEngine.Play(SoundKind.Done);
+                    }
+                    else if (oldState != AgentState.Failed && agent.State == AgentState.Failed)
+                    {
+                        _soundEngine.Play(SoundKind.Fail);
+                    }
+                }
+                _previousAgentStates[agent.Id] = agent.State;
+            }
+        }
+
         RequestUiSync();
     }
 
@@ -677,6 +758,7 @@ public class KageDeskRuntime : IDisposable
             _dispatcherForm.Dispose();
         }
 
+        _soundEngine.Dispose();
         _occlusionMonitor.Dispose();
         _cts.Dispose();
     }

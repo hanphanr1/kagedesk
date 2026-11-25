@@ -436,4 +436,33 @@ public class HqWallpaperRendererTests
         var ex2 = Record.Exception(() => renderer.Render(oversizedBuf, state, theme, 2.0f));
         Assert.Null(ex2);
     }
+
+    [Fact]
+    public void Render_ElapsedTimerPill_RendersWithoutException_WhenUnder10Minutes()
+    {
+        var renderer = new HqWallpaperRenderer();
+        var now = DateTimeOffset.UtcNow;
+        var agent = new AgentSnapshot("ag-coder", "Minato", AgentRole.Coder, "minato", AgentState.Working, WorkStartedAt: now.AddMinutes(-3));
+        var state = new HqState(new[] { agent }, Array.Empty<AccountInfo>(), Array.Empty<BuildInfo>(), EffectiveWeather.Day, HqMood.Busy, Array.Empty<HqEvent>(), Timestamp: now);
+        var theme = ThemePackLoader.BuiltInFallback;
+
+        using var buf = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
+        var ex = Record.Exception(() => renderer.Render(buf, state, theme, 1.0f));
+        Assert.Null(ex);
+    }
+
+    [Fact]
+    public void Render_ElapsedTimerPill_RendersWithoutException_WhenOver10Minutes()
+    {
+        var renderer = new HqWallpaperRenderer();
+        var now = DateTimeOffset.UtcNow;
+        var agent = new AgentSnapshot("ag-coder", "Minato", AgentRole.Coder, "minato", AgentState.Working, WorkStartedAt: now.AddMinutes(-15));
+        var state = new HqState(new[] { agent }, Array.Empty<AccountInfo>(), Array.Empty<BuildInfo>(), EffectiveWeather.Day, HqMood.Busy, Array.Empty<HqEvent>(), Timestamp: now);
+        var theme = ThemePackLoader.BuiltInFallback;
+
+        using var buf = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
+        var ex = Record.Exception(() => renderer.Render(buf, state, theme, 1.0f));
+        Assert.Null(ex);
+    }
 }
+

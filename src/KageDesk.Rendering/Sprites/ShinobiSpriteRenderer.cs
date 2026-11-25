@@ -36,7 +36,10 @@ public static class ShinobiSpriteRenderer
         int phaseOffset = 0,
         bool behindDesk = false,
         int variantSeed = 0,
-        AgentActionKind actionKind = AgentActionKind.None)
+        AgentActionKind actionKind = AgentActionKind.None,
+        bool isWalking = false,
+        bool carryingScroll = false,
+        bool facingRight = true)
     {
         string key = NormalizeSpriteKey(spriteKey);
         float t = timeSeconds + phaseOffset * 0.43f;
@@ -138,33 +141,109 @@ public static class ShinobiSpriteRenderer
 
         // Body coordinates relative to footY
         int legsTop = footY - 5;
-        int torsoTop = footY - 13 + (jumpY == 0 ? breathY : 0);
+        int walkBobY = isWalking ? (((((int)(t * 8f) + phaseOffset) & 1) == 0) ? -1 : 0) : 0;
+        int torsoTop = footY - 13 + (jumpY == 0 ? breathY : 0) + walkBobY;
         int headTop = torsoTop - 9;
 
         // 1. Back hair / cape layer (behind torso)
         DrawBackLayer(buf, key, x, headTop, torsoTop, footY, t);
 
         // 2. Legs & sandals (unless fully behind desk)
-        if (!behindDesk)
+        if (!behindDesk || isWalking)
         {
             int leftLegX = x - 4;
             int rightLegX = x + 1;
             int stepOffset = (state == AgentState.Done || state == AgentState.NeedsApproval) && jumpY < -1 ? -1 : 0;
 
-            // Legs outline & fill
-            buf.FillRect(leftLegX - 1, legsTop, 5, 5 + stepOffset, Outline);
-            buf.FillRect(rightLegX - 1, legsTop, 5, 5 + stepOffset, Outline);
-            buf.FillRect(leftLegX, legsTop, 3, 3 + stepOffset, ShinobiPants);
-            buf.FillRect(rightLegX, legsTop, 3, 3 + stepOffset, ShinobiPants);
-            buf.FillRect(leftLegX, footY - 2 + stepOffset, 3, 2, SandalDark);
-            buf.FillRect(rightLegX, footY - 2 + stepOffset, 3, 2, SandalDark);
+            if (isWalking)
+            {
+                int walkStep = ((int)(t * 8f) + phaseOffset) & 3;
+                int leftDx = walkStep switch { 0 => -2, 2 => 1, _ => 0 };
+                int leftDy = walkStep == 0 ? 1 : 0;
+                int rightDx = walkStep switch { 2 => 2, 0 => -1, _ => 0 };
+                int rightDy = walkStep == 2 ? 1 : 0;
+
+                buf.FillRect(leftLegX - 1 + leftDx, legsTop, 5, 5 + leftDy, Outline);
+                buf.FillRect(rightLegX - 1 + rightDx, legsTop, 5, 5 + rightDy, Outline);
+                buf.FillRect(leftLegX + leftDx, legsTop, 3, 3 + leftDy, ShinobiPants);
+                buf.FillRect(rightLegX + rightDx, legsTop, 3, 3 + rightDy, ShinobiPants);
+                buf.FillRect(leftLegX + leftDx, footY - 2 + leftDy, 3, 2, SandalDark);
+                buf.FillRect(rightLegX + rightDx, footY - 2 + rightDy, 3, 2, SandalDark);
+            }
+            else
+            {
+                // Legs outline & fill
+                buf.FillRect(leftLegX - 1, legsTop, 5, 5 + stepOffset, Outline);
+                buf.FillRect(rightLegX - 1, legsTop, 5, 5 + stepOffset, Outline);
+                buf.FillRect(leftLegX, legsTop, 3, 3 + stepOffset, ShinobiPants);
+                buf.FillRect(rightLegX, legsTop, 3, 3 + stepOffset, ShinobiPants);
+                buf.FillRect(leftLegX, footY - 2 + stepOffset, 3, 2, SandalDark);
+                buf.FillRect(rightLegX, footY - 2 + stepOffset, 3, 2, SandalDark);
+            }
         }
 
         // 3. Torso / Outfit
         DrawTorso(buf, key, x, torsoTop, variantSeed);
 
-        // 4. Arms (idle, typing, waving, victory, panic, action-specific)
-        DrawArms(buf, key, x, torsoTop, headTop, armsUp, waveAlt, handsOnHead, typingFast, t, state, variantSeed, actionKind);
+        // 4. Arms (idle, typing, waving, victory, panic, walking, carrying scroll)
+        if (isWalking && carryingScroll)
+        {
+            int sleeveColor = key switch
+            {
+                "minato" => ColorUtil.FromRgb(241, 245, 249),
+                "tsunade" => ColorUtil.FromRgb(77, 139, 91),
+                "clone" => ColorUtil.FromRgb(34, 211, 238),
+                _ => ShinobiDark
+            };
+            int handColor = key == "clone" ? ColorUtil.FromRgb(165, 243, 252) : SkinBase;
+            int scrollX = facingRight ? x + 3 : x - 10;
+            int scrollY = torsoTop + 3;
+
+            // Tied pixel scroll
+            buf.FillRect(scrollX, scrollY, 7, 4, ColorUtil.FromRgb(254, 243, 199)); // cream body
+            buf.FillRect(scrollX, scrollY, 1, 4, ColorUtil.FromRgb(255, 255, 255)); // cap left
+            buf.FillRect(scrollX + 6, scrollY, 1, 4, ColorUtil.FromRgb(255, 255, 255)); // cap right
+            buf.FillRect(scrollX + 3, scrollY, 1, 4, ColorUtil.FromRgb(239, 68, 68)); // red tie
+            buf.SetPixel(scrollX + 3, scrollY - 1, ColorUtil.FromRgb(239, 68, 68)); // knot
+            buf.DrawOutlineRect(scrollX - 1, scrollY - 1, 9, 6, ColorUtil.WithAlpha(ColorUtil.FromRgb(253, 224, 71), 180)); // golden aura
+
+            // Hands holding scroll
+            if (facingRight)
+            {
+                buf.FillRect(x - 2, torsoTop + 3, 4, 3, sleeveColor);
+                buf.FillRect(x + 2, torsoTop + 4, 2, 2, handColor);
+            }
+            else
+            {
+                buf.FillRect(x - 2, torsoTop + 3, 4, 3, sleeveColor);
+                buf.FillRect(x - 4, torsoTop + 4, 2, 2, handColor);
+            }
+        }
+        else if (isWalking)
+        {
+            // Swinging arms in walk phase
+            int walkStep = ((int)(t * 8f) + phaseOffset) & 3;
+            int sleeveColor = key switch
+            {
+                "minato" => ColorUtil.FromRgb(241, 245, 249),
+                "tsunade" => ColorUtil.FromRgb(77, 139, 91),
+                "clone" => ColorUtil.FromRgb(34, 211, 238),
+                _ => ShinobiDark
+            };
+            int handColor = key == "clone" ? ColorUtil.FromRgb(165, 243, 252) : SkinBase;
+            int leftArmDy = walkStep == 0 ? 1 : (walkStep == 2 ? -1 : 0);
+            int rightArmDy = walkStep == 2 ? 1 : (walkStep == 0 ? -1 : 0);
+
+            buf.FillRect(x - 7, torsoTop + 2 + leftArmDy, 2, 5, sleeveColor);
+            buf.SetPixel(x - 7, torsoTop + 7 + leftArmDy, handColor);
+
+            buf.FillRect(x + 5, torsoTop + 2 + rightArmDy, 2, 5, sleeveColor);
+            buf.SetPixel(x + 5, torsoTop + 7 + rightArmDy, handColor);
+        }
+        else
+        {
+            DrawArms(buf, key, x, torsoTop, headTop, armsUp, waveAlt, handsOnHead, typingFast, t, state, variantSeed, actionKind);
+        }
 
         // 5. Head, Face, Eyes, Hair
         DrawHeadAndHair(buf, key, x, headTop, state, eyesBlink, eyesHappy, eyesPanic, t, variantSeed, eyeScan, actionKind);

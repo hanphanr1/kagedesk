@@ -294,4 +294,19 @@ public class TaskbarPetRendererTests
         Assert.True(r.X + r.Width <= TaskbarPetRenderer.CanvasWidth);
         Assert.True(r.Y + r.Height <= TaskbarPetRenderer.CanvasHeight);
     }
+
+    [Fact]
+    public void Render_WorkingModeWithElapsedTimer_RendersPillWithoutException()
+    {
+        var renderer = new TaskbarPetRenderer();
+        var now = DateTimeOffset.UtcNow;
+        var agent = new AgentSnapshot("ag-coder", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "compile", WorkStartedAt: now.AddSeconds(-102));
+        var state = new HqState(new[] { agent }, Array.Empty<AccountInfo>(), Array.Empty<BuildInfo>(), EffectiveWeather.Day, HqMood.Busy, Array.Empty<HqEvent>(), Timestamp: now);
+        var theme = ThemePackLoader.BuiltInFallback;
+
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var ex = Record.Exception(() => renderer.Render(buf, state, theme, 1.0f));
+        Assert.Null(ex);
+        Assert.NotEmpty(renderer.HitRegions);
+    }
 }

@@ -97,3 +97,23 @@ jobs:
             }
             Write-Host "Verified snapshot: $png ($len bytes)"
           }
+
+          # 5. Run Release KageDesk.exe --record-gif into temp file and verify GIF89a header and size > 10 KB
+          $tempGif = Join-Path $env:RUNNER_TEMP "kagedesk-ci-demo.gif"
+          $gifProc = Start-Process -FilePath $exePath -ArgumentList @('--record-gif', $tempGif, '--theme', 'shinobi-hq', '--scenario', 'showcase', '--scale', '1') -Wait -PassThru
+          if ($gifProc.ExitCode -ne 0) {
+            throw "KageDesk.exe --record-gif exited with code $($gifProc.ExitCode)"
+          }
+          if (!(Test-Path $tempGif)) {
+            throw "Expected recorded GIF missing at $tempGif"
+          }
+          $gifLen = (Get-Item $tempGif).Length
+          if ($gifLen -lt 10240) {
+            throw "Recorded GIF size is too small: $gifLen bytes (expected > 10 KB)"
+          }
+          $bytes = [System.IO.File]::ReadAllBytes($tempGif)
+          $header = [System.Text.Encoding]::ASCII.GetString($bytes, 0, 6)
+          if ($header -ne "GIF89a") {
+            throw "Recorded GIF header is '$header', expected 'GIF89a'"
+          }
+          Write-Host "Verified animated GIF recorder: $tempGif ($gifLen bytes, header=$header)"

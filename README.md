@@ -11,7 +11,11 @@
 | :---: | :---: |
 | ![Shinobi HQ Working](docs/previews/shinobi-hq-working.png) | ![Taskbar Pet Approval](docs/previews/pet-overlay-approve.png) |
 
-KageDesk turns your Windows desktop and taskbar into a live pixel-art command center for your coding agents. Watch agents type at desks, spawn shadow clones across worktrees, celebrate completed builds, wave urgent approval banners, and react to live CI/weather states — all rendered natively in C# / Win32 GDI without Electron, WebView2, or browser runtimes.
+## KageDesk v2.0 — Living HQ Showcase
+
+![KageDesk Living HQ Demo](docs/previews/kagedesk-demo.gif)
+
+KageDesk turns your Windows desktop and taskbar into a live pixel-art command center for your coding agents. Watch agents type at desks, step out and walk across the rug delivering glowing scrolls during live handoffs, track real-time elapsed timers on long tasks, celebrate completed builds with 8-bit retro chimes, wave urgent approval banners, and record lightweight animated GIFs — all rendered natively in pure C# / Win32 GDI without Electron, WebView2, or browser runtimes.
 
 ---
 
@@ -127,6 +131,7 @@ dotnet build KageDesk.sln -c Release
 | :--- | :--- |
 | *(no args)* | Starts the full Live Wallpaper + Taskbar Pet Overlay + System Tray Studio |
 | `--no-wallpaper` | Runs only the transparent Taskbar Pet Overlay and tray controller |
+| `--record-gif <path> [--theme <id>] [--scenario <id>] [--scale 1\|2]` | Records a 6-second auto-choreographed showcase or scenario loop (`showcase`, `handoff`, `working`, `approve`, `done`, `fail`, `clone`) to GIF89a with transparent diff compression |
 | `--snapshot <dir>` | Headlessly renders all 9 crisp nearest-neighbor preview PNGs into `<dir>` |
 | `--benchmark <seconds> [--out <file>]` | Runs a headless rendering & GDI/RAM soak benchmark for `<seconds>` and optionally writes a JSON/text report |
 
@@ -137,8 +142,8 @@ Right-click the KageDesk tray icon (or right-click the Taskbar Pet strip) for li
 - **Taskbar Pets**: `Always Chill`, `Auto-Hide on Idle`, `Off`, `1x (384px)` / `2x (768px)` HiDPI scale, drag horizontally along the taskbar, and **Reset Position to Right**
 - **Theme Packs**: instant live switching (`Shinobi HQ`, `Cyber Bunker`, `Cozy Lo-Fi`), **Reload Themes**, and **Open Themes Folder**
 - **Weather**: `Auto`, `Dawn`, `Day`, `Sunset`, `MidnightRain`, `StormAlert`
-- **Demo Studio**: one-click triggers for `Working`, `Needs Approval`, `Done`, `Failure Alert`, `4 Clones`, and `Reset to Live Orca`
-- **Settings**: `Auto-Pause Wallpaper When Covered`, `Hide Pets in Fullscreen Game (DND)`, optional `Process Agent Collector`, optional `GitHub CI Collector`, and `Launch on Windows Startup`
+- **Demo Studio**: one-click triggers for `Trigger Working Agents`, `Trigger Living Handoff`, `Trigger Needs Approval`, `Trigger Done (Celebration)`, `Trigger Failure Alert`, `Trigger 4 Clones`, `Export 6s Demo GIF...`, and `Reset to Live Orca`
+- **Settings**: `Sound Effects (8-bit)` toggle, `Auto-Pause Wallpaper When Covered`, `Hide Pets in Fullscreen Game (DND)`, optional `Process Agent Collector`, optional `GitHub CI Collector`, and `Launch on Windows Startup`
 
 ---
 

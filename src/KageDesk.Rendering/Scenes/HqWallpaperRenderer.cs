@@ -42,6 +42,7 @@ public sealed class HqWallpaperRenderer
         public int BorderCol;
         public int BadgeBg;
         public int BadgeFg;
+        public DateTimeOffset? WorkStartedAt;
     }
 
     private readonly StationSlot[] _coreSlots = new StationSlot[4];
@@ -50,6 +51,7 @@ public sealed class HqWallpaperRenderer
     private static readonly Comparison<AgentSnapshot> ExtraStationComparison = (a, b) =>
         ComputeExtraStationPriority(b).CompareTo(ComputeExtraStationPriority(a));
     private readonly ParticleSystem _particles = new();
+    private readonly ActorMotionSystem _motionSystem = new();
     private readonly char[] _fmtScratch = new char[48];
 
     private ThemePack? _cachedTheme;
@@ -74,6 +76,7 @@ public sealed class HqWallpaperRenderer
     public void ResetEffects()
     {
         _particles.Reset();
+        _motionSystem.Reset();
         _lastTime = -1f;
         _emitAccum = 0f;
         _lastCloneCount = 0;
@@ -149,17 +152,29 @@ public sealed class HqWallpaperRenderer
         // 4. Emit & Update Particles (zero-alloc)
         UpdateStationParticles(dt, extraCount, coreDeskY, extraDeskY, state);
 
+        // 4b. Update zero-allocation ActorMotionSystem for handoffs & ambient life
+        _motionSystem.Update(
+            dt,
+            timeSeconds,
+            state,
+            coreDeskY,
+            extraDeskY,
+            extraCount,
+            CoreStationCentersX,
+            GetExtraStationCenterX,
+            _particles);
+
         // 5. Row 1: 4 Core Character Workstations
         for (int i = 0; i < 4; i++)
         {
-            DrawWorkstation(buf, ref _coreSlots[i], CoreStationCentersX[i], coreDeskY, timeSeconds, i);
+            DrawWorkstation(buf, ref _coreSlots[i], CoreStationCentersX[i], coreDeskY, timeSeconds, i, state.Timestamp);
         }
 
         // 6. Row 2: Dynamic Clone / External Workstations (up to 5)
         for (int i = 0; i < extraCount; i++)
         {
             int cx = GetExtraStationCenterX(i, extraCount);
-            DrawWorkstation(buf, ref _extraSlots[i], cx, extraDeskY, timeSeconds, i + 4);
+            DrawWorkstation(buf, ref _extraSlots[i], cx, extraDeskY, timeSeconds, i + 4, state.Timestamp);
         }
 
         // 7. Render Active Particles on top
@@ -215,7 +230,8 @@ public sealed class HqWallpaperRenderer
                     ToolName = ag.ToolName,
                     VariantSeed = HashString(ag.Id),
                     ActionKind = actionKind,
-                    BadgeLabel = badgeLabel
+                    BadgeLabel = badgeLabel,
+                    WorkStartedAt = ag.WorkStartedAt
                 };
             }
             else
@@ -245,7 +261,8 @@ public sealed class HqWallpaperRenderer
                 ToolName = ag.ToolName,
                 VariantSeed = HashString(ag.Id),
                 ActionKind = actionKind,
-                BadgeLabel = badgeLabel
+                BadgeLabel = badgeLabel,
+                WorkStartedAt = ag.WorkStartedAt
             };
         }
 
@@ -1222,22 +1239,33 @@ public sealed class HqWallpaperRenderer
         return new NameplateLayout(totalW, h, x, y, nameAvail, bx, badgeW, h - 2);
     }
 
-    private void DrawWorkstation(PixelBuffer buf, ref StationSlot slot, int cx, int deskY, float timeSeconds, int phase)
+    private void DrawWorkstation(PixelBuffer buf, ref StationSlot slot, int cx, int deskY, float timeSeconds, int stationIdx, DateTimeOffset now)
     {
         AgentActionKind actionKind = slot.ActionKind;
+        ref readonly var motion = ref _motionSystem.GetMotion(stationIdx);
 
-        // Character sits behind desk with full face & upper outfit clearly visible above desk & monitors
+        int charX = cx + motion.OffsetX;
+        int charY = deskY + 3 + motion.OffsetY;
+        bool behindDesk = motion.BehindDesk;
+        bool isWalking = motion.State is ActorMotionState.StepOut or ActorMotionState.WalkingToTarget or ActorMotionState.WalkingBack or ActorMotionState.StepBack or ActorMotionState.IdleStroll;
+        bool carryingScroll = motion.CarryingScroll;
+        bool facingRight = motion.FacingRight;
+
+        // Character sits behind desk with full face & upper outfit clearly visible above desk & monitors (or steps out/walks)
         ShinobiSpriteRenderer.DrawCharacter(
             buf,
             slot.SpriteKey,
             slot.State,
-            cx,
-            deskY + 3,
+            charX,
+            charY,
             timeSeconds,
-            phaseOffset: phase,
-            behindDesk: true,
+            phaseOffset: stationIdx,
+            behindDesk: behindDesk,
             variantSeed: slot.VariantSeed,
-            actionKind: actionKind);
+            actionKind: actionKind,
+            isWalking: isWalking,
+            carryingScroll: carryingScroll,
+            facingRight: facingRight);
 
         // Desk & interactive station props
         ShinobiSpriteRenderer.DrawDesk(
@@ -1265,6 +1293,32 @@ public sealed class HqWallpaperRenderer
         else if (slot.State == AgentState.Failed)
         {
             ShinobiSpriteRenderer.DrawStatusBubble(buf, cx, bubbleY, "!!", ColorCrimsonDark, ColorCrimson, ColorCrimson);
+        }
+
+        // Live Elapsed Timer pill (when working or approval and WorkStartedAt != null)
+        if ((slot.State == AgentState.Working || slot.State == AgentState.NeedsApproval) && slot.WorkStartedAt.HasValue)
+        {
+            int elapsedSec = (int)Math.Max(0, (now - slot.WorkStartedAt.Value).TotalSeconds);
+            int mm = Math.Min(99, elapsedSec / 60);
+            int ss = elapsedSec % 60;
+
+            _fmtScratch[0] = (char)('0' + (mm / 10));
+            _fmtScratch[1] = (char)('0' + (mm % 10));
+            _fmtScratch[2] = ':';
+            _fmtScratch[3] = (char)('0' + (ss / 10));
+            _fmtScratch[4] = (char)('0' + (ss % 10));
+
+            int pillBg = mm < 10 ? ColorCyanDark : ColorAmberDark;
+            int pillFg = mm < 10 ? ColorCyan : ColorAmberBright;
+            int pillBorder = mm < 10 ? ColorCyan : ColorAmber;
+
+            int pillW = 23;
+            int pillH = 9;
+            int pillX = cx - pillW / 2;
+            int pillY = deskY - 8;
+
+            buf.DrawPixelCard(pillX, pillY, pillW, pillH, pillBg, pillBorder);
+            PixelFont.DrawText(buf, pillX + 2, pillY + 2, _fmtScratch.AsSpan(0, 5), pillFg, PixelFontSize.Small);
         }
 
         // Crisp nameplate & tool/state badge strictly below desk (y = deskY + 20 .. deskY + 31)

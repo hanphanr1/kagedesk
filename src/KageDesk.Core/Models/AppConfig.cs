@@ -21,4 +21,5 @@ public class AppConfig
     public bool HidePetsInFullscreenGame { get; set; } = true;
     public int TargetFps { get; set; } = 15;
     public bool LaunchOnStartup { get; set; } = false;
+    public bool SoundEnabled { get; set; } = true;
 }

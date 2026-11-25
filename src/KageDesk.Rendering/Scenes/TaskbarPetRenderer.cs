@@ -64,6 +64,7 @@ public sealed class TaskbarPetRenderer
     private ResolvedScenePalette _palette;
     private float _lastTime = -1f;
     private float _emitAccum;
+    private DateTimeOffset _stateTimestamp;
 
     public IReadOnlyList<PetHitRegion> HitRegions => _hitRegions;
 
@@ -86,6 +87,8 @@ public sealed class TaskbarPetRenderer
         {
             throw new ArgumentException($"PixelBuffer must be at least {CanvasWidth}x{CanvasHeight}.", nameof(buf));
         }
+
+        _stateTimestamp = state.Timestamp;
 
         if (!ReferenceEquals(_cachedTheme, theme))
         {
@@ -444,6 +447,25 @@ public sealed class TaskbarPetRenderer
             int c2 = Math.Min(t.Length, _textScratch.Length - written);
             t.Slice(0, c2).CopyTo(_textScratch.AsSpan(written));
             written += c2;
+
+            if (a.WorkStartedAt.HasValue)
+            {
+                var now = _stateTimestamp;
+                var elapsedSec = (int)Math.Max(0, (now - a.WorkStartedAt.Value).TotalSeconds);
+                int mm = Math.Min(99, elapsedSec / 60);
+                int ss = elapsedSec % 60;
+                if (written + 8 <= _textScratch.Length)
+                {
+                    " \u2022 ".AsSpan().CopyTo(_textScratch.AsSpan(written));
+                    written += 3;
+                    _textScratch[written++] = (char)('0' + (mm / 10));
+                    _textScratch[written++] = (char)('0' + (mm % 10));
+                    _textScratch[written++] = ':';
+                    _textScratch[written++] = (char)('0' + (ss / 10));
+                    _textScratch[written++] = (char)('0' + (ss % 10));
+                }
+            }
+
             pillText = _textScratch.AsSpan(0, written);
         }
         else

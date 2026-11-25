@@ -331,5 +331,25 @@ public class AgentDetailToastAndOverlayClickTests
         Assert.Equal("proc:test:abc123", toast.Agent.Id);
         toast.Close();
     }
+
+    [Fact]
+    public void ShowToast_WithWorkStartedAt_RendersElapsedWithoutException()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var agent = new AgentSnapshot(
+            "ag-timer",
+            "Minato",
+            AgentRole.Coder,
+            "minato",
+            AgentState.Working,
+            WorkStartedAt: now.AddSeconds(-102)
+        );
+
+        using var toast = new AgentDetailToast(agent);
+        Assert.NotNull(toast.Agent.WorkStartedAt);
+        _ = toast.Handle;
+        toast.Refresh();
+        toast.Close();
+    }
 }
 

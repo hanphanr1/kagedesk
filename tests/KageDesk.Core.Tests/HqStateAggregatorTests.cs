@@ -548,5 +548,245 @@ public class HqStateAggregatorTests
         var state = aggregator.GetState();
         Assert.Empty(state.Agents);
     }
+
+    [Fact]
+    public void AutoHandoffDetection_EmitsHandoffVisualEvent_WhenAgentExitsWorkingAndOtherEntersWorkingWithin15Seconds()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var aggregator = new HqStateAggregator(timeProvider: () => now);
+
+        // Step 1: Agent A is Working
+        var agentA = new AgentSnapshot("agent-a", "Agent A", AgentRole.Coder, "minato", AgentState.Working);
+        aggregator.UpdateOrcaSnapshot(new[] { agentA }, Array.Empty<AccountInfo>());
+
+        var state1 = aggregator.GetState();
+        Assert.Single(state1.Agents);
+        Assert.NotNull(state1.Agents[0].WorkStartedAt);
+
+        // Step 2: 5 seconds later, Agent A finishes (becomes Done/Idle) and Agent B starts Working
+        now = now.AddSeconds(5);
+        var agentADone = agentA with { State = AgentState.Done };
+        var agentB = new AgentSnapshot("agent-b", "Agent B", AgentRole.Tester, "tsunade", AgentState.Working);
+        aggregator.UpdateOrcaSnapshot(new[] { agentADone, agentB }, Array.Empty<AccountInfo>());
+
+        var state2 = aggregator.GetState();
+        var handoffEvent = state2.PendingVisualEvents.FirstOrDefault(e => e.Type == "handoff");
+        Assert.NotNull(handoffEvent);
+        Assert.Equal("agent-a", handoffEvent.AgentId);
+        Assert.Equal("agent-b", handoffEvent.TargetAgentId);
+    }
+
+    [Fact]
+    public void ExplicitHandoffPushedEvent_EmitsHandoffEvent_WithFromAndToAgentIds()
+    {
+        var aggregator = new HqStateAggregator();
+        aggregator.UpdatePushedEvent(new PushedEventPayload(
+            Type: "handoff",
+            FromAgentId: "minato-1",
+            ToAgentId: "tsunade-1",
+            Message: "Scroll transfer to QA"
+        ));
+
+        var state = aggregator.GetState();
+        var ev = state.PendingVisualEvents.FirstOrDefault(e => e.Type == "handoff");
+        Assert.NotNull(ev);
+        Assert.Equal("minato-1", ev.AgentId);
+        Assert.Equal("tsunade-1", ev.TargetAgentId);
+        Assert.Equal("Scroll transfer to QA", ev.Message);
+    }
+
+    [Fact]
+    public void DemoScenario_Handoff_ContainsActiveHandoffEventAndWorkingAgents()
+    {
+        var aggregator = new HqStateAggregator();
+        aggregator.SetDemoScenario("handoff");
+
+        var state = aggregator.GetState();
+        Assert.Equal("handoff", state.DemoScenario);
+        Assert.Contains(state.Agents, a => a.Id == "demo-coder" && a.State == AgentState.Working && a.WorkStartedAt != null);
+        Assert.Contains(state.Agents, a => a.Id == "demo-tester" && a.State == AgentState.Working && a.WorkStartedAt != null);
+
+        var ev = state.PendingVisualEvents.FirstOrDefault(e => e.Type == "handoff");
+        Assert.NotNull(ev);
+        Assert.Equal("demo-coder", ev.AgentId);
+        Assert.Equal("demo-tester", ev.TargetAgentId);
+    }
+
+    [Fact]
+    public void WorkStartedAt_TrackedAccurately_AndResetToNullWhenReturningToIdle()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var aggregator = new HqStateAggregator(timeProvider: () => now);
+
+        var agent = new AgentSnapshot("ag-1", "Ag 1", AgentRole.Coder, "minato", AgentState.Working);
+        aggregator.UpdateOrcaSnapshot(new[] { agent }, Array.Empty<AccountInfo>());
+
+        var stateWorking = aggregator.GetState();
+        var startedAt = stateWorking.Agents[0].WorkStartedAt;
+        Assert.NotNull(startedAt);
+        Assert.Equal(now, startedAt.Value);
+
+        // Advance time and remain working: WorkStartedAt should remain stable
+        now = now.AddSeconds(10);
+        aggregator.Reevaluate();
+        var stateWorking2 = aggregator.GetState();
+        Assert.Equal(startedAt, stateWorking2.Agents[0].WorkStartedAt);
+
+        // Transition to Idle: WorkStartedAt must reset to null
+        now = now.AddSeconds(5);
+        aggregator.UpdateOrcaSnapshot(new[] { agent with { State = AgentState.Idle } }, Array.Empty<AccountInfo>());
+        var stateIdle = aggregator.GetState();
+        Assert.Null(stateIdle.Agents[0].WorkStartedAt);
+    }
+
+    [Fact]
+    public void OrcaSnapshotParser_ParsesStateStartedAt_WhenWorkingOrNeedsApproval()
+    {
+        var now = DateTimeOffset.UtcNow;
+        long epochMs = 1732560000000L;
+        var expectedDto = DateTimeOffset.FromUnixTimeMilliseconds(epochMs);
+
+        var json = $$"""
+        {
+            "ok": true,
+            "result": {
+                "worktrees": [
+                    {
+                        "worktreeId": "wt-1",
+                        "status": "working",
+                        "agents": [
+                            {
+                                "address": "ag-active",
+                                "state": "working",
+                                "stateStartedAt": {{epochMs}},
+                                "taskTitle": "Compiling kernel"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        """;
+
+        var agents = KageDesk.Core.Collectors.OrcaSnapshotParser.ParseWorktreePs(json, now);
+        Assert.Single(agents);
+        Assert.Equal(AgentState.Working, agents[0].State);
+        Assert.Equal(expectedDto, agents[0].WorkStartedAt);
+    }
+
+    [Fact]
+    public void AutoHandoff_DoesNotTrigger_WhenTransitionsAreMoreThan15SecondsApart()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var aggregator = new HqStateAggregator(timeProvider: () => now);
+
+        // Step 1: Agent 1 working
+        var ag1 = new AgentSnapshot("ag-1", "Agent 1", AgentRole.Coder, "minato", AgentState.Working);
+        var ag2 = new AgentSnapshot("ag-2", "Agent 2", AgentRole.Tester, "tsunade", AgentState.Idle);
+        aggregator.UpdateOrcaSnapshot(new[] { ag1, ag2 }, Array.Empty<AccountInfo>());
+
+        // Step 2: Agent 1 finishes working at t = 0
+        aggregator.UpdateOrcaSnapshot(new[] { ag1 with { State = AgentState.Done }, ag2 }, Array.Empty<AccountInfo>());
+
+        // Step 3: Advance 16 seconds (> 15s window)
+        now = now.AddSeconds(16);
+
+        // Step 4: Agent 2 starts working
+        aggregator.UpdateOrcaSnapshot(new[] { ag1 with { State = AgentState.Done }, ag2 with { State = AgentState.Working } }, Array.Empty<AccountInfo>());
+
+        var state = aggregator.GetState();
+        var handoffEvent = state.PendingVisualEvents.FirstOrDefault(e => e.Type == "handoff");
+        Assert.Null(handoffEvent);
+    }
+
+    [Fact]
+    public void AutoHandoff_DoesNotTrigger_ForSameAgent()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var aggregator = new HqStateAggregator(timeProvider: () => now);
+
+        var ag1 = new AgentSnapshot("ag-1", "Agent 1", AgentRole.Coder, "minato", AgentState.Working);
+        aggregator.UpdateOrcaSnapshot(new[] { ag1 }, Array.Empty<AccountInfo>());
+
+        // Agent 1 finishes at t = 0
+        aggregator.UpdateOrcaSnapshot(new[] { ag1 with { State = AgentState.Done } }, Array.Empty<AccountInfo>());
+
+        // Agent 1 starts working again at t = 2s (same agent)
+        now = now.AddSeconds(2);
+        aggregator.UpdateOrcaSnapshot(new[] { ag1 with { State = AgentState.Working } }, Array.Empty<AccountInfo>());
+
+        var state = aggregator.GetState();
+        var handoffEvent = state.PendingVisualEvents.FirstOrDefault(e => e.Type == "handoff");
+        Assert.Null(handoffEvent);
+    }
+
+    [Fact]
+    public void OrcaSnapshotParser_NullWorkStartedAt_WhenAgentIsIdle()
+    {
+        var now = DateTimeOffset.UtcNow;
+        long epochMs = 1732560000000L;
+
+        var json = $$"""
+        {
+            "ok": true,
+            "result": {
+                "worktrees": [
+                    {
+                        "worktreeId": "wt-1",
+                        "status": "idle",
+                        "agents": [
+                            {
+                                "address": "ag-idle",
+                                "state": "idle",
+                                "stateStartedAt": {{epochMs}},
+                                "taskTitle": "Idle task"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        """;
+
+        var agents = KageDesk.Core.Collectors.OrcaSnapshotParser.ParseWorktreePs(json, now);
+        Assert.Single(agents);
+        Assert.Equal(AgentState.Idle, agents[0].State);
+        Assert.Null(agents[0].WorkStartedAt);
+    }
+
+    [Fact]
+    public void OrcaSnapshotParser_ParsesMainAgentStateStartedAt_WhenNeedsApproval()
+    {
+        var now = DateTimeOffset.UtcNow;
+        long epochMs = 1732560120000L;
+        var expectedDto = DateTimeOffset.FromUnixTimeMilliseconds(epochMs);
+
+        var json = $$"""
+        {
+            "ok": true,
+            "result": {
+                "worktrees": [
+                    {
+                        "worktreeId": "wt-gate",
+                        "status": "needs_approval",
+                        "mainAgent": {
+                            "address": "ag-leader",
+                            "state": "needs_approval",
+                            "stateStartedAt": {{epochMs}},
+                            "taskTitle": "Deployment approval gate"
+                        }
+                    }
+                ]
+            }
+        }
+        """;
+
+        var agents = KageDesk.Core.Collectors.OrcaSnapshotParser.ParseWorktreePs(json, now);
+        Assert.Single(agents);
+        Assert.Equal(AgentState.NeedsApproval, agents[0].State);
+        Assert.Equal(expectedDto, agents[0].WorkStartedAt);
+    }
 }
+
+
 

@@ -37,7 +37,9 @@ public class TrayController : IDisposable
     public Action<bool>? OnGameDndToggled { get; set; }
     public Action<bool>? OnProcessAgentCollectorToggled { get; set; }
     public Action<bool>? OnGitHubCiCollectorToggled { get; set; }
+    public Action<bool>? OnSoundToggled { get; set; }
     public Action<string>? OnDemoTrigger { get; set; }
+    public Action? OnExportGif { get; set; }
 
     public ContextMenuStrip ContextMenu => _contextMenu ?? throw new ObjectDisposedException(nameof(TrayController));
 
@@ -247,16 +249,26 @@ public class TrayController : IDisposable
         // 6. Demo Studio Submenu (Canonical names routed directly to SetDemoScenario)
         var demoMenu = new ToolStripMenuItem("Demo Studio");
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Working Agents", null, (_, _) => OnDemoTrigger?.Invoke("working")));
+        demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Living Handoff", null, (_, _) => OnDemoTrigger?.Invoke("handoff")));
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Needs Approval", null, (_, _) => OnDemoTrigger?.Invoke("approve")));
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Done (Celebration)", null, (_, _) => OnDemoTrigger?.Invoke("done")));
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Failure Alert", null, (_, _) => OnDemoTrigger?.Invoke("fail")));
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger 4 Clones", null, (_, _) => OnDemoTrigger?.Invoke("clone")));
+        demoMenu.DropDownItems.Add(new ToolStripSeparator());
+        demoMenu.DropDownItems.Add(new ToolStripMenuItem("Export 6s Demo GIF...", null, (_, _) => OnExportGif?.Invoke()));
         demoMenu.DropDownItems.Add(new ToolStripSeparator());
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Reset to Live Orca", null, (_, _) => OnDemoTrigger?.Invoke("clear")));
         _contextMenu.Items.Add(demoMenu);
 
         // 7. Settings Submenu
         var settingsMenu = new ToolStripMenuItem("Settings");
+        var soundItem = new ToolStripMenuItem("Sound Effects (8-bit)", null, (_, _) =>
+        {
+            bool next = !config.SoundEnabled;
+            UpdateConfig?.Invoke(c => c.SoundEnabled = next);
+            OnSoundToggled?.Invoke(next);
+        }) { Checked = config.SoundEnabled };
+
         var autoPauseItem = new ToolStripMenuItem("Auto-Pause Wallpaper When Covered", null, (_, _) =>
         {
             bool next = !config.AutoPauseWallpaperWhenCovered;
@@ -294,6 +306,8 @@ public class TrayController : IDisposable
             }
         }) { Checked = StartupManager.IsStartupEnabled() };
 
+        settingsMenu.DropDownItems.Add(soundItem);
+        settingsMenu.DropDownItems.Add(new ToolStripSeparator());
         settingsMenu.DropDownItems.Add(autoPauseItem);
         settingsMenu.DropDownItems.Add(gameDndItem);
         settingsMenu.DropDownItems.Add(new ToolStripSeparator());

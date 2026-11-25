@@ -179,8 +179,15 @@ public class AgentDetailToast : Form
         var sourceRect = new RectangleF(10, 34, Width - 20, 16);
         g.DrawString(sourceLabel, DetailFont, subBrush, sourceRect, sf);
 
-        // State / Role
+        // State / Role / Elapsed
         string stateRoleText = $"State: {_agent.State}   Role: {_agent.Role}";
+        if (_agent.WorkStartedAt.HasValue)
+        {
+            int elapsedSec = (int)Math.Max(0, (DateTimeOffset.UtcNow - _agent.WorkStartedAt.Value).TotalSeconds);
+            int mm = elapsedSec / 60;
+            int ss = elapsedSec % 60;
+            stateRoleText += $"   Elapsed: {mm:D2}:{ss:D2}";
+        }
         var stateRect = new RectangleF(10, 52, Width - 20, 16);
         g.DrawString(stateRoleText, BodyFont, dimBrush, stateRect, sf);
 

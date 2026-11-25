@@ -73,6 +73,7 @@ public record AgentSnapshot(
     bool Unread = false,
     string? QuestionPrompt = null,
     string? Source = null,
+    DateTimeOffset? WorkStartedAt = null,
     [property: JsonIgnore] int? ProcessId = null,
     [property: JsonIgnore] long? ProcessStartTicks = null
 );
@@ -114,7 +115,8 @@ public record HqEvent(
     string Message,
     DateTimeOffset Timestamp,
     string? AgentId = null,
-    double TtlSeconds = 10.0
+    double TtlSeconds = 10.0,
+    string? TargetAgentId = null
 );
 
 public record HqState(

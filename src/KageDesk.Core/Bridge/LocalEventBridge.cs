@@ -185,7 +185,7 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
             await WriteJsonAsync(response, 200, new
             {
                 ok = true,
-                version = "1.0.0",
+                version = "2.0.0",
                 workingSetMb = Math.Round(workingSet, 2),
                 uptimeSec = Math.Round(uptime, 1),
                 activeTheme = activeTheme,
@@ -223,7 +223,8 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
                     Unread: a.Unread,
                     Source: a.Source,
                     LastActivityAt: a.LastActivityAt,
-                    UpdatedAt: a.UpdatedAt
+                    UpdatedAt: a.UpdatedAt,
+                    WorkStartedAt: a.WorkStartedAt
                 ));
             }
 
@@ -234,7 +235,8 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
                     SequenceId: e.SequenceId,
                     Type: e.Type,
                     AgentId: e.AgentId,
-                    Timestamp: e.Timestamp
+                    Timestamp: e.Timestamp,
+                    TargetAgentId: e.TargetAgentId
                 ));
             }
 
