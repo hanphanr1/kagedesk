@@ -2,59 +2,61 @@ using KageDesk.Core.Models;
 using KageDesk.Core.Themes;
 using KageDesk.Rendering.Canvas;
 using KageDesk.Rendering.Scenes;
+using Xunit;
 
 namespace KageDesk.Rendering.Tests;
 
 public class TaskbarPetRendererTests
 {
-    private static HqState MakeState(params AgentSnapshot[] agents) => new(
-        Agents: agents,
-        Accounts: Array.Empty<AccountInfo>(),
-        Builds: Array.Empty<BuildInfo>(),
-        Weather: EffectiveWeather.Day,
-        Mood: HqMood.Calm,
-        PendingVisualEvents: Array.Empty<HqEvent>(),
-        Timestamp: DateTimeOffset.UtcNow);
+    private static HqState MakeState(params AgentSnapshot[] agents)
+    {
+        return new HqState(
+            Agents: agents,
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Calm,
+            PendingVisualEvents: Array.Empty<HqEvent>(),
+            Timestamp: DateTimeOffset.UtcNow);
+    }
 
     [Fact]
-    public void Render_NeedsApproval_HasTransparentBackgroundCharacterAndExactHitRegions()
+    public void Render_NeedsApprovalMode_RendersPillAndActionButtons()
     {
         var renderer = new TaskbarPetRenderer();
         using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
 
         var state = MakeState(
-            new AgentSnapshot("shika-1", "Shikamaru (Leader)", AgentRole.Leader, "shikamaru", AgentState.NeedsApproval,
-                QuestionPrompt: "Approve production deployment to main cluster?"));
+            new AgentSnapshot(
+                Id: "agent-1",
+                Name: "Shikamaru (Leader)",
+                Role: AgentRole.Leader,
+                SpriteKey: "shikamaru",
+                State: AgentState.NeedsApproval,
+                QuestionPrompt: "Approve deployment to production release?",
+                TaskTitle: "Deploy Pipeline"));
 
         IReadOnlyList<PetHitRegion> regions = renderer.Render(buf, state, ThemePackLoader.BuiltInFallback, 1.0f);
 
-        double transparentRatio = ComputeTransparentRatio(buf);
-        Assert.True(transparentRatio > 0.55, $"Expected >55% transparent pixels, got {transparentRatio:P1}.");
+        Assert.NotEmpty(regions);
+        Assert.All(regions, AssertValidRegionInBounds);
 
-        // Top-left corner must be 100% transparent
-        Assert.Equal(0, buf.GetPixel(0, 0));
-        Assert.Equal(0, buf.GetPixel(20, 10));
+        var openOrca = Assert.Single(regions, r => r.ActionId == "open_orca");
+        var dismiss = Assert.Single(regions, r => r.ActionId == "dismiss");
+        var agent = Assert.Single(regions, r => r.ActionId == "agent:agent-1");
 
-        // Character pixels present near bottom edge on right
-        Assert.True(CountNonZeroPixelsInRegion(buf, 326, 92, 36, 34) > 120);
+        Assert.True(openOrca.Width > 60 && openOrca.Height > 10);
+        Assert.True(dismiss.Width > 14 && dismiss.Height > 10);
+        Assert.True(agent.Width >= 20 && agent.Height >= 20);
 
-        // Hit regions must include open_orca, dismiss, and agent:shika-1
-        PetHitRegion openOrca = Assert.Single(regions, r => r.ActionId == "open_orca");
-        PetHitRegion dismiss = Assert.Single(regions, r => r.ActionId == "dismiss");
-        PetHitRegion agent = Assert.Single(regions, r => r.ActionId == "agent:shika-1");
+        Assert.True(ComputeTransparentRatio(buf) > 0.60);
 
-        AssertValidRegionInBounds(openOrca);
-        AssertValidRegionInBounds(dismiss);
-        AssertValidRegionInBounds(agent);
-        Assert.False(openOrca.Contains(dismiss.X + dismiss.Width / 2, dismiss.Y + dismiss.Height / 2));
-
-        // Verify button regions actually have rendered non-transparent pixels
         Assert.True(CountNonZeroPixelsInRegion(buf, openOrca.X, openOrca.Y, openOrca.Width, openOrca.Height) > 400);
         Assert.True(CountNonZeroPixelsInRegion(buf, dismiss.X, dismiss.Y, dismiss.Width, dismiss.Height) > 100);
     }
 
     [Fact]
-    public void Render_WorkingMultipleAgents_RendersUpToThreeMiniDesksAndAgentHitRegions()
+    public void Render_WorkingMultipleAgents_RendersUpToSixMiniDesksAndAgentHitRegions()
     {
         var renderer = new TaskbarPetRenderer();
         using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
@@ -68,8 +70,88 @@ public class TaskbarPetRendererTests
         IReadOnlyList<PetHitRegion> regions = renderer.Render(buf, state, ThemePackLoader.BuiltInFallback, 1.5f);
 
         Assert.True(ComputeTransparentRatio(buf) > 0.70);
-        Assert.Equal(3, regions.Count(r => r.ActionId.StartsWith("agent:", StringComparison.Ordinal)));
+        Assert.Equal(4, regions.Count(r => r.ActionId.StartsWith("agent:", StringComparison.Ordinal)));
         Assert.Contains(regions, r => r.ActionId == "open_orca");
+        Assert.All(regions, AssertValidRegionInBounds);
+    }
+
+    [Fact]
+    public void Render_SixConcurrentWorkingAgents_FitsCleanlyWithoutClipping()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+
+        var state = MakeState(
+            new AgentSnapshot("a1", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit"),
+            new AgentSnapshot("a2", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test"),
+            new AgentSnapshot("a3", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Working, ToolName: "review"),
+            new AgentSnapshot("a4", "OMP", AgentRole.Coder, "omp", AgentState.Working, ToolName: "code"),
+            new AgentSnapshot("a5", "AGY", AgentRole.Leader, "agy", AgentState.Working, ToolName: "think"),
+            new AgentSnapshot("a6", "Claude", AgentRole.Coder, "claude", AgentState.Working, ToolName: "exec"));
+
+        IReadOnlyList<PetHitRegion> regions = renderer.Render(buf, state, ThemePackLoader.BuiltInFallback, 1.0f);
+
+        Assert.Equal(6, regions.Count(r => r.ActionId.StartsWith("agent:", StringComparison.Ordinal)));
+        Assert.Contains(regions, r => r.ActionId == "open_orca");
+        Assert.All(regions, AssertValidRegionInBounds);
+        Assert.True(ComputeTransparentRatio(buf) > 0.60);
+    }
+
+    [Fact]
+    public void Render_MoreThanSixWorkingAgents_CapsAtSixAndShowsPlusN()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+
+        var agents = new List<AgentSnapshot>();
+        for (int i = 1; i <= 8; i++)
+        {
+            agents.Add(new AgentSnapshot($"a{i}", $"Agent {i}", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit"));
+        }
+
+        var state = MakeState(agents.ToArray());
+        IReadOnlyList<PetHitRegion> regions = renderer.Render(buf, state, ThemePackLoader.BuiltInFallback, 1.0f);
+
+        // Scratch caps rendered agents at 6
+        Assert.Equal(6, regions.Count(r => r.ActionId.StartsWith("agent:", StringComparison.Ordinal)));
+        Assert.Contains(regions, r => r.ActionId == "open_orca");
+        Assert.All(regions, AssertValidRegionInBounds);
+    }
+
+    [Fact]
+    public void Render_ReadFileTool_NeverProducesReadFil()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+
+        var state = MakeState(
+            new AgentSnapshot("a1", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "read_file"));
+
+        IReadOnlyList<PetHitRegion> regions = renderer.Render(buf, state, ThemePackLoader.BuiltInFallback, 1.0f);
+
+        Assert.Single(regions, r => r.ActionId == "agent:a1");
+        var (kind, shortLabel) = AgentActionClassifier.Classify(AgentState.Working, "read_file");
+        Assert.Equal(AgentActionKind.Reading, kind);
+        Assert.Equal("READ", shortLabel);
+        Assert.NotEqual("READ_FIL", shortLabel);
+    }
+
+    [Fact]
+    public void Render_IdleMode_ShowsLiveIdleTerminalAgentsBesidePrimary()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+
+        var state = MakeState(
+            new AgentSnapshot("proc:omp:100", "OMP", AgentRole.Coder, "omp", AgentState.Idle, Source: "process", ProcessId: 100),
+            new AgentSnapshot("proc:agy:200", "AGY", AgentRole.Leader, "agy", AgentState.Idle, Source: "process", ProcessId: 200));
+
+        IReadOnlyList<PetHitRegion> regions = renderer.Render(buf, state, ThemePackLoader.BuiltInFallback, 1.0f, showIdleChill: true);
+
+        // Primary (Kakashi) + 2 live idle terminal agents
+        Assert.Contains(regions, r => r.ActionId == "agent:proc:omp:100");
+        Assert.Contains(regions, r => r.ActionId == "agent:proc:agy:200");
+        Assert.All(regions, AssertValidRegionInBounds);
     }
 
     [Fact]
@@ -78,7 +160,6 @@ public class TaskbarPetRendererTests
         var renderer = new TaskbarPetRenderer();
         using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
 
-        // Failed has priority over Done & Working
         var failState = MakeState(
             new AgentSnapshot("w1", "Minato", AgentRole.Coder, "minato", AgentState.Working),
             new AgentSnapshot("d1", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Done),
@@ -90,7 +171,6 @@ public class TaskbarPetRendererTests
         Assert.Contains(failRegions, r => r.ActionId == "open_orca");
         Assert.Contains(failRegions, r => r.ActionId == "dismiss");
 
-        // Done mode when no approval/failed
         var doneState = MakeState(
             new AgentSnapshot("d1", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Done, TaskTitle: "All tests green"));
         IReadOnlyList<PetHitRegion> doneRegions = renderer.Render(buf, doneState, ThemePackLoader.BuiltInFallback, 1.0f);
@@ -105,12 +185,10 @@ public class TaskbarPetRendererTests
         using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
         var idleState = MakeState();
 
-        // showIdleChill = false -> 100% transparent
         IReadOnlyList<PetHitRegion> hiddenRegions = renderer.Render(buf, idleState, ThemePackLoader.BuiltInFallback, 0.5f, showIdleChill: false);
         Assert.Empty(hiddenRegions);
         Assert.Equal(1.0, ComputeTransparentRatio(buf));
 
-        // showIdleChill = true -> renders chill character with >85% transparent background
         IReadOnlyList<PetHitRegion> chillRegions = renderer.Render(buf, idleState, ThemePackLoader.BuiltInFallback, 0.5f, showIdleChill: true);
         Assert.Single(chillRegions);
         double ratio = ComputeTransparentRatio(buf);

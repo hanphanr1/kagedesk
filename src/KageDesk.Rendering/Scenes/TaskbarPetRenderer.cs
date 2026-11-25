@@ -36,10 +36,10 @@ public sealed class TaskbarPetRenderer
     private static readonly int ColorSlate = ColorUtil.FromRgb(148, 163, 184);
     private static readonly int ColorWhite = ColorUtil.FromRgb(248, 250, 252);
 
-    private readonly List<PetHitRegion> _hitRegions = new(8);
+    private readonly List<PetHitRegion> _hitRegions = new(16);
     private readonly ParticleSystem _particles = new();
-    private readonly AgentSnapshot[] _workingScratch = new AgentSnapshot[3];
-    private readonly char[] _textScratch = new char[48];
+    private readonly AgentSnapshot[] _workingScratch = new AgentSnapshot[6];
+    private readonly char[] _textScratch = new char[64];
 
     private ThemePack? _cachedTheme;
     private ResolvedScenePalette _palette;
@@ -76,15 +76,14 @@ public sealed class TaskbarPetRenderer
         float dt = _lastTime < 0f ? 0.033f : Math.Clamp(timeSeconds - _lastTime, 0f, 0.2f);
         _lastTime = timeSeconds;
 
-        // 100% transparent background (0x00000000)
         buf.ClearTransparent();
         _hitRegions.Clear();
 
-        // Priority scan without LINQ allocations
         AgentSnapshot? approvalAgent = null;
         AgentSnapshot? failedAgent = null;
         AgentSnapshot? doneAgent = null;
         int workingCount = 0;
+        int totalWorking = 0;
 
         var agents = state.Agents;
         for (int i = 0; i < agents.Count; i++)
@@ -102,9 +101,13 @@ public sealed class TaskbarPetRenderer
             {
                 doneAgent = ag;
             }
-            else if (ag.State == AgentState.Working && workingCount < 3)
+            else if (ag.State == AgentState.Working)
             {
-                _workingScratch[workingCount++] = ag;
+                totalWorking++;
+                if (workingCount < 6)
+                {
+                    _workingScratch[workingCount++] = ag;
+                }
             }
         }
 
@@ -130,7 +133,7 @@ public sealed class TaskbarPetRenderer
         }
         else if (workingCount > 0)
         {
-            RenderWorkingMode(buf, workingCount, timeSeconds, emitTick);
+            RenderWorkingMode(buf, workingCount, totalWorking, timeSeconds, emitTick);
         }
         else if (showIdleChill)
         {
@@ -148,43 +151,38 @@ public sealed class TaskbarPetRenderer
         const int charX = 344;
         string sprite = ShinobiSpriteRenderer.NormalizeSpriteKey(agent.SpriteKey);
 
-        // Waving character standing flush on taskbar edge (y = 124)
         ShinobiSpriteRenderer.DrawCharacter(buf, sprite, AgentState.NeedsApproval, charX, GroundY, timeSeconds);
-        int pulseFill = ((int)(timeSeconds * 5f) & 1) == 0 ? ColorAmber : ColorAmberBright;
-        ShinobiSpriteRenderer.DrawStatusBubble(buf, charX, GroundY - 29, "!", pulseFill, ColorOutline, ColorOutline);
-        _hitRegions.Add(new PetHitRegion($"agent:{agent.Id}", charX - 16, GroundY - 40, 32, 42, agent.Name));
+        _hitRegions.Add(new PetHitRegion($"agent:{agent.Id}", charX - 16, GroundY - 32, 32, 34, agent.Name));
 
-        // Crisp dark-amber pixel speech card to the left of waving agent
-        const int cardX = 82;
+        // Amber card bubble
+        const int cardX = 96;
         const int cardY = 48;
-        const int cardW = 230;
-        const int cardH = 74;
+        const int cardW = 208;
+        const int cardH = 72;
+        int border = ((int)(timeSeconds * 5f) & 1) == 0 ? ColorAmberBright : ColorAmber;
 
-        // Outer shadow & crisp double amber frame
-        buf.BlendRect(cardX + 2, cardY + 2, cardW, cardH, ColorOutline, 150);
-        int borderCol = ((int)(timeSeconds * 4f) & 1) == 0 ? ColorAmber : ColorAmberBright;
-        buf.DrawPixelCard(cardX, cardY, cardW, cardH, ColorAmberCardBg, borderCol, ColorUtil.WithAlpha(ColorAmberBright, 80));
+        buf.DrawPixelCard(cardX, cardY, cardW, cardH, ColorAmberCardBg, border);
+        buf.FillRect(cardX + cardW - 1, cardY + 50, 4, 6, border);
+        buf.FillRect(cardX + cardW - 1, cardY + 51, 3, 4, ColorAmberCardBg);
 
-        // Speech tail pointing right toward waving agent
-        buf.FillRect(cardX + cardW - 1, cardY + 46, 5, 7, borderCol);
-        buf.FillRect(cardX + cardW - 1, cardY + 47, 4, 5, ColorAmberCardBg);
-        buf.FillRect(cardX + cardW + 3, cardY + 48, 3, 3, borderCol);
-        buf.SetPixel(cardX + cardW + 3, cardY + 49, ColorAmberCardBg);
+        buf.FillRect(cardX + 1, cardY + 1, cardW - 2, 16, ColorAmberHeaderBg);
+        buf.FillRect(cardX + 1, cardY + 17, cardW - 2, 1, ColorAmber);
 
-        // Header bar
-        buf.FillRect(cardX + 2, cardY + 2, cardW - 4, 14, ColorAmberHeaderBg);
-        buf.FillRect(cardX + 2, cardY + 16, cardW - 4, 1, ColorUtil.Darken(ColorAmber, 0.35f));
+        buf.FillRect(cardX + 6, cardY + 4, 9, 9, ColorAmberBright);
+        buf.FillRect(cardX + 7, cardY + 5, 7, 7, ColorAmberCardBg);
+        PixelFont.DrawTextCentered(buf, cardX + 10, cardY + 6, "!", ColorAmberBright, PixelFontSize.Small);
 
-        // Pulsing status dot + Agent Name + NEEDS APPROVAL badge
-        buf.FillRect(cardX + 6, cardY + 7, 4, 4, pulseFill);
         string shortName = ShortenName(agent.Name);
-        PixelFont.DrawTextTruncated(buf, cardX + 14, cardY + 6, 122, shortName, ColorWhite, PixelFontSize.Regular);
-        PixelFont.DrawText(buf, cardX + cardW - 60, cardY + 7, "APPROVAL REQ", ColorAmberBright, PixelFontSize.Small);
+        int written = 0;
+        ReadOnlySpan<char> snSpan = shortName.AsSpan();
+        int toCopy = Math.Min(snSpan.Length, _textScratch.Length);
+        snSpan.Slice(0, toCopy).CopyTo(_textScratch.AsSpan());
+        written += toCopy;
+        PixelFont.DrawTextTruncated(buf, cardX + 19, cardY + 5, cardW - 24, _textScratch.AsSpan(0, written), ColorWhite, PixelFontSize.Small);
 
-        // Question / Prompt text (up to 2 crisp wrapped lines)
         string prompt = !string.IsNullOrWhiteSpace(agent.QuestionPrompt)
             ? agent.QuestionPrompt!
-            : (!string.IsNullOrWhiteSpace(agent.TaskTitle) ? agent.TaskTitle! : "WAITING FOR YOUR APPROVAL");
+            : (!string.IsNullOrWhiteSpace(agent.TaskTitle) ? agent.TaskTitle! : "Approval requested. Open Orca to respond.");
 
         PixelFont.DrawWrappedText(
             buf,
@@ -197,7 +195,6 @@ public sealed class TaskbarPetRenderer
             PixelFontSize.Small,
             lineSpacing: 4);
 
-        // Action Buttons row: [OPEN ORCA] and [X]
         const int btnY = cardY + 51;
         const int btnH = 17;
 
@@ -229,7 +226,6 @@ public sealed class TaskbarPetRenderer
             _particles.EmitFireAndSmoke(laptopX, GroundY - 9);
         }
 
-        // Crisp red pixel alert bubble
         const int cardX = 114;
         const int cardY = 66;
         const int cardW = 184;
@@ -251,7 +247,6 @@ public sealed class TaskbarPetRenderer
         PixelFont.DrawTextTruncated(buf, cardX + 8, cardY + 7, cardW - 16, _textScratch.AsSpan(0, written), ColorCrimson, PixelFontSize.Regular);
         PixelFont.DrawTextTruncated(buf, cardX + 8, cardY + 20, cardW - 16, "FAIL \u2022 CLICK DETAILS", ColorUtil.FromRgb(254, 202, 202), PixelFontSize.Small);
 
-        // Buttons
         const int btnY = cardY + 32;
         buf.DrawPixelCard(cardX + 8, btnY, 82, 16, ColorUtil.FromRgb(185, 28, 28), ColorUtil.FromRgb(252, 165, 165));
         PixelFont.DrawTextCentered(buf, cardX + 49, btnY + 5, "OPEN ORCA", ColorWhite, PixelFontSize.Small);
@@ -292,10 +287,9 @@ public sealed class TaskbarPetRenderer
         _hitRegions.Add(new PetHitRegion("open_orca", cardX, cardY, cardW, cardH, "Open Orca"));
     }
 
-    private void RenderWorkingMode(PixelBuffer buf, int workingCount, float timeSeconds, bool emitTick)
+    private void RenderWorkingMode(PixelBuffer buf, int workingCount, int totalWorking, float timeSeconds, bool emitTick)
     {
-        // Up to 3 active working agents side-by-side at mini pixel desks on right edge
-        const int spacing = 46;
+        int spacing = workingCount <= 4 ? 46 : 38;
         const int rightmostX = 346;
 
         for (int i = 0; i < workingCount; i++)
@@ -303,10 +297,28 @@ public sealed class TaskbarPetRenderer
             AgentSnapshot ag = _workingScratch[i];
             int cx = rightmostX - i * spacing;
             string sprite = ShinobiSpriteRenderer.NormalizeSpriteKey(ag.SpriteKey);
+            var (actionKind, _) = AgentActionClassifier.Classify(ag.State, ag.ToolName, ag.TaskTitle);
 
             // Character behind mini desk with clear head & shoulders visible
-            ShinobiSpriteRenderer.DrawCharacter(buf, sprite, AgentState.Working, cx, GroundY - 6, timeSeconds, phaseOffset: i, behindDesk: true);
-            ShinobiSpriteRenderer.DrawMiniTaskbarDesk(buf, cx, GroundY, _palette.DeskTop, AgentState.Working, timeSeconds);
+            ShinobiSpriteRenderer.DrawCharacter(
+                buf,
+                sprite,
+                AgentState.Working,
+                cx,
+                GroundY - 6,
+                timeSeconds,
+                phaseOffset: i,
+                behindDesk: true,
+                actionKind: actionKind);
+
+            ShinobiSpriteRenderer.DrawMiniTaskbarDesk(
+                buf,
+                cx,
+                GroundY,
+                _palette.DeskTop,
+                AgentState.Working,
+                timeSeconds,
+                actionKind: actionKind);
 
             _hitRegions.Add(new PetHitRegion($"agent:{ag.Id}", cx - 18, GroundY - 36, 36, 38, ag.Name));
 
@@ -317,13 +329,13 @@ public sealed class TaskbarPetRenderer
             }
         }
 
-        // Crisp cyan status pill tightly sized to text, centered over active working agents!
+        // Status pill text
         ReadOnlySpan<char> pillText;
         if (workingCount == 1)
         {
             AgentSnapshot a = _workingScratch[0];
             string shortName = ShortenName(a.Name);
-            string tool = NormalizeShortTool(a.ToolName);
+            var (_, shortLabel) = AgentActionClassifier.Classify(a.State, a.ToolName, a.TaskTitle);
             int written = 0;
             ReadOnlySpan<char> sn = shortName.AsSpan();
             int c1 = Math.Min(sn.Length, _textScratch.Length);
@@ -334,7 +346,7 @@ public sealed class TaskbarPetRenderer
                 " \u2022 ".AsSpan().CopyTo(_textScratch.AsSpan(written));
                 written += 3;
             }
-            ReadOnlySpan<char> t = tool.AsSpan();
+            ReadOnlySpan<char> t = shortLabel.AsSpan();
             int c2 = Math.Min(t.Length, _textScratch.Length - written);
             t.Slice(0, c2).CopyTo(_textScratch.AsSpan(written));
             written += c2;
@@ -342,13 +354,23 @@ public sealed class TaskbarPetRenderer
         }
         else
         {
-            _textScratch[0] = (char)('0' + workingCount);
-            " AGENTS WORKING".AsSpan().CopyTo(_textScratch.AsSpan(1));
-            pillText = _textScratch.AsSpan(0, 16);
+            string label;
+            if (totalWorking > 6)
+            {
+                int extra = totalWorking - workingCount;
+                label = $"{workingCount} WORKING (+{extra})";
+            }
+            else
+            {
+                label = $"{totalWorking} AGENTS WORKING";
+            }
+            int len = Math.Min(label.Length, _textScratch.Length);
+            label.AsSpan(0, len).CopyTo(_textScratch.AsSpan());
+            pillText = _textScratch.AsSpan(0, len);
         }
 
         int textW = PixelFont.MeasureWidth(pillText, PixelFontSize.Small);
-        int pillW = Math.Min(164, Math.Max(78, textW + 24));
+        int pillW = Math.Min(172, Math.Max(78, textW + 24));
         int pillH = 18;
         int groupCenterX = rightmostX - ((workingCount - 1) * spacing) / 2;
         int pillX = Math.Clamp(groupCenterX - pillW / 2, 8, CanvasWidth - pillW - 6);
@@ -367,37 +389,82 @@ public sealed class TaskbarPetRenderer
 
     private void RenderIdleChillMode(PixelBuffer buf, HqState state, float timeSeconds, bool emitTick)
     {
-        const int charX = 346;
+        const int primaryX = 346;
 
-        // Pick Kakashi reading orange book or Shikamaru sipping coffee
-        AgentSnapshot? idleAgent = state.Agents.Count > 0 ? state.Agents[0] : null;
-        string sprite = idleAgent != null
-            ? ShinobiSpriteRenderer.NormalizeSpriteKey(idleAgent.SpriteKey)
+        AgentSnapshot? primaryNonProcess = null;
+        var idleTerminalAgents = new List<AgentSnapshot>(2);
+
+        var agents = state.Agents;
+        for (int i = 0; i < agents.Count; i++)
+        {
+            AgentSnapshot ag = agents[i];
+            if (ag.State == AgentState.Idle)
+            {
+                if (string.Equals(ag.Source, "process", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (idleTerminalAgents.Count < 2)
+                    {
+                        idleTerminalAgents.Add(ag);
+                    }
+                }
+                else if (primaryNonProcess == null)
+                {
+                    primaryNonProcess = ag;
+                }
+            }
+        }
+
+        string primarySprite = primaryNonProcess != null
+            ? ShinobiSpriteRenderer.NormalizeSpriteKey(primaryNonProcess.SpriteKey)
             : "kakashi";
-        if (sprite is not ("kakashi" or "shikamaru"))
+        if (primarySprite is not ("kakashi" or "shikamaru"))
         {
-            sprite = "kakashi";
+            primarySprite = "kakashi";
         }
-        string agentId = idleAgent?.Id ?? sprite;
+        string primaryId = primaryNonProcess?.Id ?? primarySprite;
+        string primaryName = primaryNonProcess?.Name ?? primarySprite;
 
-        ShinobiSpriteRenderer.DrawCharacter(buf, sprite, AgentState.Idle, charX, GroundY, timeSeconds);
+        // Draw primary idle agent
+        ShinobiSpriteRenderer.DrawCharacter(buf, primarySprite, AgentState.Idle, primaryX, GroundY, timeSeconds);
+        _hitRegions.Add(new PetHitRegion($"agent:{primaryId}", primaryX - 16, GroundY - 30, 32, 32, primaryName));
 
-        if (sprite == "shikamaru")
+        if (primarySprite == "shikamaru")
         {
-            ShinobiSpriteRenderer.DrawCoffeeCup(buf, charX - 15, GroundY - 5, timeSeconds);
-            if (emitTick) _particles.EmitCoffeeSteam(charX - 13, GroundY - 6);
+            ShinobiSpriteRenderer.DrawCoffeeCup(buf, primaryX - 15, GroundY - 5, timeSeconds);
+            if (emitTick) _particles.EmitCoffeeSteam(primaryX - 13, GroundY - 6);
         }
 
-        // Subtle chill bubble
-        const int bX = 248;
+        // Draw up to 2 chilling idle terminal agents to the left
+        for (int i = 0; i < idleTerminalAgents.Count; i++)
+        {
+            var tAg = idleTerminalAgents[i];
+            int tx = primaryX - (i + 1) * 38;
+            string tSprite = ShinobiSpriteRenderer.NormalizeSpriteKey(tAg.SpriteKey);
+
+            ShinobiSpriteRenderer.DrawCharacter(buf, tSprite, AgentState.Idle, tx, GroundY, timeSeconds, phaseOffset: i + 1);
+            _hitRegions.Add(new PetHitRegion($"agent:{tAg.Id}", tx - 16, GroundY - 30, 32, 32, tAg.Name));
+        }
+
+        // Chill bubble
+        int leftmostCharX = primaryX - idleTerminalAgents.Count * 38;
+        int bW = idleTerminalAgents.Count > 0 ? 84 : 76;
+        int bX = Math.Max(8, leftmostCharX - bW - 12);
         const int bY = 92;
-        const int bW = 76;
         const int bH = 22;
-        buf.DrawPixelCard(bX, bY, bW, bH, ColorUtil.FromRgb(22, 26, 38), ColorSlate);
-        PixelFont.DrawTextCentered(buf, bX + bW / 2, bY + 5, sprite == "kakashi" ? "READING.." : "COFFEE..", ColorUtil.FromRgb(203, 213, 225), PixelFontSize.Small);
-        PixelFont.DrawTextCentered(buf, bX + bW / 2, bY + 13, "HQ IDLE", ColorSlate, PixelFontSize.Small);
 
-        _hitRegions.Add(new PetHitRegion($"agent:{agentId}", charX - 16, GroundY - 30, 32, 32, sprite));
+        buf.DrawPixelCard(bX, bY, bW, bH, ColorUtil.FromRgb(22, 26, 38), ColorSlate);
+
+        if (idleTerminalAgents.Count > 0)
+        {
+            string topText = idleTerminalAgents.Count == 1 ? $"{ShortenName(idleTerminalAgents[0].Name)} READY" : $"{idleTerminalAgents.Count} TERMINALS";
+            PixelFont.DrawTextCentered(buf, bX + bW / 2, bY + 5, topText, ColorUtil.FromRgb(203, 213, 225), PixelFontSize.Small);
+            PixelFont.DrawTextCentered(buf, bX + bW / 2, bY + 13, "HQ IDLE", ColorSlate, PixelFontSize.Small);
+        }
+        else
+        {
+            PixelFont.DrawTextCentered(buf, bX + bW / 2, bY + 5, primarySprite == "kakashi" ? "READING.." : "COFFEE..", ColorUtil.FromRgb(203, 213, 225), PixelFontSize.Small);
+            PixelFont.DrawTextCentered(buf, bX + bW / 2, bY + 13, "HQ IDLE", ColorSlate, PixelFontSize.Small);
+        }
     }
 
     private static string ShortenName(string name)
@@ -406,15 +473,5 @@ public sealed class TaskbarPetRenderer
         int idx = name.IndexOf('(');
         if (idx > 0) name = name[..idx];
         return name.Trim();
-    }
-
-    private static string NormalizeShortTool(string? toolName)
-    {
-        if (string.IsNullOrWhiteSpace(toolName)) return "WORK";
-        if (toolName.Contains("edit", StringComparison.OrdinalIgnoreCase) || toolName.Contains("write", StringComparison.OrdinalIgnoreCase)) return "EDIT";
-        if (toolName.Contains("test", StringComparison.OrdinalIgnoreCase)) return "TEST";
-        if (toolName.Contains("review", StringComparison.OrdinalIgnoreCase)) return "REVIEW";
-        if (toolName.Contains("exec", StringComparison.OrdinalIgnoreCase) || toolName.Contains("compile", StringComparison.OrdinalIgnoreCase)) return "EXEC";
-        return toolName.Length > 8 ? toolName[..8].ToUpperInvariant() : toolName.ToUpperInvariant();
     }
 }

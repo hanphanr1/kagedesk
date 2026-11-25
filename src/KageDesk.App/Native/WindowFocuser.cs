@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using KageDesk.Core.Collectors;
 
 namespace KageDesk.App.Native;
 
@@ -14,6 +15,67 @@ public static class WindowFocuser
                 return false;
             }
 
+            return FocusHwnd(targetHwnd);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public static bool TryFocusProcessWindow(int pid)
+    {
+        if (pid <= 0) return false;
+
+        try
+        {
+            // 1. Direct check on target PID
+            IntPtr directHwnd = FindTopLevelWindowForProcess(pid);
+            if (directHwnd != IntPtr.Zero)
+            {
+                return FocusHwnd(directHwnd);
+            }
+
+            // 2. Walk up parent process chain via Win32ProcessInspector to find enclosing terminal window
+            var processes = Win32ProcessInspector.Instance.InspectProcesses();
+            var parentMap = new Dictionary<int, int>(processes.Count);
+            foreach (var p in processes)
+            {
+                parentMap[p.ProcessId] = p.ParentProcessId;
+            }
+
+            int? ancestorPid = Win32ProcessInspector.FindAncestorWithVisibleWindow(
+                pid,
+                parentMap,
+                pId => FindTopLevelWindowForProcess(pId) != IntPtr.Zero,
+                maxDepth: 10);
+
+            if (ancestorPid.HasValue)
+            {
+                IntPtr ancHwnd = FindTopLevelWindowForProcess(ancestorPid.Value);
+                if (ancHwnd != IntPtr.Zero)
+                {
+                    return FocusHwnd(ancHwnd);
+                }
+            }
+        }
+        catch
+        {
+            // Fallback gracefully
+        }
+
+        return false;
+    }
+
+    public static bool FocusHwnd(IntPtr targetHwnd)
+    {
+        if (targetHwnd == IntPtr.Zero || !Win32Interop.IsWindow(targetHwnd))
+        {
+            return false;
+        }
+
+        try
+        {
             if (Win32Interop.IsIconic(targetHwnd))
             {
                 Win32Interop.ShowWindow(targetHwnd, Win32Interop.SW_RESTORE);
@@ -56,9 +118,43 @@ public static class WindowFocuser
         }
     }
 
+    private static IntPtr FindTopLevelWindowForProcess(int pid)
+    {
+        try
+        {
+            using var proc = Process.GetProcessById(pid);
+            if (proc.MainWindowHandle != IntPtr.Zero &&
+                Win32Interop.IsWindow(proc.MainWindowHandle) &&
+                Win32Interop.IsWindowVisible(proc.MainWindowHandle))
+            {
+                return proc.MainWindowHandle;
+            }
+        }
+        catch
+        {
+            // Ignore access denied or exited
+        }
+
+        IntPtr foundHwnd = IntPtr.Zero;
+        Win32Interop.EnumWindows((hwnd, _) =>
+        {
+            if (hwnd == IntPtr.Zero || !Win32Interop.IsWindowVisible(hwnd)) return true;
+
+            Win32Interop.GetWindowThreadProcessId(hwnd, out uint winPid);
+            if (winPid == (uint)pid)
+            {
+                foundHwnd = hwnd;
+                return false;
+            }
+
+            return true;
+        }, IntPtr.Zero);
+
+        return foundHwnd;
+    }
+
     private static IntPtr FindOrcaWindow()
     {
-        // 1. Check current processes named orca
         Process[] processes = Process.GetProcessesByName("orca");
         try
         {
@@ -73,7 +169,6 @@ public static class WindowFocuser
                 }
                 catch
                 {
-                    // Ignore process access issues
                 }
             }
         }
@@ -85,7 +180,6 @@ public static class WindowFocuser
             }
         }
 
-        // 2. Iterate top-level windows; verify window belongs to an "orca" process via PID
         IntPtr foundHwnd = IntPtr.Zero;
         Win32Interop.EnumWindows((hwnd, _) =>
         {
@@ -105,7 +199,6 @@ public static class WindowFocuser
             }
             catch
             {
-                // Access denied or process exited
             }
 
             return true;

@@ -359,7 +359,29 @@ public class PetOverlayForm : Form
             {
                 if (hit.ActionId == "open_orca")
                 {
-                    WindowFocuser.TryFocusOrca();
+                    AgentSnapshot? soleTerminal = null;
+                    int workingCount = 0;
+                    var agents = _currentState.Agents;
+                    for (int i = 0; i < agents.Count; i++)
+                    {
+                        if (agents[i].State == AgentState.Working)
+                        {
+                            workingCount++;
+                            if (string.Equals(agents[i].Source, "process", StringComparison.OrdinalIgnoreCase) && agents[i].ProcessId.HasValue)
+                            {
+                                soleTerminal = agents[i];
+                            }
+                        }
+                    }
+
+                    if (workingCount == 1 && soleTerminal != null && soleTerminal.ProcessId.HasValue)
+                    {
+                        WindowFocuser.TryFocusProcessWindow(soleTerminal.ProcessId.Value);
+                    }
+                    else
+                    {
+                        WindowFocuser.TryFocusOrca();
+                    }
                     return;
                 }
                 if (hit.ActionId == "dismiss")
@@ -371,11 +393,27 @@ public class PetOverlayForm : Form
                 {
                     string agentId = hit.ActionId["agent:".Length..];
                     var agent = _currentState.Agents.FirstOrDefault(a => a.Id == agentId);
-                    if (agent != null)
+                    if (agent == null)
                     {
-                        AgentClicked?.Invoke(agent);
-                        return;
+                        agent = new AgentSnapshot(
+                            Id: agentId,
+                            Name: hit.Label ?? "Shinobi Agent",
+                            Role: AgentRole.Leader,
+                            SpriteKey: hit.Label?.ToLowerInvariant() ?? "kakashi",
+                            State: AgentState.Idle,
+                            Source: "fallback"
+                        );
                     }
+
+                    if (AgentClicked != null)
+                    {
+                        AgentClicked.Invoke(agent);
+                    }
+                    else
+                    {
+                        AgentDetailToast.ShowToast(agent);
+                    }
+                    return;
                 }
             }
 
@@ -423,6 +461,11 @@ public class PetOverlayForm : Form
             _petX = Left;
             PetPositionChanged?.Invoke(Left);
         }
+    }
+
+    public void SimulateMouseDown(int x, int y, MouseButtons button = MouseButtons.Left)
+    {
+        OnMouseDown(new MouseEventArgs(button, 1, x, y, 0));
     }
 
     private PetHitRegion? FindHitRegion(int unscaledX, int unscaledY)

@@ -47,9 +47,11 @@ public static class BenchmarkRunner
         // 2. Setup State Aggregator and Collectors
         var aggregator = new HqStateAggregator();
         var orcaCollector = new OrcaCliCollector(aggregator);
+        var procCollector = new ProcessAgentCollector(aggregator, enabled: true);
 
-        // Run real Orca collector once
+        // Run collectors once
         await orcaCollector.CollectOnceAsync().ConfigureAwait(false);
+        procCollector.CollectOnce();
 
         // 3. Setup LocalEventBridge on an ephemeral port
         int ephemeralPort = GetFreeTcpPort();

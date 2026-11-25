@@ -39,7 +39,10 @@ public sealed class HqWallpaperRenderer
     }
 
     private readonly StationSlot[] _coreSlots = new StationSlot[4];
-    private readonly StationSlot[] _extraSlots = new StationSlot[4];
+    private readonly StationSlot[] _extraSlots = new StationSlot[5];
+    private readonly List<AgentSnapshot> _extraCandidates = new(16);
+    private static readonly Comparison<AgentSnapshot> ExtraStationComparison = (a, b) =>
+        ComputeExtraStationPriority(b).CompareTo(ComputeExtraStationPriority(a));
     private readonly ParticleSystem _particles = new();
     private readonly char[] _fmtScratch = new char[48];
 
@@ -155,11 +158,15 @@ public sealed class HqWallpaperRenderer
                 ToolName = null,
                 VariantSeed = i
             };
+        }
+        for (int i = 0; i < 5; i++)
+        {
             _extraSlots[i] = default;
         }
 
-        int extraCount = 0;
+        _extraCandidates.Clear();
         var agents = state.Agents;
+
         for (int i = 0; i < agents.Count; i++)
         {
             AgentSnapshot ag = agents[i];
@@ -178,29 +185,53 @@ public sealed class HqWallpaperRenderer
                     VariantSeed = HashString(ag.Id)
                 };
             }
-            else if (extraCount < 4)
+            else
             {
-                string sprite = ShinobiSpriteRenderer.NormalizeSpriteKey(ag.SpriteKey);
-                if (ag.Role == AgentRole.Clone) sprite = "clone";
-                _extraSlots[extraCount++] = new StationSlot
-                {
-                    Occupied = true,
-                    Name = ShortenDisplayName(ag.Name),
-                    SpriteKey = sprite,
-                    StationType = "clone",
-                    State = ag.State,
-                    ToolName = ag.ToolName,
-                    VariantSeed = HashString(ag.Id)
-                };
+                _extraCandidates.Add(ag);
             }
+        }
+
+        // Priority sort for extra candidates (Row 2):
+        _extraCandidates.Sort(ExtraStationComparison);
+
+        int extraCount = Math.Min(5, _extraCandidates.Count);
+        for (int i = 0; i < extraCount; i++)
+        {
+            AgentSnapshot ag = _extraCandidates[i];
+            string sprite = ShinobiSpriteRenderer.NormalizeSpriteKey(ag.SpriteKey);
+            if (ag.Role == AgentRole.Clone) sprite = "clone";
+
+            _extraSlots[i] = new StationSlot
+            {
+                Occupied = true,
+                Name = ShortenDisplayName(ag.Name),
+                SpriteKey = sprite,
+                StationType = "clone",
+                State = ag.State,
+                ToolName = ag.ToolName,
+                VariantSeed = HashString(ag.Id)
+            };
         }
 
         return extraCount;
     }
 
+    private static int ComputeExtraStationPriority(AgentSnapshot ag)
+    {
+        if (ag.State == AgentState.NeedsApproval) return 1000;
+        if (ag.State == AgentState.Failed) return 900;
+        if (ag.State == AgentState.Working) return 800;
+        if (ag.State == AgentState.Done) return 700;
+        if (string.Equals(ag.Source, "process", StringComparison.OrdinalIgnoreCase)) return 500;
+        if (string.Equals(ag.Source, "push", StringComparison.OrdinalIgnoreCase)) return 400;
+        if (ag.Unread || !string.IsNullOrWhiteSpace(ag.TaskTitle)) return 200;
+        return 50;
+    }
+
     private static int ResolveCoreSlotIndex(AgentSnapshot ag)
     {
         if (ag.Role == AgentRole.Clone || ag.Role == AgentRole.External) return -1;
+        if (string.Equals(ag.Source, "process", StringComparison.OrdinalIgnoreCase)) return -1;
 
         string key = ShinobiSpriteRenderer.NormalizeSpriteKey(ag.SpriteKey);
         if (key == "shikamaru" || ag.Role == AgentRole.Leader) return 0;
@@ -217,7 +248,9 @@ public sealed class HqWallpaperRenderer
             1 => 192,
             2 => index == 0 ? 132 : 252,
             3 => index switch { 0 => 96, 1 => 192, _ => 288 },
-            _ => CoreStationCentersX[index & 3]
+            4 => CoreStationCentersX[index & 3],
+            5 => index switch { 0 => 48, 1 => 120, 2 => 192, 3 => 264, _ => 336 },
+            _ => CoreStationCentersX[index % 4]
         };
     }
 
@@ -1028,6 +1061,8 @@ public sealed class HqWallpaperRenderer
 
     private void DrawWorkstation(PixelBuffer buf, ref StationSlot slot, int cx, int deskY, float timeSeconds, int phase)
     {
+        var (actionKind, _) = AgentActionClassifier.Classify(slot.State, slot.ToolName);
+
         // Character sits behind desk with full face & upper outfit clearly visible above desk & monitors
         ShinobiSpriteRenderer.DrawCharacter(
             buf,
@@ -1038,7 +1073,8 @@ public sealed class HqWallpaperRenderer
             timeSeconds,
             phaseOffset: phase,
             behindDesk: true,
-            variantSeed: slot.VariantSeed);
+            variantSeed: slot.VariantSeed,
+            actionKind: actionKind);
 
         // Desk & interactive station props
         ShinobiSpriteRenderer.DrawDesk(
@@ -1049,7 +1085,8 @@ public sealed class HqWallpaperRenderer
             _palette.DeskTop,
             _palette.DeskFront,
             slot.State,
-            timeSeconds);
+            timeSeconds,
+            actionKind: actionKind);
 
         // Floating status bubble above head (for alert/done/fail)
         int bubbleY = deskY - 22;
@@ -1115,25 +1152,8 @@ public sealed class HqWallpaperRenderer
 
     private static ReadOnlySpan<char> ResolveBadgeText(AgentState state, string? toolName)
     {
-        return state switch
-        {
-            AgentState.NeedsApproval => "WAIT",
-            AgentState.Done => "PASS",
-            AgentState.Failed => "FAIL",
-            AgentState.Idle => "IDLE",
-            AgentState.Working => NormalizeToolBadge(toolName),
-            _ => "IDLE"
-        };
-    }
-
-    private static ReadOnlySpan<char> NormalizeToolBadge(string? toolName)
-    {
-        if (string.IsNullOrWhiteSpace(toolName)) return "WORK";
-        if (toolName.Contains("test", StringComparison.OrdinalIgnoreCase)) return "TEST";
-        if (toolName.Contains("review", StringComparison.OrdinalIgnoreCase) || toolName.Contains("diff", StringComparison.OrdinalIgnoreCase)) return "REVIEW";
-        if (toolName.Contains("edit", StringComparison.OrdinalIgnoreCase) || toolName.Contains("write", StringComparison.OrdinalIgnoreCase)) return "EDIT";
-        if (toolName.Contains("exec", StringComparison.OrdinalIgnoreCase) || toolName.Contains("run", StringComparison.OrdinalIgnoreCase) || toolName.Contains("compile", StringComparison.OrdinalIgnoreCase)) return "EXEC";
-        return "WORK";
+        var (_, shortLabel) = AgentActionClassifier.Classify(state, toolName);
+        return shortLabel.AsSpan();
     }
 
     private static void DrawApprovalSpotlight(PixelBuffer buf, int focusX, int focusY, float timeSeconds)

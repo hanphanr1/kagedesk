@@ -255,6 +255,95 @@ public class HqWallpaperRendererTests
         }
     }
 
+    [Fact]
+    public void AssignStations_LiveTerminalAgentsOutrankStaleOrcaWorktrees()
+    {
+        var renderer = new HqWallpaperRenderer();
+        using var buf = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
+
+        var agents = new List<AgentSnapshot>
+        {
+            new("shika", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "execute"),
+            new("mina", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit"),
+            new("tsuna", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test"),
+            new("kaka", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Working, ToolName: "review")
+        };
+
+        // Add 20 stale idle child worktrees
+        for (int i = 1; i <= 20; i++)
+        {
+            agents.Add(new AgentSnapshot($"wt-{i}", $"worktree-{i}", AgentRole.Coder, "minato", AgentState.Idle, WorktreeId: $"wt-{i}", Source: "orca"));
+        }
+
+        // Add 2 live standalone terminal agents
+        agents.Add(new AgentSnapshot("proc:omp:101", "OMP", AgentRole.Coder, "omp", AgentState.Working, ToolName: "thinking", Source: "process", ProcessId: 101));
+        agents.Add(new AgentSnapshot("proc:agy:102", "AGY", AgentRole.Leader, "agy", AgentState.Working, ToolName: "search", Source: "process", ProcessId: 102));
+
+        var state = new HqState(
+            Agents: agents,
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: Array.Empty<HqEvent>(),
+            Timestamp: DateTimeOffset.UtcNow);
+
+        // Render should succeed without throwing and render 4 core + up to 5 extra desks (9 total live desks)
+        renderer.Render(buf, state, ThemePackLoader.BuiltInFallback, 1.0f);
+        Assert.True(CountUniqueColorsInRegion(buf, 0, 0, buf.Width, buf.Height) > 15);
+    }
+
+    [Fact]
+    public void Render_AllEightWorkingActions_ProduceDistinctFramesAndPerformance()
+    {
+        var renderer = new HqWallpaperRenderer();
+        using var buf = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
+
+        string[] toolNames = { "code", "run_command", "read_file", "search_web", "test", "build", "git", "review", "think" };
+        var checksums = new HashSet<long>();
+
+        // Warmup JIT
+        var warmupState = new HqState(
+            Agents: new List<AgentSnapshot> { new("a0", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "code") },
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: Array.Empty<HqEvent>(),
+            Timestamp: DateTimeOffset.UtcNow);
+        renderer.Render(buf, warmupState, ThemePackLoader.BuiltInFallback, 1.0f);
+        ComputeFrameChecksum(buf);
+
+        var sw = new Stopwatch();
+        foreach (var tool in toolNames)
+        {
+            var state = new HqState(
+                Agents: new List<AgentSnapshot>
+                {
+                    new("a1", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: tool)
+                },
+                Accounts: Array.Empty<AccountInfo>(),
+                Builds: Array.Empty<BuildInfo>(),
+                Weather: EffectiveWeather.Day,
+                Mood: HqMood.Busy,
+                PendingVisualEvents: Array.Empty<HqEvent>(),
+                Timestamp: DateTimeOffset.UtcNow);
+
+            renderer.ResetEffects();
+            sw.Start();
+            renderer.Render(buf, state, ThemePackLoader.BuiltInFallback, 1.0f);
+            sw.Stop();
+
+            long checksum = ComputeFrameChecksum(buf);
+            checksums.Add(checksum);
+        }
+
+        double avgMs = sw.Elapsed.TotalMilliseconds / toolNames.Length;
+        Assert.True(avgMs < 3.0, $"Expected avg frame time < 3.0 ms, got {avgMs:F2} ms");
+        // Verify distinct checksums (all different animations!)
+        Assert.Equal(toolNames.Length, checksums.Count);
+    }
+
     private static long ComputeFrameChecksum(PixelBuffer buf)
         => ComputeRegionChecksum(buf, 0, 0, buf.Width, buf.Height);
 

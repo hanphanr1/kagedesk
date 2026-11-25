@@ -44,8 +44,33 @@ public class ConfigStore
         try
         {
             var json = File.ReadAllText(_configFilePath);
+            int fileVersion = 1;
+            bool hasExplicitVersion = false;
+            try
+            {
+                using var doc = JsonDocument.Parse(json);
+                if (doc.RootElement.TryGetProperty("ConfigVersion", out var verProp) && verProp.TryGetInt32(out var v))
+                {
+                    hasExplicitVersion = true;
+                    fileVersion = v;
+                }
+            }
+            catch { }
+
             var config = JsonSerializer.Deserialize<AppConfig>(json, JsonOptions);
-            return config ?? new AppConfig();
+            if (config == null) return new AppConfig();
+
+            if (!hasExplicitVersion || fileVersion < 2)
+            {
+                if (!config.EnableProcessAgentCollector)
+                {
+                    config.EnableProcessAgentCollector = true;
+                }
+                config.ConfigVersion = 2;
+                Save(config);
+            }
+
+            return config;
         }
         catch (Exception)
         {

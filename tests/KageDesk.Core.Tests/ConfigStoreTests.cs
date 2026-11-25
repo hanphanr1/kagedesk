@@ -116,4 +116,65 @@ public class ConfigStoreTests
             }
         }
     }
+
+    [Fact]
+    public void Load_V1Config_MigratesEnableProcessAgentCollectorAndSavesV2()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "kagedesk_cfg_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var tempFile = Path.Combine(dir, "config.json");
+
+        try
+        {
+            // Simulate v1 config with ConfigVersion absent (0) and EnableProcessAgentCollector = false
+            string v1Json = "{\n  \"PollingIntervalMs\": 2500,\n  \"EnableProcessAgentCollector\": false\n}";
+            File.WriteAllText(tempFile, v1Json);
+
+            var store = new ConfigStore(tempFile);
+            var loaded = store.Load();
+
+            Assert.Equal(2, loaded.ConfigVersion);
+            Assert.True(loaded.EnableProcessAgentCollector);
+
+            // Verify file on disk was updated atomically with version 2
+            string savedJson = File.ReadAllText(tempFile);
+            Assert.Contains("\"ConfigVersion\": 2", savedJson);
+            Assert.Contains("\"EnableProcessAgentCollector\": true", savedJson);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+            {
+                try { Directory.Delete(dir, recursive: true); } catch { }
+            }
+        }
+    }
+
+    [Fact]
+    public void Load_V2ConfigWithExplicitFalse_PreservesFalse()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "kagedesk_cfg_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var tempFile = Path.Combine(dir, "config.json");
+
+        try
+        {
+            // Explicit v2 opt-out
+            string v2Json = "{\n  \"ConfigVersion\": 2,\n  \"EnableProcessAgentCollector\": false\n}";
+            File.WriteAllText(tempFile, v2Json);
+
+            var store = new ConfigStore(tempFile);
+            var loaded = store.Load();
+
+            Assert.Equal(2, loaded.ConfigVersion);
+            Assert.False(loaded.EnableProcessAgentCollector);
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+            {
+                try { Directory.Delete(dir, recursive: true); } catch { }
+            }
+        }
+    }
 }

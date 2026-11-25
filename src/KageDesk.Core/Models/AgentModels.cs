@@ -72,7 +72,8 @@ public record AgentSnapshot(
     bool IsBotHome = false,
     bool Unread = false,
     string? QuestionPrompt = null,
-    string? Source = null
+    string? Source = null,
+    [property: JsonIgnore] int? ProcessId = null
 );
 
 public record AccountInfo(
