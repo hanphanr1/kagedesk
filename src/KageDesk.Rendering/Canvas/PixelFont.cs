@@ -371,6 +371,38 @@ public static class PixelFont
             while (start < len && text[start] == ' ') start++;
             if (start >= len) break;
 
+            int newlineIdx = -1;
+            for (int i = start; i < len; i++)
+            {
+                if (text[i] is '\r' or '\n')
+                {
+                    newlineIdx = i;
+                    break;
+                }
+            }
+
+            if (newlineIdx >= start)
+            {
+                int visibleBeforeNl = CountVisibleChars(text.Slice(start, newlineIdx - start));
+                if (visibleBeforeNl <= maxCharsPerLine)
+                {
+                    bool isLast = line == maxLines - 1;
+                    if (isLast)
+                    {
+                        DrawTextTruncated(buf, x, y + line * lineStep, maxWidthPx, text.Slice(start, newlineIdx - start), color, size, shadowColor);
+                    }
+                    else
+                    {
+                        DrawText(buf, x, y + line * lineStep, text.Slice(start, newlineIdx - start), color, size, shadowColor);
+                    }
+
+                    start = newlineIdx;
+                    if (start < len && text[start] == '\r') start++;
+                    if (start < len && text[start] == '\n') start++;
+                    continue;
+                }
+            }
+
             int remainingVisible = CountVisibleChars(text.Slice(start));
             bool isLastLine = line == maxLines - 1;
 
@@ -387,10 +419,22 @@ public static class PixelFont
             }
 
             int takeLen = GetCharLengthForVisibleChars(text.Slice(start), maxCharsPerLine);
+            int end = Math.Min(start + takeLen, len);
+            while (end < len && CharUnicodeInfo.GetUnicodeCategory(text[end]) == UnicodeCategory.NonSpacingMark)
+            {
+                end++;
+            }
+
+            if (end < len && text[end] == ' ')
+            {
+                DrawText(buf, x, y + line * lineStep, text.Slice(start, end - start), color, size, shadowColor);
+                start = end + 1;
+                continue;
+            }
+
             // Try to break on a space within maxCharsPerLine
             int breakIdx = -1;
-            int searchEnd = Math.Min(start + takeLen, len);
-            for (int i = searchEnd - 1; i > start; i--)
+            for (int i = end - 1; i > start; i--)
             {
                 if (text[i] == ' ')
                 {
@@ -399,9 +443,16 @@ public static class PixelFont
                 }
             }
 
-            int take = breakIdx > start ? breakIdx - start : takeLen;
-            DrawText(buf, x, y + line * lineStep, text.Slice(start, take), color, size, shadowColor);
-            start += take;
+            if (breakIdx > start)
+            {
+                DrawText(buf, x, y + line * lineStep, text.Slice(start, breakIdx - start), color, size, shadowColor);
+                start = breakIdx + 1;
+            }
+            else
+            {
+                DrawText(buf, x, y + line * lineStep, text.Slice(start, end - start), color, size, shadowColor);
+                start = end;
+            }
         }
     }
 
