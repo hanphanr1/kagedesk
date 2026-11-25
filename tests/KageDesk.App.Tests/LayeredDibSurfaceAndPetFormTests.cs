@@ -18,17 +18,9 @@ public class LayeredDibSurfaceAndPetFormTests
     {
         var proc = Process.GetCurrentProcess();
 
-        // Warm up GDI allocations
-        using (var warmup = new LayeredDibSurface(100, 100))
+        void RunCycles()
         {
-            warmup.Resize(200, 200);
-        }
-
-        proc.Refresh();
-        uint gdiStart = Win32Interop.GetGuiResources(proc.Handle, Win32Interop.GR_GDIOBJECTS);
-
-        using (var surface = new LayeredDibSurface(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight))
-        {
+            using var surface = new LayeredDibSurface(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
             using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
             buf.FillRect(0, 0, 10, 10, ColorUtil.FromRgb(255, 0, 0));
 
@@ -47,6 +39,21 @@ public class LayeredDibSurfaceAndPetFormTests
                 }
             }
         }
+
+        // Warm up GDI allocations and settle lazy subsystem initialization
+        RunCycles();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        proc.Refresh();
+        uint gdiStart = Win32Interop.GetGuiResources(proc.Handle, Win32Interop.GR_GDIOBJECTS);
+
+        RunCycles();
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
 
         proc.Refresh();
         uint gdiEnd = Win32Interop.GetGuiResources(proc.Handle, Win32Interop.GR_GDIOBJECTS);

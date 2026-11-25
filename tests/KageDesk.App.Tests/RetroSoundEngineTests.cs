@@ -1,4 +1,6 @@
+using System.Collections.Concurrent;
 using System.Text;
+using System.Threading;
 using KageDesk.App.Audio;
 using Xunit;
 
@@ -204,6 +206,68 @@ public class RetroSoundEngineTests
 
         await Task.WhenAll(tasks);
         engine.Dispose();
+    }
+
+    [Fact]
+    public async Task ConcurrentAccess_PlayWhileDisposing_ZeroCrashesZeroDoubleFreeAndPlaybackBlockedAfterDispose()
+    {
+        var engine = new RetroSoundEngine();
+        using var barrier = new Barrier(6);
+        var playTasks = new List<Task>();
+        var exceptions = new ConcurrentBag<Exception>();
+
+        // 4 threads actively invoking Play in a loop
+        for (int i = 0; i < 4; i++)
+        {
+            int index = i;
+            playTasks.Add(Task.Run(() =>
+            {
+                try
+                {
+                    barrier.SignalAndWait(TimeSpan.FromSeconds(5));
+                    for (int j = 0; j < 200; j++)
+                    {
+                        var kind = (SoundKind)(j % 4);
+                        _ = engine.Play(kind);
+                        if (index % 2 == 0 && j % 10 == 0)
+                        {
+                            engine.SetMuted(j % 20 == 0);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    exceptions.Add(ex);
+                }
+            }));
+        }
+
+        // 1 thread invoking Dispose mid-loop
+        var disposeTask = Task.Run(async () =>
+        {
+            try
+            {
+                barrier.SignalAndWait(TimeSpan.FromSeconds(5));
+                await Task.Yield();
+                engine.Dispose();
+                engine.Dispose(); // redundant dispose safety
+            }
+            catch (Exception ex)
+            {
+                exceptions.Add(ex);
+            }
+        });
+
+        barrier.SignalAndWait(TimeSpan.FromSeconds(5));
+
+        await Task.WhenAll(playTasks.Concat(new[] { disposeTask }));
+
+        Assert.Empty(exceptions);
+        // Zero playback calls accepted after Dispose has completed
+        foreach (SoundKind kind in Enum.GetValues<SoundKind>())
+        {
+            Assert.False(engine.Play(kind));
+        }
     }
 }
 

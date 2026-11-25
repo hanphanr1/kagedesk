@@ -127,7 +127,8 @@ public record HqState(
     HqMood Mood,
     IReadOnlyList<HqEvent> PendingVisualEvents,
     string? DemoScenario = null,
-    DateTimeOffset Timestamp = default
+    DateTimeOffset Timestamp = default,
+    long Revision = 0
 )
 {
     public virtual bool Equals(HqState? other)

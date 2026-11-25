@@ -194,39 +194,73 @@ public class Gif89aEncoderTests
     [Fact]
     public void Encode_HighColorFrame2Fallback_OpaqueWithBlackPreserved()
     {
-        int width = 30;
-        int height = 20;
+        int width = 20;
+        int height = 20; // 400 pixels total
         using var ms = new MemoryStream();
         var encoder = new Gif89aEncoder(ms, width, height, scale: 1);
 
-        // Frame 1: 400 genuinely distinct RGB colors
+        // Frame 1:
+        // Pixels 0..49: blue (0, 0, 255)
+        // Pixels 50..349: gray (128, 128, 128)
+        // Pixels 350..399 (known block to be preserved in Frame 2): pure red (255, 0, 0)
         int[] f1 = new int[width * height];
         for (int i = 0; i < f1.Length; i++)
         {
-            int red = (i * 11) % 256;
-            int green = (i * 23) % 256;
-            int blue = (i * 37) % 256;
-            f1[i] = unchecked((int)(0xFF000000 | (uint)(red << 16) | (uint)(green << 8) | (uint)blue));
+            if (i < 50)
+                f1[i] = unchecked((int)0xFF0000FF); // pure blue
+            else if (i < 350)
+                f1[i] = unchecked((int)0xFF808080); // gray
+            else
+                f1[i] = unchecked((int)0xFFFF0000); // pure red
         }
 
-        // Frame 2: change >256 pixels, including changing specific pixels to pure black (0,0,0)
+        // Frame 2:
+        // Pixels 0..49: changed to pure black (0, 0, 0)
+        // Pixels 50..349 (300 pixels): changed to 300 genuinely distinct RGB (r, g, b) values
+        // where each color remains distinct even under 4-bit masking (forcing RGB332 fallback)
+        // Pixels 350..399: left unchanged (pure red)
         int[] f2 = (int[])f1.Clone();
-        for (int i = 0; i < 300; i++)
+        for (int i = 0; i < 50; i++)
         {
-            if (i < 50)
-            {
-                f2[i] = unchecked((int)0xFF000000); // pure black
-            }
-            else
-            {
-                f2[i] = unchecked((int)(0xFF000000 | (uint)((i * 13) % 256 << 16) | (uint)((i * 29) % 256 << 8) | 0xFF));
-            }
+            f2[i] = unchecked((int)0xFF000000); // pure black
+        }
+        for (int k = 0; k < 300; k++)
+        {
+            int r4 = (k % 16) * 16;
+            int g4 = ((k / 16) % 16) * 16;
+            int b4 = ((k / 256) % 16) * 16 + 16;
+            f2[50 + k] = unchecked((int)(0xFF000000 | (uint)(r4 << 16) | (uint)(g4 << 8) | (uint)b4));
         }
 
         encoder.AddFrame(f1, 8);
         encoder.AddFrame(f2, 8);
         encoder.Finish();
 
+        byte[] rawBytes = ms.ToArray();
+
+        // Find the second Graphic Control Extension block (0x21, 0xF9, 0x04) for frame 2
+        int gceCount = 0;
+        int gce2Offset = -1;
+        for (int i = 0; i < rawBytes.Length - 4; i++)
+        {
+            if (rawBytes[i] == 0x21 && rawBytes[i + 1] == 0xF9 && rawBytes[i + 2] == 0x04)
+            {
+                gceCount++;
+                if (gceCount == 2)
+                {
+                    gce2Offset = i;
+                    break;
+                }
+            }
+        }
+        Assert.Equal(2, gceCount);
+        Assert.True(gce2Offset >= 0);
+
+        // Inspect encoded GCE packed byte for frame 2: (gcePacked & 0x01) == 0 (opaque, no transparency flag!)
+        byte gce2Packed = rawBytes[gce2Offset + 3];
+        Assert.Equal(0, gce2Packed & 0x01);
+
+        // Decode BOTH frames via System.Drawing.Image
         ms.Position = 0;
         using var img = Image.FromStream(ms);
         var dim = new FrameDimension(img.FrameDimensionsList[0]);
@@ -243,7 +277,7 @@ public class Gif89aEncoderTests
         img.SelectActiveFrame(dim, 1);
         g.DrawImage(img, 0, 0);
 
-        // Verify that changed pixels to black are opaque black (not transparent!)
+        // Assert exact black (0, 0, 0) on the changed-to-black block (pixels 0..49)
         for (int i = 0; i < 50; i++)
         {
             int x = i % width;
@@ -254,6 +288,27 @@ public class Gif89aEncoderTests
             Assert.Equal(0, pixel.G);
             Assert.Equal(0, pixel.B);
         }
+
+        // Assert preserved color (pure red: 255, 0, 0) on the unchanged block (pixels 350..399)
+        for (int i = 350; i < 400; i++)
+        {
+            int x = i % width;
+            int y = i / width;
+            Color pixel = composite.GetPixel(x, y);
+            Assert.Equal(255, pixel.A);
+            Assert.Equal(255, pixel.R);
+            Assert.Equal(0, pixel.G);
+            Assert.Equal(0, pixel.B);
+        }
+    }
+
+    [Fact]
+    public void Constructor_PixelCountOverflow_ThrowsArgumentOutOfRangeException_WithoutWritingBytes()
+    {
+        using var ms = new MemoryStream();
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(() => new Gif89aEncoder(ms, 1, 1, 46341));
+        Assert.Equal(0, ms.Length);
+        Assert.Contains("Scaled pixel count", ex.Message);
     }
 
     [Theory]

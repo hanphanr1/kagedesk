@@ -33,23 +33,32 @@ public sealed class Gif89aEncoder
         if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height), "Height must be positive.");
         if (scale < 1) throw new ArgumentOutOfRangeException(nameof(scale), "Scale must be at least 1.");
 
-        int outWidth = checked(width * scale);
-        int outHeight = checked(height * scale);
+        long scaledW = (long)width * scale;
+        long scaledH = (long)height * scale;
+        long sourcePixels = (long)width * height;
+        long scaledPixels = scaledW * scaledH;
 
-        if (outWidth > ushort.MaxValue) throw new ArgumentOutOfRangeException(nameof(width), "Scaled width exceeds max GIF dimension (65535).");
-        if (outHeight > ushort.MaxValue) throw new ArgumentOutOfRangeException(nameof(height), "Scaled height exceeds max GIF dimension (65535).");
+        if (scaledW > ushort.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(width), $"Scaled width {scaledW} exceeds max GIF dimension ({ushort.MaxValue}).");
+        if (scaledH > ushort.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(height), $"Scaled height {scaledH} exceeds max GIF dimension ({ushort.MaxValue}).");
+        if (sourcePixels > 16_777_216L)
+            throw new ArgumentOutOfRangeException(nameof(width), $"Source pixel count {sourcePixels} exceeds maximum allowed (16777216).");
+        if (scaledPixels > 16_777_216L)
+            throw new ArgumentOutOfRangeException(nameof(scale), $"Scaled pixel count {scaledPixels} exceeds maximum allowed (16777216).");
 
         _width = width;
         _height = height;
         _scale = scale;
-        _outWidth = outWidth;
-        _outHeight = outHeight;
+        _outWidth = (int)scaledW;
+        _outHeight = (int)scaledH;
     }
 
     private int[]? _prevArgb;
 
-    public void AddFrame(int[] argbPixels, int delayCentiseconds = 8)
+    public void AddFrame(int[] argbPixels, int delayCentiseconds = 8, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         ArgumentNullException.ThrowIfNull(argbPixels);
         if (argbPixels.Length != _width * _height)
         {

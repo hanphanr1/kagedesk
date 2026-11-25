@@ -857,6 +857,46 @@ public class HqStateAggregatorTests
         var handoffEvents2 = state2.PendingVisualEvents.Count(e => e.Type == "handoff");
         Assert.Equal(1, handoffEvents2);
     }
+
+    [Fact]
+    public void HqState_Equality_IgnoresRevision()
+    {
+        var s1 = new HqState(
+            Agents: Array.Empty<AgentSnapshot>(),
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Calm,
+            PendingVisualEvents: Array.Empty<HqEvent>(),
+            Revision: 1
+        );
+
+        var s2 = s1 with { Revision = 999 };
+
+        Assert.True(s1.Equals(s2));
+        Assert.True(s2.Equals(s1));
+        Assert.True(s1 == s2);
+        Assert.Equal(s1.GetHashCode(), s2.GetHashCode());
+    }
+
+    [Fact]
+    public void HqStateAggregator_EmitsStrictlyIncreasingRevisionValues()
+    {
+        var agg = new HqStateAggregator();
+        var revisions = new List<long>();
+        agg.StateChanged += (_, s) => revisions.Add(s.Revision);
+
+        agg.UpdatePushedEvent(new PushedEventPayload(AgentId: "a1", State: AgentState.Working));
+        agg.UpdatePushedEvent(new PushedEventPayload(AgentId: "a2", State: AgentState.Working));
+        agg.SetWeatherMode(WeatherMode.Sunset);
+        agg.SetDemoScenario("working");
+
+        Assert.True(revisions.Count >= 3);
+        for (int i = 1; i < revisions.Count; i++)
+        {
+            Assert.True(revisions[i] > revisions[i - 1], $"Revision {revisions[i]} was not strictly greater than {revisions[i - 1]}");
+        }
+    }
 }
 
 

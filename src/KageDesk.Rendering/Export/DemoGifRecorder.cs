@@ -15,10 +15,13 @@ public static class DemoGifRecorder
         ThemePack theme,
         string scenario = "showcase",
         int scale = 1,
-        Action<int, int>? onProgress = null)
+        Action<int, int>? onProgress = null,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(outputPath);
         ArgumentNullException.ThrowIfNull(theme);
+
+        cancellationToken.ThrowIfCancellationRequested();
 
         string fullOutPath = Path.GetFullPath(outputPath);
         string? dir = Path.GetDirectoryName(fullOutPath);
@@ -42,6 +45,8 @@ public static class DemoGifRecorder
 
                 for (int frame = 0; frame < TotalFrames; frame++)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
+
                     float timeSeconds = frame * (6.0f / TotalFrames);
                     DateTimeOffset frameNow = baseTime.AddSeconds(timeSeconds);
 
@@ -50,11 +55,12 @@ public static class DemoGifRecorder
                     renderer.Render(pixelBuffer, state, theme, timeSeconds, nowOverride: frameNow);
 
                     pixelBuffer.ReadOnlyPixels.CopyTo(scratch);
-                    encoder.AddFrame(scratch, FrameDelayCentiseconds);
+                    encoder.AddFrame(scratch, FrameDelayCentiseconds, cancellationToken);
 
                     onProgress?.Invoke(frame + 1, TotalFrames);
                 }
 
+                cancellationToken.ThrowIfCancellationRequested();
                 encoder.Finish();
             }
 

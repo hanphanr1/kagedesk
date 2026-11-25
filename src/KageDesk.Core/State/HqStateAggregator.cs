@@ -31,6 +31,7 @@ public class HqStateAggregator
     private readonly AppConfig _config;
 
     private long _sequenceCounter;
+    private long _revisionCounter;
 
     private readonly Dictionary<string, AgentSnapshot> _orcaAgents = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, (AgentSnapshot Agent, DateTimeOffset ExpiresAt)> _pushedAgents = new(StringComparer.OrdinalIgnoreCase);
@@ -705,7 +706,8 @@ public class HqStateAggregator
             return null; // Suppress no-op
         }
 
-        _currentState = newState;
+        _revisionCounter++;
+        _currentState = newState with { Revision = _revisionCounter };
         return _currentState;
     }
 
@@ -927,7 +929,8 @@ public class HqStateAggregator
             return null;
         }
 
-        _currentState = demoState;
+        _revisionCounter++;
+        _currentState = demoState with { Revision = _revisionCounter };
         return _currentState;
     }
 

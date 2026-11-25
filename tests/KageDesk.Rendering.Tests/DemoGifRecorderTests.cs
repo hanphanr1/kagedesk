@@ -101,4 +101,48 @@ public class DemoGifRecorderTests
             }
         }
     }
+
+    [Fact]
+    public void RecordGif_CancelledMidRecording_ThrowsOperationCanceledException_AndLeavesNoTmpOrOutputFile()
+    {
+        string outDir = Path.Combine(Path.GetTempPath(), $"kagedesk-cancel-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(outDir);
+        string outPath = Path.Combine(outDir, "test.gif");
+
+        try
+        {
+            var theme = ThemePackLoader.BuiltInFallback;
+            using var cts = new CancellationTokenSource();
+
+            Assert.Throws<OperationCanceledException>(() =>
+            {
+                DemoGifRecorder.RecordGif(
+                    outPath,
+                    theme,
+                    scenario: "showcase",
+                    scale: 1,
+                    onProgress: (frame, total) =>
+                    {
+                        if (frame >= 2)
+                        {
+                            cts.Cancel();
+                        }
+                    },
+                    cancellationToken: cts.Token);
+            });
+
+            Assert.False(File.Exists(outPath));
+
+            var tmpFiles = Directory.GetFiles(outDir, "*.tmp");
+            Assert.Empty(tmpFiles);
+        }
+        finally
+        {
+            if (Directory.Exists(outDir))
+            {
+                try { Directory.Delete(outDir, true); } catch { }
+            }
+        }
+    }
 }
+

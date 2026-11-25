@@ -56,10 +56,11 @@ public sealed class RetroSoundEngine : IDisposable
                 _wavBytes[kind] = bytes;
 
                 currentHandle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+                IntPtr ptr = currentHandle.AddrOfPinnedObject();
                 _pinnedHandles[kind] = currentHandle;
-                _pinnedPointers[kind] = currentHandle.AddrOfPinnedObject();
-                _lastPlayedTimestamp[kind] = 0;
                 currentHandle = default;
+                _pinnedPointers[kind] = ptr;
+                _lastPlayedTimestamp[kind] = 0;
             }
         }
         catch

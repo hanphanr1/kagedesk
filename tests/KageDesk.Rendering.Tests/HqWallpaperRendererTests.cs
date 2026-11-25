@@ -200,7 +200,7 @@ public class HqWallpaperRendererTests
         using var buf = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
 
         // Warmup JIT
-        for (int i = 0; i < 20; i++)
+        for (int i = 0; i < 50; i++)
         {
             renderer.Render(buf, busyState, theme, i * 0.033f);
         }
@@ -302,17 +302,23 @@ public class HqWallpaperRendererTests
         string[] toolNames = { "code", "run_command", "read_file", "search_web", "test", "build", "git", "review", "think" };
         var checksums = new HashSet<long>();
 
-        // Warmup JIT
-        var warmupState = new HqState(
-            Agents: new List<AgentSnapshot> { new("a0", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "code") },
-            Accounts: Array.Empty<AccountInfo>(),
-            Builds: Array.Empty<BuildInfo>(),
-            Weather: EffectiveWeather.Day,
-            Mood: HqMood.Busy,
-            PendingVisualEvents: Array.Empty<HqEvent>(),
-            Timestamp: DateTimeOffset.UtcNow);
-        renderer.Render(buf, warmupState, ThemePackLoader.BuiltInFallback, 1.0f);
-        ComputeFrameChecksum(buf);
+        // Warmup JIT for all tool action paths to reach Tier 1 optimized compilation
+        foreach (var tool in toolNames)
+        {
+            var warmupState = new HqState(
+                Agents: new List<AgentSnapshot> { new("a0", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: tool) },
+                Accounts: Array.Empty<AccountInfo>(),
+                Builds: Array.Empty<BuildInfo>(),
+                Weather: EffectiveWeather.Day,
+                Mood: HqMood.Busy,
+                PendingVisualEvents: Array.Empty<HqEvent>(),
+                Timestamp: DateTimeOffset.UtcNow);
+            for (int w = 0; w < 20; w++)
+            {
+                renderer.ResetEffects();
+                renderer.Render(buf, warmupState, ThemePackLoader.BuiltInFallback, 1.0f);
+            }
+        }
 
         var sw = new Stopwatch();
         foreach (var tool in toolNames)

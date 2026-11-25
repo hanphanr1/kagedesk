@@ -657,4 +657,65 @@ public class LocalEventBridgeTests
         var parsedTime = DateTimeOffset.Parse(prop.GetString()!);
         Assert.Equal(expectedStartedAt, parsedTime);
     }
+
+    [Fact]
+    public async Task PostEvent_Handoff_TwoAliasesResolvingToSameAgent_ReturnsBadRequest()
+    {
+        var port = GetAvailablePort();
+        var aggregator = new HqStateAggregator();
+        const string token = "test-token-alias-same";
+
+        aggregator.UpdateOrcaSnapshot(new[]
+        {
+            new AgentSnapshot("demo-leader", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Idle),
+            new AgentSnapshot("demo-coder", "Minato (Senior Coder)", AgentRole.Coder, "minato", AgentState.Working)
+        }, Array.Empty<AccountInfo>());
+
+        await using var bridge = new LocalEventBridge(aggregator, port, requiredToken: token);
+        bridge.Start();
+
+        using var client = new HttpClient();
+        // fromAgentId: "shikamaru" (alias), toAgentId: "Leader" (alias) -> both resolve to "demo-leader"
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{port}/api/event")
+        {
+            Content = new StringContent(
+                """{"type":"handoff","fromAgentId":"shikamaru","toAgentId":"Leader","message":"Passing scroll to self"}""",
+                Encoding.UTF8,
+                "application/json")
+        };
+        req.Headers.Add("X-KageDesk-Token", token);
+
+        var res = await client.SendAsync(req);
+        Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
+    }
+
+    [Fact]
+    public void ResolveCanonicalAgentId_ExactIdLaterInAgents_NotShadowedByEarlierAliasMatch()
+    {
+        var agents = new[]
+        {
+            new AgentSnapshot("worker-1", "First Worker", AgentRole.Coder, "minato", AgentState.Working),
+            new AgentSnapshot("minato", "Second Worker", AgentRole.Tester, "clone", AgentState.Working)
+        };
+        var state = new HqState(
+            Agents: agents,
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: Array.Empty<HqEvent>()
+        );
+
+        // Resolving "minato": Pass 1 matches Agent 1's exact Id ("minato"), NOT Agent 0's SpriteKey ("minato")
+        string resolved = LocalEventBridge.ResolveCanonicalAgentId("minato", state);
+        Assert.Equal("minato", resolved);
+
+        // When exact ID does not exist, Pass 2 matches Agent 0's SpriteKey ("minato")
+        var stateWithoutExactId = state with
+        {
+            Agents = new[] { agents[0] }
+        };
+        string resolvedFallback = LocalEventBridge.ResolveCanonicalAgentId("minato", stateWithoutExactId);
+        Assert.Equal("worker-1", resolvedFallback);
+    }
 }

@@ -32,6 +32,7 @@ public class KageDeskRuntime : IDisposable
     private readonly object _audioTrackLock = new();
     private readonly Dictionary<string, AgentState> _lastAgentStates = new(StringComparer.OrdinalIgnoreCase);
     private long _lastSeenAudioEventSeq;
+    private long _lastProcessedAudioRevision;
     private int _gifExportInProgress;
     private Task? _gifExportTask;
 
@@ -102,14 +103,9 @@ public class KageDeskRuntime : IDisposable
         _wallpaperBridge = new Win32WallpaperBridge();
         _occlusionMonitor = new DesktopOcclusionMonitor(500);
 
-        _soundEngine = new RetroSoundEngine
-        {
-            IsSoundEnabled = () => _config.SoundEnabled,
-            IsFullscreenGameDnd = () => _occlusionMonitor.IsFullscreenGame && _config.HidePetsInFullscreenGame,
-            IsSessionLocked = () => _occlusionMonitor.IsSessionLocked
-        };
+        _soundEngine = new RetroSoundEngine();
         _soundEngine.SetEnabled(_config.SoundEnabled);
-        _soundEngine.SetMuted(_occlusionMonitor.IsSessionLocked || (_occlusionMonitor.IsFullscreenGame && _config.HidePetsInFullscreenGame));
+        ApplyEffectiveAudioMute();
 
         InitCollectorsAndBridge();
         InitFormsAndTray();
@@ -121,17 +117,32 @@ public class KageDeskRuntime : IDisposable
         _occlusionMonitor.SubscribeSessionSwitch();
     }
 
+    internal void ApplyEffectiveAudioMute()
+    {
+        lock (_configLock)
+        {
+            UpdateEffectiveAudioMuteLocked();
+        }
+    }
+
+    private void UpdateEffectiveAudioMuteLocked()
+    {
+        bool isFullscreenGameDnd = _occlusionMonitor.IsFullscreenGame;
+        bool isSessionLocked = _occlusionMonitor.IsSessionLocked;
+        bool effectiveMuted = !_config.SoundEnabled || isSessionLocked || (_config.HidePetsInFullscreenGame && isFullscreenGameDnd);
+        _soundEngine.SetEnabled(_config.SoundEnabled);
+        _soundEngine.SetMuted(effectiveMuted);
+    }
+
     public void UpdateConfig(Action<AppConfig> updater)
     {
         ArgumentNullException.ThrowIfNull(updater);
-        bool soundEnabled;
         lock (_configLock)
         {
             updater(_config);
             _configStore.Save(_config);
-            soundEnabled = _config.SoundEnabled;
+            UpdateEffectiveAudioMuteLocked();
         }
-        _soundEngine.SetEnabled(soundEnabled);
     }
 
     public void Start()
@@ -344,7 +355,7 @@ public class KageDeskRuntime : IDisposable
                 {
                     try
                     {
-                        DemoGifRecorder.RecordGif(gifPath, themeToExport, "showcase", 2);
+                        DemoGifRecorder.RecordGif(gifPath, themeToExport, "showcase", 2, cancellationToken: _cts.Token);
 
                         if (!_stopping && !_disposed && _dispatcherForm.IsHandleCreated)
                         {
@@ -360,6 +371,10 @@ public class KageDeskRuntime : IDisposable
                             }
                             catch { }
                         }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Clean cooperative cancellation during shutdown
                     }
                     catch (Exception ex)
                     {
@@ -581,14 +596,23 @@ public class KageDeskRuntime : IDisposable
 
     private void OnHqStateChanged(object? sender, HqState state)
     {
-        ProcessAudioEvents(state);
+        OnStateChangedForAudio(state);
         RequestUiSync();
     }
 
-    private void ProcessAudioEvents(HqState state)
+    internal void OnStateChangedForAudio(HqState state)
     {
         lock (_audioTrackLock)
         {
+            if (state.Revision > 0 && state.Revision <= _lastProcessedAudioRevision)
+            {
+                return;
+            }
+            if (state.Revision > _lastProcessedAudioRevision)
+            {
+                _lastProcessedAudioRevision = state.Revision;
+            }
+
             // 1. Process visual events (handoff, etc.)
             if (state.PendingVisualEvents != null)
             {
@@ -659,10 +683,17 @@ public class KageDeskRuntime : IDisposable
         }
     }
 
+    internal AgentState? GetLastAgentState(string agentId)
+    {
+        lock (_audioTrackLock)
+        {
+            return _lastAgentStates.TryGetValue(agentId, out var st) ? st : null;
+        }
+    }
+
     private void OnOcclusionStateChanged(object? sender, EventArgs e)
     {
-        bool muted = _occlusionMonitor.IsSessionLocked || (_occlusionMonitor.IsFullscreenGame && _config.HidePetsInFullscreenGame);
-        _soundEngine.SetMuted(muted);
+        ApplyEffectiveAudioMute();
         RequestUiSync();
     }
 
@@ -818,9 +849,11 @@ public class KageDeskRuntime : IDisposable
         {
             try
             {
-                _gifExportTask.Wait(TimeSpan.FromSeconds(2));
+                _gifExportTask.Wait(TimeSpan.FromSeconds(5));
             }
-            catch { }
+            catch (Exception)
+            {
+            }
         }
 
         if (_localBridge != null)

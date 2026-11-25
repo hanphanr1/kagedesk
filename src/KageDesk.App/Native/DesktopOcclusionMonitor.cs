@@ -266,6 +266,14 @@ public class DesktopOcclusionMonitor : IDisposable
         }
     }
 
+    internal void SetTestOcclusionState(bool? isWallpaperOccluded = null, bool? isFullscreenGame = null, bool? isSessionLocked = null)
+    {
+        if (isWallpaperOccluded.HasValue) _isWallpaperOccluded = isWallpaperOccluded.Value;
+        if (isFullscreenGame.HasValue) _isFullscreenGame = isFullscreenGame.Value;
+        if (isSessionLocked.HasValue) _isSessionLocked = isSessionLocked.Value;
+        OcclusionStateChanged?.Invoke(this, EventArgs.Empty);
+    }
+
     public void Dispose()
     {
         if (_disposed) return;

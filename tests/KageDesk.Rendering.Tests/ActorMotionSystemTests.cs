@@ -155,4 +155,163 @@ public class ActorMotionSystemTests
         Assert.Equal(ActorMotionState.AtDesk, safeMotion.State);
         Assert.True(safeMotion.BehindDesk);
     }
+
+    [Fact]
+    public void Handoff_RecipientSwapsDeskMidHandoff_UpdatesDestinationToNewDesk()
+    {
+        var motionSystem = new ActorMotionSystem();
+        var now = DateTimeOffset.UtcNow;
+
+        var agents = new[]
+        {
+            new AgentSnapshot("demo-leader", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle),
+            new AgentSnapshot("demo-coder", "Minato", AgentRole.Coder, "minato", AgentState.Working),
+            new AgentSnapshot("demo-tester", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Idle),
+            new AgentSnapshot("demo-reviewer", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle),
+            new AgentSnapshot("clone-1", "Shadow Clone 1", AgentRole.Clone, "clone", AgentState.Working),
+            new AgentSnapshot("clone-2", "Shadow Clone 2", AgentRole.Clone, "clone", AgentState.Working)
+        };
+
+        var events = new[]
+        {
+            new HqEvent(1, "handoff", "Scroll to clone 1", now, "demo-coder", 10.0, "clone-1")
+        };
+
+        var state = new HqState(
+            Agents: agents,
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: events,
+            Timestamp: now
+        );
+
+        int coreDeskY = 126;
+        int extraDeskY = 168;
+
+        // Slot setup: station 4 has clone-1 (CenterX = 100), station 5 has clone-2 (CenterX = 250)
+        var slotsInitial = new SlotBinding[]
+        {
+            new(0, "demo-leader", "shikamaru", AgentState.Idle, true, 56, coreDeskY),
+            new(1, "demo-coder", "minato", AgentState.Working, true, 146, coreDeskY),
+            new(2, "demo-tester", "tsunade", AgentState.Idle, true, 238, coreDeskY),
+            new(3, "demo-reviewer", "kakashi", AgentState.Idle, true, 328, coreDeskY),
+            new(4, "clone-1", "clone", AgentState.Working, true, 100, extraDeskY),
+            new(5, "clone-2", "clone", AgentState.Working, true, 250, extraDeskY)
+        };
+
+        // Tick 1: start handoff -> enters StepOut toward station 4
+        motionSystem.Update(0.016f, 0.016f, state, slotsInitial, coreDeskY, extraDeskY);
+        ref readonly var m0 = ref motionSystem.GetMotion(1);
+        Assert.Equal(ActorMotionState.StepOut, m0.State);
+        Assert.Equal(4, m0.TargetSlotIndex);
+        int oldTargetX = m0.TargetX;
+
+        // Advance past StepOut (0.35s) -> WalkingToTarget
+        motionSystem.Update(0.36f, 0.38f, state, slotsInitial, coreDeskY, extraDeskY);
+        ref readonly var m1 = ref motionSystem.GetMotion(1);
+        Assert.Equal(ActorMotionState.WalkingToTarget, m1.State);
+        Assert.Equal(4, m1.TargetSlotIndex);
+
+        // Swap station 4 and station 5: clone-1 is now at station 5 (CenterX = 250)
+        var slotsSwapped = new SlotBinding[]
+        {
+            new(0, "demo-leader", "shikamaru", AgentState.Idle, true, 56, coreDeskY),
+            new(1, "demo-coder", "minato", AgentState.Working, true, 146, coreDeskY),
+            new(2, "demo-tester", "tsunade", AgentState.Idle, true, 238, coreDeskY),
+            new(3, "demo-reviewer", "kakashi", AgentState.Idle, true, 328, coreDeskY),
+            new(4, "clone-2", "clone", AgentState.Working, true, 100, extraDeskY),
+            new(5, "clone-1", "clone", AgentState.Working, true, 250, extraDeskY)
+        };
+
+        // Tick with swapped slots: destination smoothly updates to station 5's coordinates
+        motionSystem.Update(0.05f, 0.43f, state, slotsSwapped, coreDeskY, extraDeskY);
+        ref readonly var m2 = ref motionSystem.GetMotion(1);
+        Assert.Equal(5, m2.TargetSlotIndex);
+        Assert.NotEqual(oldTargetX, m2.TargetX);
+        int expectedNewTargetX = 250 + (m2.DeskX < 250 ? -16 : 16); // 234
+        Assert.Equal(expectedNewTargetX, m2.TargetX);
+
+        // Advance to Delivering: delivers at station 5 (TargetX == 234), never at old station 4
+        motionSystem.Update(0.60f, 1.03f, state, slotsSwapped, coreDeskY, extraDeskY);
+        ref readonly var m3 = ref motionSystem.GetMotion(1);
+        Assert.Equal(ActorMotionState.Delivering, m3.State);
+        Assert.Equal(expectedNewTargetX, m3.DeskX + m3.OffsetX);
+    }
+
+    [Fact]
+    public void Handoff_RecipientDisappearsMidHandoff_TransitionsToWalkingBack()
+    {
+        var motionSystem = new ActorMotionSystem();
+        var now = DateTimeOffset.UtcNow;
+
+        var agents = new[]
+        {
+            new AgentSnapshot("demo-leader", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle),
+            new AgentSnapshot("demo-coder", "Minato", AgentRole.Coder, "minato", AgentState.Working),
+            new AgentSnapshot("clone-1", "Shadow Clone 1", AgentRole.Clone, "clone", AgentState.Working)
+        };
+
+        var events = new[]
+        {
+            new HqEvent(1, "handoff", "Scroll to clone 1", now, "demo-coder", 10.0, "clone-1")
+        };
+
+        var state = new HqState(
+            Agents: agents,
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: events,
+            Timestamp: now
+        );
+
+        int coreDeskY = 126;
+        int extraDeskY = 168;
+
+        var slotsInitial = new SlotBinding[]
+        {
+            new(0, "demo-leader", "shikamaru", AgentState.Idle, true, 56, coreDeskY),
+            new(1, "demo-coder", "minato", AgentState.Working, true, 146, coreDeskY),
+            new(2, "demo-tester", "tsunade", AgentState.Idle, false, 238, coreDeskY),
+            new(3, "demo-reviewer", "kakashi", AgentState.Idle, false, 328, coreDeskY),
+            new(4, "clone-1", "clone", AgentState.Working, true, 100, extraDeskY)
+        };
+
+        // Step 1: Start handoff -> StepOut
+        motionSystem.Update(0.016f, 0.016f, state, slotsInitial, coreDeskY, extraDeskY);
+        Assert.Equal(ActorMotionState.StepOut, motionSystem.GetMotion(1).State);
+
+        // Advance to WalkingToTarget
+        motionSystem.Update(0.36f, 0.38f, state, slotsInitial, coreDeskY, extraDeskY);
+        Assert.Equal(ActorMotionState.WalkingToTarget, motionSystem.GetMotion(1).State);
+
+        // Recipient disappears: slot 4 is now unoccupied
+        var slotsDisappeared = new SlotBinding[]
+        {
+            new(0, "demo-leader", "shikamaru", AgentState.Idle, true, 56, coreDeskY),
+            new(1, "demo-coder", "minato", AgentState.Working, true, 146, coreDeskY),
+            new(2, "demo-tester", "tsunade", AgentState.Idle, false, 238, coreDeskY),
+            new(3, "demo-reviewer", "kakashi", AgentState.Idle, false, 328, coreDeskY),
+            new(4, null, "clone", AgentState.Idle, false, 100, extraDeskY)
+        };
+
+        // Next tick: clean transition to WalkingBack with CarryingScroll = false
+        motionSystem.Update(0.05f, 0.43f, state, slotsDisappeared, coreDeskY, extraDeskY);
+        ref readonly var mBack = ref motionSystem.GetMotion(1);
+        Assert.Equal(ActorMotionState.WalkingBack, mBack.State);
+        Assert.False(mBack.CarryingScroll);
+
+        // Advance past walkback and stepback: returns cleanly to AtDesk
+        for (int i = 0; i < 20; i++)
+        {
+            motionSystem.Update(0.1f, 0.53f + i * 0.1f, state, slotsDisappeared, coreDeskY, extraDeskY);
+        }
+        ref readonly var mFinal = ref motionSystem.GetMotion(1);
+        Assert.Equal(ActorMotionState.AtDesk, mFinal.State);
+        Assert.True(mFinal.BehindDesk);
+    }
 }
+

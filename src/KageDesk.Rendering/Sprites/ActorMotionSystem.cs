@@ -54,6 +54,10 @@ public struct ActorMotion
     public bool IsFlashTrail;
     public bool BehindDesk;
     public string? BoundAgentId;
+    public string? TargetAgentId;
+    public int TargetSlotIndex;
+    public bool TargetBoundBySpriteKey;
+    public string? TargetSpriteKey;
 
     public readonly bool IsInMotion => State != ActorMotionState.AtDesk;
 }
@@ -84,7 +88,8 @@ public sealed class ActorMotionSystem
             {
                 State = ActorMotionState.AtDesk,
                 BehindDesk = true,
-                FacingRight = true
+                FacingRight = true,
+                TargetSlotIndex = -1
             };
         }
         _lastHandledHandoffSeq = -1;
@@ -134,6 +139,10 @@ public sealed class ActorMotionSystem
                     m.CarryingScroll = false;
                     m.IsFlashTrail = false;
                     m.BoundAgentId = null;
+                    m.TargetAgentId = null;
+                    m.TargetSlotIndex = -1;
+                    m.TargetBoundBySpriteKey = false;
+                    m.TargetSpriteKey = null;
                     if (_activeHandoffStation == i)
                     {
                         _activeHandoffStation = -1;
@@ -156,7 +165,7 @@ public sealed class ActorMotionSystem
         {
             if (_motions[i].State != ActorMotionState.AtDesk && i != newlyStarted)
             {
-                UpdateStationMotion(i, dt, timeSeconds, particles);
+                UpdateStationMotion(i, dt, timeSeconds, slots, particles);
             }
         }
     }
@@ -228,12 +237,12 @@ public sealed class ActorMotionSystem
             {
                 _lastHandledHandoffSeq = ev.SequenceId;
 
-                int fromStation = ResolveStationIndex(ev.AgentId, slots);
-                int toStation = ResolveStationIndex(ev.TargetAgentId, slots);
+                int fromStation = ResolveStationIndex(ev.AgentId, slots, out _, out _);
+                int toStation = ResolveStationIndex(ev.TargetAgentId, slots, out bool toBoundBySprite, out string? toSpriteKey);
 
                 if (fromStation >= 0 && toStation >= 0 && fromStation != toStation)
                 {
-                    StartHandoff(fromStation, toStation, slots, coreDeskY, extraDeskY);
+                    StartHandoff(fromStation, toStation, slots, coreDeskY, extraDeskY, toBoundBySprite, toSpriteKey, ev.TargetAgentId);
                     return fromStation;
                 }
             }
@@ -246,7 +255,10 @@ public sealed class ActorMotionSystem
         int toStation,
         ReadOnlySpan<SlotBinding> slots,
         int coreDeskY,
-        int extraDeskY)
+        int extraDeskY,
+        bool toBoundBySprite = false,
+        string? toSpriteKey = null,
+        string? targetAgentIdRef = null)
     {
         ref readonly var fromSlot = ref slots[fromStation];
         ref readonly var toSlot = ref slots[toStation];
@@ -279,6 +291,10 @@ public sealed class ActorMotionSystem
         m.IsFlashTrail = isMinato;
         m.BehindDesk = true;
         m.BoundAgentId = fromSlot.AgentId;
+        m.TargetAgentId = toSlot.AgentId ?? targetAgentIdRef;
+        m.TargetSlotIndex = toStation;
+        m.TargetBoundBySpriteKey = toBoundBySprite || string.IsNullOrEmpty(toSlot.AgentId);
+        m.TargetSpriteKey = toSpriteKey ?? toSlot.SpriteKey;
 
         _activeHandoffStation = fromStation;
     }
@@ -341,9 +357,104 @@ public sealed class ActorMotionSystem
         return -1;
     }
 
-    private void UpdateStationMotion(int idx, float dt, float timeSeconds, ParticleSystem? particles)
+    private void UpdateStationMotion(
+        int idx,
+        float dt,
+        float timeSeconds,
+        ReadOnlySpan<SlotBinding> slots,
+        ParticleSystem? particles)
     {
         ref var m = ref _motions[idx];
+
+        if (m.State is ActorMotionState.WalkingToTarget or ActorMotionState.Delivering)
+        {
+            // 1. Revalidate sender binding
+            if (idx >= slots.Length || !slots[idx].Occupied ||
+                !string.Equals(slots[idx].AgentId, m.BoundAgentId, StringComparison.OrdinalIgnoreCase))
+            {
+                m.State = ActorMotionState.AtDesk;
+                m.BehindDesk = true;
+                m.OffsetX = 0;
+                m.OffsetY = 0;
+                m.CarryingScroll = false;
+                m.IsFlashTrail = false;
+                m.BoundAgentId = null;
+                m.TargetAgentId = null;
+                m.TargetSlotIndex = -1;
+                m.TargetBoundBySpriteKey = false;
+                m.TargetSpriteKey = null;
+                if (_activeHandoffStation == idx) _activeHandoffStation = -1;
+                return;
+            }
+
+            // 2. Revalidate recipient binding
+            if (m.CarryingScroll || m.TargetSlotIndex >= 0)
+            {
+                int currentRecipientSlot = -1;
+
+                if (!string.IsNullOrEmpty(m.TargetAgentId))
+                {
+                    for (int s = 0; s < slots.Length; s++)
+                    {
+                        if (slots[s].Occupied && string.Equals(slots[s].AgentId, m.TargetAgentId, StringComparison.OrdinalIgnoreCase))
+                        {
+                            currentRecipientSlot = s;
+                            break;
+                        }
+                    }
+                }
+
+                if (currentRecipientSlot < 0 && m.TargetBoundBySpriteKey && !string.IsNullOrEmpty(m.TargetSpriteKey))
+                {
+                    for (int s = 0; s < slots.Length; s++)
+                    {
+                        if (slots[s].Occupied && string.Equals(slots[s].SpriteKey, m.TargetSpriteKey, StringComparison.OrdinalIgnoreCase))
+                        {
+                            currentRecipientSlot = s;
+                            break;
+                        }
+                    }
+                }
+
+                if (currentRecipientSlot < 0)
+                {
+                    // Recipient disappeared: cleanly transition sender to WalkingBack (cancel delivery)
+                    m.State = ActorMotionState.WalkingBack;
+                    m.Elapsed = 0f;
+                    m.TargetX = m.DeskX + m.OffsetX;
+                    m.TargetY = m.DeskY + m.OffsetY;
+                    float dist = MathF.Abs(m.TargetX - m.DeskX);
+                    m.Duration = m.IsFlashTrail ? 0.6f : Math.Clamp(dist / 70f, 0.45f, 1.4f);
+                    m.FacingRight = m.DeskX >= m.TargetX;
+                    m.CarryingScroll = false;
+                    m.TargetSlotIndex = -1;
+                }
+                else
+                {
+                    ref readonly var recSlot = ref slots[currentRecipientSlot];
+                    int toDeskX = recSlot.CenterX;
+                    int toDeskY = recSlot.DeskY;
+                    int toRugY = toDeskY + 22;
+                    int newTargetX = toDeskX + (m.DeskX < toDeskX ? -16 : 16);
+                    int newTargetY = toRugY;
+
+                    if (m.TargetSlotIndex != currentRecipientSlot || m.TargetX != newTargetX || m.TargetY != newTargetY)
+                    {
+                        m.TargetSlotIndex = currentRecipientSlot;
+                        m.TargetX = newTargetX;
+                        m.TargetY = newTargetY;
+                        m.FacingRight = toDeskX >= (m.DeskX + m.OffsetX);
+
+                        if (m.State == ActorMotionState.Delivering)
+                        {
+                            m.OffsetX = m.TargetX - m.DeskX;
+                            m.OffsetY = m.TargetY - m.DeskY;
+                        }
+                    }
+                }
+            }
+        }
+
         m.Elapsed += dt;
 
         switch (m.State)
@@ -537,6 +648,13 @@ public sealed class ActorMotionSystem
 
     private static int ResolveStationIndex(string? agentId, ReadOnlySpan<SlotBinding> slots)
     {
+        return ResolveStationIndex(agentId, slots, out _, out _);
+    }
+
+    private static int ResolveStationIndex(string? agentId, ReadOnlySpan<SlotBinding> slots, out bool boundBySpriteKey, out string? spriteKey)
+    {
+        boundBySpriteKey = false;
+        spriteKey = null;
         if (string.IsNullOrWhiteSpace(agentId)) return -1;
         string trimmed = agentId.Trim();
 
@@ -545,6 +663,7 @@ public sealed class ActorMotionSystem
         {
             if (slots[i].Occupied && string.Equals(slots[i].AgentId, trimmed, StringComparison.OrdinalIgnoreCase))
             {
+                spriteKey = slots[i].SpriteKey;
                 return i;
             }
         }
@@ -568,6 +687,8 @@ public sealed class ActorMotionSystem
             {
                 if (slots[i].Occupied && string.Equals(slots[i].SpriteKey, roleSprite, StringComparison.OrdinalIgnoreCase))
                 {
+                    boundBySpriteKey = true;
+                    spriteKey = roleSprite;
                     return i;
                 }
             }

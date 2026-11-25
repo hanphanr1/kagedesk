@@ -120,7 +120,31 @@ try {
         $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
         $shaEntry = "$hash  $zipName"
         $shaPath = Join-Path $distDir "SHA256SUMS.txt"
-        Set-Content -Path $shaPath -Value $shaEntry -Encoding utf8
+
+        $entries = [System.Collections.Generic.List[string]]::new()
+        if (Test-Path $shaPath) {
+            $existingLines = Get-Content -Path $shaPath -Encoding utf8
+            foreach ($line in $existingLines) {
+                $trimmed = $line.Trim()
+                if ($trimmed.Length -gt 0) {
+                    $parts = $trimmed -split '\s+', 2
+                    if ($parts.Count -eq 2) {
+                        if ($parts[1].Trim() -ne $zipName) {
+                            $entries.Add($trimmed)
+                        }
+                    }
+                    elseif (-not $trimmed.EndsWith($zipName)) {
+                        $entries.Add($trimmed)
+                    }
+                }
+            }
+        }
+        $entries.Add($shaEntry)
+        $sortedEntries = $entries | Sort-Object
+
+        $tempShaPath = Join-Path $distDir "SHA256SUMS.tmp"
+        Set-Content -Path $tempShaPath -Value $sortedEntries -Encoding utf8
+        Move-Item -Path $tempShaPath -Destination $shaPath -Force
 
         $zipInfo = Get-Item $zipPath
         Write-Host "Successfully packaged and verified release:" -ForegroundColor Green
