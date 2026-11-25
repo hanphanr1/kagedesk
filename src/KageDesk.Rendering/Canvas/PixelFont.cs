@@ -359,17 +359,8 @@ public static class PixelFont
     {
         if (text.Length == 0 || maxLines <= 0 || maxWidthPx <= 0) return;
 
-        bool hasNewline = false;
-        for (int i = 0; i < text.Length; i++)
-        {
-            if (text[i] is '\r' or '\n')
-            {
-                hasNewline = true;
-                break;
-            }
-        }
-
-        if (!hasNewline)
+        bool hasNewlineOrTab = text.IndexOfAny('\r', '\n', '\t') >= 0;
+        if (!hasNewlineOrTab)
         {
             DrawWrappedTextCore(buf, x, y, maxWidthPx, maxLines, text, color, size, lineSpacing, shadowColor);
             return;

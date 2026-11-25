@@ -461,6 +461,95 @@ public class PixelFontVietnameseTests
         Assert.True(ellipsisLitPixels > 0, "Line 2 must render truncation indicator '..'!");
     }
 
+    [Fact]
+    public void PixelFont_DrawWrappedText_TabSeparator_MatchesSingleSpacePixelForPixel()
+    {
+        const int maxWidthPx = 192;
+        const int maxLines = 2;
+        const PixelFontSize size = PixelFontSize.Small;
+        const int lineSpacing = 4;
+        int lineStep = PixelFont.LineHeight(size) + lineSpacing;
+        int color = ColorUtil.White;
+
+        string prompt = "Approval requested:\tDeploy service";
+
+        using var bufTab = new PixelBuffer(200, lineStep * maxLines + 4);
+        using var bufExpected = new PixelBuffer(200, lineStep * maxLines + 4);
+
+        PixelFont.DrawWrappedText(bufTab, 0, 0, maxWidthPx, maxLines, prompt, color, size, lineSpacing);
+        PixelFont.DrawWrappedText(bufExpected, 0, 0, maxWidthPx, maxLines, "Approval requested: Deploy service", color, size, lineSpacing);
+
+        var tabPixels = bufTab.ReadOnlyPixels;
+        var expectedPixels = bufExpected.ReadOnlyPixels;
+        Assert.Equal(expectedPixels.Length, tabPixels.Length);
+        for (int i = 0; i < expectedPixels.Length; i++)
+        {
+            Assert.Equal(expectedPixels[i], tabPixels[i]);
+        }
+
+        // Verify "Deploy service" starts at char index 20 (x = 20 * 4 = 80) and is lit
+        int deployServiceLitPixels = CountLitPixels(bufTab, 20 * 4, 0, 14 * 4, PixelFont.LineHeight(size));
+        Assert.True(deployServiceLitPixels > 0, "Deploy service must be visibly rendered!");
+    }
+
+    [Fact]
+    public void PixelFont_DrawWrappedText_ApprovalCard_192pxBoundary_WithTabSeparator_MatchesSpacePixelForPixel()
+    {
+        const int maxWidthPx = 192; // 48 chars
+        const int maxLines = 2;
+        const PixelFontSize size = PixelFontSize.Small;
+        const int lineSpacing = 4;
+        int lineStep = PixelFont.LineHeight(size) + lineSpacing; // 5 + 4 = 9
+        int color = ColorUtil.White;
+
+        string line1 = "This is a test of the emergency broadcast system"; // exactly 48 chars (192 px)
+        string line2 = "Please respond immediately to approve this task."; // exactly 48 chars (192 px)
+        Assert.Equal(48, line1.Length);
+        Assert.Equal(48, line2.Length);
+
+        string promptTab = line1 + "\t" + line2;
+        string promptSpace = line1 + " " + line2;
+
+        int bufferWidth = 200;
+        int bufferHeight = lineStep * maxLines + 4;
+
+        using var bufTab = new PixelBuffer(bufferWidth, bufferHeight);
+        using var bufSpace = new PixelBuffer(bufferWidth, bufferHeight);
+        using var bufExpected = new PixelBuffer(bufferWidth, bufferHeight);
+
+        // Render with DrawWrappedText using tab separator
+        PixelFont.DrawWrappedText(bufTab, 0, 0, maxWidthPx, maxLines, promptTab, color, size, lineSpacing);
+
+        // Render with DrawWrappedText using single-space separator
+        PixelFont.DrawWrappedText(bufSpace, 0, 0, maxWidthPx, maxLines, promptSpace, color, size, lineSpacing);
+
+        // Render known 2-line layout directly with DrawText
+        PixelFont.DrawText(bufExpected, 0, 0, line1, color, size);
+        PixelFont.DrawText(bufExpected, 0, lineStep, line2, color, size);
+
+        // Pixel-by-pixel equality: tab separator must match single-space and expected direct layout
+        var tabPixels = bufTab.ReadOnlyPixels;
+        var spacePixels = bufSpace.ReadOnlyPixels;
+        var expectedPixels = bufExpected.ReadOnlyPixels;
+
+        Assert.Equal(expectedPixels.Length, tabPixels.Length);
+        Assert.Equal(expectedPixels.Length, spacePixels.Length);
+
+        for (int i = 0; i < expectedPixels.Length; i++)
+        {
+            Assert.Equal(spacePixels[i], tabPixels[i]);
+            Assert.Equal(expectedPixels[i], tabPixels[i]);
+        }
+
+        // Concretely verify Line 1 retains its final word ("system")
+        int line1FinalWordLitPixels = CountLitPixels(bufTab, 42 * 4, 0, 6 * 4, PixelFont.LineHeight(size));
+        Assert.True(line1FinalWordLitPixels > 0, "Line 1 must retain 'system' on row 1 at the 192 px boundary!");
+
+        // Concretely verify Line 2 renders its full expected text and is not clipped
+        int line2EndLitPixels = CountLitPixels(bufTab, 47 * 4, lineStep, 4, PixelFont.LineHeight(size));
+        Assert.True(line2EndLitPixels > 0, "Line 2 must retain its final character at the 192 px boundary!");
+    }
+
     private static int CountLitPixels(PixelBuffer buf, int startX, int startY, int width, int height)
     {
         int count = 0;
