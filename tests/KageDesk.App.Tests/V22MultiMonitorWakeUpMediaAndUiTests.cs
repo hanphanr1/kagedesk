@@ -551,4 +551,185 @@ public class V22MultiMonitorWakeUpMediaAndUiTests
         Assert.Contains(settingsTexts, t => t.Contains("Install CLI Hooks", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(settingsTexts, t => t.Contains("Remove CLI Hooks", StringComparison.OrdinalIgnoreCase));
     }
+
+    [Fact]
+    public async Task MediaSync_DisableRacingLatePlayingCallback_NeverLeavesAnimationsStuckOn()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), $"kagedesk-mediarace-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var store = new KageDesk.Core.Config.ConfigStore(Path.Combine(tempDir, "config.json"));
+            store.Save(new AppConfig
+            {
+                EnableMediaSync = true,
+                WallpaperEnabled = false,
+                PetOverlayEnabled = false,
+                EnableProcessAgentCollector = false,
+                EnableSessionLogWatcher = false,
+                EnableGitHubCiCollector = false,
+                LocalBridgePort = 0
+            });
+
+            var probe = new FakeMediaProbe
+            {
+                NextSnapshot = new MediaPlaybackSnapshot(true, "Spotify")
+            };
+
+            using var runtime = new KageDesk.App.Services.KageDeskRuntime(store, noWallpaper: true, mediaProbe: probe);
+            using var reachedBeforeInvoke = new ManualResetEventSlim(false);
+            using var allowInvoke = new ManualResetEventSlim(false);
+
+            runtime.MediaMonitor.BeforeInvokePlaybackChangedForTest = snap =>
+            {
+                if (snap.IsPlaying)
+                {
+                    reachedBeforeInvoke.Set();
+                    allowInvoke.Wait(TimeSpan.FromSeconds(5));
+                }
+            };
+
+            // 1. Background poll observes Playing=true and pauses right before firing PlaybackChanged(true)
+            Task pollTask = Task.Run(() => runtime.MediaMonitor.PollOnce());
+            Assert.True(reachedBeforeInvoke.Wait(TimeSpan.FromSeconds(3)));
+
+            // 2. UI disables Media Sync while PlaybackChanged(true) is in-flight!
+            runtime.SetMediaSyncEnabledForTest(false);
+            Assert.False(runtime.MediaMonitor.IsMediaPlaying);
+            Assert.False(runtime.GetCurrentSceneEffects().IsMediaPlaying);
+
+            // 3. Release the late PlaybackChanged(true) callback into KageDeskRuntime.OnMediaPlaybackChanged
+            allowInvoke.Set();
+            await pollTask.WaitAsync(TimeSpan.FromSeconds(3));
+
+            // Even after the late Playing=true event fires, runtime MUST stay false (never stuck playing!)
+            Assert.False(runtime.MediaMonitor.IsMediaPlaying);
+            Assert.False(runtime.GetCurrentSceneEffects().IsMediaPlaying);
+
+            // Direct simulated late callback with Playing=true also cannot override authoritative monitor state
+            runtime.SimulateMediaPlaybackCallbackForTest(new MediaPlaybackSnapshot(true, "Spotify"));
+            Assert.False(runtime.GetCurrentSceneEffects().IsMediaPlaying);
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task SingleInstanceWakeUp_RejectsTrailingBytesBeforeAck_BoundsStalledServerTimeout_AndDisposesWithoutLeak()
+    {
+        // 1. Trailing bytes in single message OR queued second message MUST be rejected BEFORE sending ACK!
+        string pipeName = $"KageDesk_TestTrail_{Guid.NewGuid():N}";
+        int wakeCount = 0;
+        using (var server = new SingleInstanceWakeUpServer(
+            onWakeUp: () => Interlocked.Increment(ref wakeCount),
+            pipeName: pipeName,
+            rateLimitWindow: TimeSpan.Zero))
+        {
+            server.Start();
+
+            // 1a. Oversized message with trailing bytes ("KDWK0001EXTRA")
+            using (var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut))
+            {
+                client.Connect(1000);
+                byte[] oversized = Encoding.ASCII.GetBytes("KDWK0001EXTRA");
+                client.Write(oversized, 0, oversized.Length);
+                client.Flush();
+                int ack = client.ReadByte();
+                Assert.NotEqual(1, ack);
+            }
+            await Task.Delay(60);
+            Assert.Equal(0, Volatile.Read(ref wakeCount));
+
+            // 1b. Exact 8 bytes followed immediately by extra trailing byte on same connection
+            using (var client2 = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut))
+            {
+                client2.Connect(1000);
+                byte[] extra = Encoding.ASCII.GetBytes("KDWK0001!");
+                client2.Write(extra, 0, extra.Length);
+                client2.Flush();
+                int ack = client2.ReadByte();
+                Assert.NotEqual(1, ack);
+            }
+            await Task.Delay(60);
+            Assert.Equal(0, Volatile.Read(ref wakeCount));
+        }
+
+        // 2. Stalled server (accepts pipe connection and never replies) MUST NOT hang TrySignalRunningInstance past retry budget!
+        string stalledPipe = $"KageDesk_TestStall_{Guid.NewGuid():N}";
+        using (var stalledServer = NamedPipeServerStreamAcl.Create(
+            stalledPipe,
+            PipeDirection.InOut,
+            2,
+            PipeTransmissionMode.Message,
+            PipeOptions.Asynchronous,
+            64,
+            64,
+            SingleInstanceWakeUp.CreateCurrentUserPipeSecurity()))
+        {
+            using var stallCts = new CancellationTokenSource();
+            Task acceptTask = stalledServer.WaitForConnectionAsync(stallCts.Token);
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            bool signaled = SingleInstanceWakeUp.TrySignalRunningInstance(stalledPipe, maxRetryWindow: TimeSpan.FromMilliseconds(350));
+            sw.Stop();
+
+            stallCts.Cancel();
+            try { await acceptTask; } catch { }
+
+            Assert.False(signaled);
+            Assert.True(sw.ElapsedMilliseconds < 2000, $"Expected stalled pipe signal to abort promptly within retry budget, took {sw.ElapsedMilliseconds}ms.");
+        }
+
+        // 3. Immediate Start() + Dispose() rapid cycle MUST NOT leak pipe handles and allows immediate reuse
+        string recyclePipe = $"KageDesk_TestRecycle_{Guid.NewGuid():N}";
+        for (int i = 0; i < 10; i++)
+        {
+            var srv = new SingleInstanceWakeUpServer(() => { }, pipeName: recyclePipe);
+            srv.Start();
+            srv.Dispose();
+        }
+
+        using var finalServer = new SingleInstanceWakeUpServer(() => Interlocked.Increment(ref wakeCount), pipeName: recyclePipe);
+        finalServer.Start();
+        Assert.True(SingleInstanceWakeUp.TrySignalRunningInstance(recyclePipe, maxRetryWindow: TimeSpan.FromMilliseconds(1000)));
+    }
+
+    [Fact]
+    public void Win32WallpaperBridge_TryComputeHostClientRect_ReturnsFalseOnMapWindowPointsFailureWithoutFallback()
+    {
+        var monitorBounds = new Rectangle(-1920, 0, 1920, 1080);
+        var fakeHwnd = new IntPtr(0x1234);
+
+        // 1. Zero or dead window handle -> false (NO virtualOffset fallback!)
+        Assert.False(Win32WallpaperBridge.TryComputeHostClientRect(IntPtr.Zero, monitorBounds, out var empty1));
+        Assert.Equal(Rectangle.Empty, empty1);
+
+        Assert.False(Win32WallpaperBridge.TryComputeHostClientRect(
+            fakeHwnd,
+            monitorBounds,
+            out var empty2,
+            isWindow: _ => false));
+        Assert.Equal(Rectangle.Empty, empty2);
+
+        // 2. MapWindowPoints fails (result == 0, LastError != 0) -> returns false so caller rolls back or triggers recovery!
+        Assert.False(Win32WallpaperBridge.TryComputeHostClientRect(
+            fakeHwnd,
+            monitorBounds,
+            out var empty3,
+            isWindow: _ => true,
+            mapWindowPoints: (_, r) => (0, 1400, r)));
+        Assert.Equal(Rectangle.Empty, empty3);
+
+        // 3. Valid mapping (including zero-displacement result == 0 with LastError == 0) -> returns true with exact mapped rect
+        Assert.True(Win32WallpaperBridge.TryComputeHostClientRect(
+            fakeHwnd,
+            monitorBounds,
+            out var mapped,
+            isWindow: _ => true,
+            mapWindowPoints: (_, _) => (0, 0, new Win32Interop.RECT(0, 0, 1920, 1080))));
+        Assert.Equal(new Rectangle(0, 0, 1920, 1080), mapped);
+    }
 }

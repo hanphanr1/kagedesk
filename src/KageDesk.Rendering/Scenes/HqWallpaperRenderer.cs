@@ -77,6 +77,8 @@ public sealed class HqWallpaperRenderer
     private float _lastTime = -1f;
     private float _emitAccum;
     private int _lastCloneCount;
+    private int _lastSeenCelebrateBurstSeq;
+    private int _lastSeenImpactEventSeq;
     private string? _cachedPrimaryBranch;
     private string? _cachedPrimaryWorkflow;
     private string? _cachedBranchText;
@@ -102,6 +104,8 @@ public sealed class HqWallpaperRenderer
         _lastTime = -1f;
         _emitAccum = 0f;
         _lastCloneCount = 0;
+        _lastSeenCelebrateBurstSeq = 0;
+        _lastSeenImpactEventSeq = 0;
         _lastAssignedState = null;
         _lastShowMixiCorner = false;
         IsMixiChillActive = false;
@@ -116,7 +120,8 @@ public sealed class HqWallpaperRenderer
         float timeSeconds,
         DateTimeOffset? nowOverride = null,
         bool showMixiWhenAllIdle = true,
-        SceneEffectsState effects = default)
+        SceneEffectsState effects = default,
+        long? monotonicTicks = null)
     {
         if (buf.Width < CanvasWidth || buf.Height < CanvasHeight)
         {
@@ -137,6 +142,9 @@ public sealed class HqWallpaperRenderer
 
         float dt = _lastTime < 0f ? 0.033f : Math.Clamp(timeSeconds - _lastTime, 0f, 0.2f);
         _lastTime = timeSeconds;
+
+        long resolvedMonotonicTicks = monotonicTicks ?? TeamDramaController.SecondsToMonotonicTicks(timeSeconds);
+        _dramaController.AdvanceTo(resolvedMonotonicTicks);
 
         bool isNight = state.Weather == EffectiveWeather.MidnightRain;
 
@@ -231,18 +239,25 @@ public sealed class HqWallpaperRenderer
             rugOffsetY: 22,
             enableAmbientStroll: !showMixiCorner);
 
-        _dramaController.Update(
-            dt,
-            timeSeconds,
+        ReadOnlySpan<SlotBinding> activeSlots = _slotBindings.AsSpan(0, slotCount);
+        DramaEffectSnapshot dramaSnap = _dramaController.AdvanceAndConsume(
+            resolvedMonotonicTicks,
             state,
-            _slotBindings.AsSpan(0, slotCount),
+            activeSlots,
+            allowConsumeDrama: true,
+            allowConsumeCelebrate: true);
+
+        TeamDramaController.EmitLocalParticles(
+            in dramaSnap,
+            activeSlots,
             _particles,
             CanvasWidth,
             confettiMinX: 14,
             confettiMaxX: CanvasWidth - 14,
             confettiTopY: 18,
             emitTick: emitTick,
-            rendererToken: 1);
+            ref _lastSeenCelebrateBurstSeq,
+            ref _lastSeenImpactEventSeq);
 
         // 5. Row 1: 4 Core Character Workstations
         for (int i = 0; i < 4; i++)
@@ -257,7 +272,7 @@ public sealed class HqWallpaperRenderer
                 now,
                 isNight,
                 effects.IsMediaPlaying,
-                _dramaController.IsCelebrationActive);
+                dramaSnap.IsCelebrationActive);
         }
 
         // 6. Row 2: Exclusive All-Idle Do Mixi Gaming Chill Corner OR Dynamic External Workstations
@@ -305,12 +320,12 @@ public sealed class HqWallpaperRenderer
                     now,
                     isNight,
                     effects.IsMediaPlaying,
-                    _dramaController.IsCelebrationActive);
+                    dramaSnap.IsCelebrationActive);
             }
         }
 
         // 7. Render Active Team Drama Overlays (red scroll arc) & Particles on top
-        _dramaController.DrawOverlays(buf, timeSeconds, _slotBindings.AsSpan(0, slotCount));
+        TeamDramaController.DrawOverlays(buf, timeSeconds, in dramaSnap, activeSlots);
         _particles.Render(buf);
 
         // 8. Approval Spotlight & Pulsing Amber Border

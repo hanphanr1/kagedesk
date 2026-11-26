@@ -83,6 +83,8 @@ public sealed class TaskbarPetRenderer
     private ResolvedScenePalette _palette;
     private float _lastTime = -1f;
     private float _emitAccum;
+    private int _lastSeenCelebrateBurstSeq;
+    private int _lastSeenImpactEventSeq;
     private DateTimeOffset _stateTimestamp;
 
     public IReadOnlyList<PetHitRegion> HitRegions => _hitRegions;
@@ -118,6 +120,8 @@ public sealed class TaskbarPetRenderer
         _dramaController.Reset();
         _lastTime = -1f;
         _emitAccum = 0f;
+        _lastSeenCelebrateBurstSeq = 0;
+        _lastSeenImpactEventSeq = 0;
         _lastRenderedState = null;
         _lastStripCount = 0;
         _lastDoneCount = 0;
@@ -139,7 +143,8 @@ public sealed class TaskbarPetRenderer
         DateTimeOffset? nowOverride = null,
         bool showMixiWhenAllIdle = true,
         IReadOnlyDictionary<string, AgentState>? dismissedAlerts = null,
-        SceneEffectsState effects = default)
+        SceneEffectsState effects = default,
+        long? monotonicTicks = null)
     {
         if (buf.Width < CanvasWidth || buf.Height < CanvasHeight)
         {
@@ -156,6 +161,9 @@ public sealed class TaskbarPetRenderer
 
         float dt = _lastTime < 0f ? 0.033f : Math.Clamp(timeSeconds - _lastTime, 0f, 0.2f);
         _lastTime = timeSeconds;
+
+        long resolvedMonotonicTicks = monotonicTicks ?? TeamDramaController.SecondsToMonotonicTicks(timeSeconds);
+        _dramaController.AdvanceTo(resolvedMonotonicTicks);
 
         bool isNight = state.Weather == EffectiveWeather.MidnightRain;
 
@@ -178,10 +186,14 @@ public sealed class TaskbarPetRenderer
         if (string.Equals(state.DemoScenario, "mixi", StringComparison.OrdinalIgnoreCase))
         {
             if (_motionSystem.IsHandoffActive) _motionSystem.Reset();
-            _dramaController.Update(
-                dt,
-                timeSeconds,
+            DramaEffectSnapshot mixiDramaSnap = _dramaController.AdvanceAndConsume(
+                resolvedMonotonicTicks,
                 state,
+                ReadOnlySpan<SlotBinding>.Empty,
+                allowConsumeDrama: false,
+                allowConsumeCelebrate: false);
+            TeamDramaController.EmitLocalParticles(
+                in mixiDramaSnap,
                 ReadOnlySpan<SlotBinding>.Empty,
                 _particles,
                 CanvasWidth,
@@ -189,9 +201,8 @@ public sealed class TaskbarPetRenderer
                 confettiMaxX: CanvasWidth - 10,
                 confettiTopY: 20,
                 emitTick: emitTick,
-                allowConsumeDrama: false,
-                allowConsumeCelebrate: false,
-                rendererToken: 2);
+                ref _lastSeenCelebrateBurstSeq,
+                ref _lastSeenImpactEventSeq);
             RenderMixiChillMode(buf, timeSeconds, isNight, effects);
             _particles.Update(dt);
             _particles.Render(buf);
@@ -323,10 +334,8 @@ public sealed class TaskbarPetRenderer
                     EnsureAgentInStrip(dramaTo, dramaFrom, ref stripCount);
                     dramaMode = true;
                 }
-                else
-                {
-                    _dramaController.MarkDramaEventHandled(pendingDrama.SequenceId);
-                }
+                // NOTE: Never globally mark pendingDrama handled here when Taskbar Pet's own subset of slots
+                // cannot display both endpoints — HqWallpaperRenderer may still resolve and display it!
             }
         }
 
@@ -383,10 +392,15 @@ public sealed class TaskbarPetRenderer
         int confettiSpacing = confettiSpanCount == 2 ? 64 : 46;
         int confettiMinX = Math.Max(12, 346 - (confettiSpanCount - 1) * confettiSpacing - 24);
 
-        _dramaController.Update(
-            dt,
-            timeSeconds,
+        DramaEffectSnapshot dramaSnap = _dramaController.AdvanceAndConsume(
+            resolvedMonotonicTicks,
             state,
+            dramaSlots,
+            allowConsumeDrama: allowConsumeDrama,
+            allowConsumeCelebrate: allowConsumeCelebrate);
+
+        TeamDramaController.EmitLocalParticles(
+            in dramaSnap,
             dramaSlots,
             _particles,
             CanvasWidth,
@@ -394,11 +408,10 @@ public sealed class TaskbarPetRenderer
             confettiMaxX: CanvasWidth - 10,
             confettiTopY: 16,
             emitTick: emitTick,
-            allowConsumeDrama: allowConsumeDrama,
-            allowConsumeCelebrate: allowConsumeCelebrate,
-            rendererToken: 2);
+            ref _lastSeenCelebrateBurstSeq,
+            ref _lastSeenImpactEventSeq);
 
-        if (allowConsumeDrama && _dramaController.IsDramaActive)
+        if (allowConsumeDrama && dramaSnap.IsDramaActive)
         {
             dramaMode = true;
         }
@@ -431,7 +444,7 @@ public sealed class TaskbarPetRenderer
         }
         else if (showIdleChill)
         {
-            if (_dramaController.IsCelebrationActive && agents.Count > 0)
+            if (dramaSnap.IsCelebrationActive && agents.Count > 0)
             {
                 int celCount = Math.Min(4, agents.Count);
                 for (int i = 0; i < celCount; i++) _celebrateScratch[i] = agents[i];
@@ -442,8 +455,8 @@ public sealed class TaskbarPetRenderer
                 showMixiWhenAllIdle,
                 _motionSystem.IsHandoffActive,
                 _motionSystem.LastHandledHandoffSeq,
-                _dramaController.IsDramaActive,
-                _dramaController.IsCelebrationActive,
+                dramaSnap.IsDramaActive,
+                dramaSnap.IsCelebrationActive,
                 _dramaController.LastHandledDramaSeq,
                 _dramaController.LastHandledCelebrateSeq))
             {
@@ -455,7 +468,7 @@ public sealed class TaskbarPetRenderer
             }
         }
 
-        _dramaController.DrawOverlays(buf, timeSeconds, dramaSlots);
+        TeamDramaController.DrawOverlays(buf, timeSeconds, in dramaSnap, dramaSlots);
         _particles.Update(dt);
         _particles.Render(buf);
         DrawWakeUpPulse(buf, timeSeconds, effects.WakeUpPulseRemainingSeconds);

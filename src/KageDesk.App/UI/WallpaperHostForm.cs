@@ -178,8 +178,9 @@ public class WallpaperHostForm : Form
         if (_disposed) return;
 
         float timeSeconds = (float)_stopwatch.Elapsed.TotalSeconds;
+        long monotonicTicks = Stopwatch.GetTimestamp();
         SceneEffectsState effects = GetSceneEffects?.Invoke() ?? default;
-        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds, DateTimeOffset.UtcNow, _showMixiWhenAllIdle, effects);
+        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds, DateTimeOffset.UtcNow, _showMixiWhenAllIdle, effects, monotonicTicks);
         Invalidate();
     }
 
@@ -194,8 +195,9 @@ public class WallpaperHostForm : Form
         if (_isPaused || _disposed || (!Visible && !_isAttached)) return;
 
         float timeSeconds = (float)_stopwatch.Elapsed.TotalSeconds;
+        long monotonicTicks = Stopwatch.GetTimestamp();
         SceneEffectsState effects = GetSceneEffects?.Invoke() ?? default;
-        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds, DateTimeOffset.UtcNow, _showMixiWhenAllIdle, effects);
+        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds, DateTimeOffset.UtcNow, _showMixiWhenAllIdle, effects, monotonicTicks);
         Invalidate();
     }
 

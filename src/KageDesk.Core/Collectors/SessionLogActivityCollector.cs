@@ -22,12 +22,14 @@ public sealed record DerivedSessionActivity(
     string? DerivedActionToken,
     DateTimeOffset ObservedAt,
     bool IsExplicitIdle = false,
-    int? CorrelatedProcessId = null
+    int? CorrelatedProcessId = null,
+    long? CorrelatedProcessStartTicks = null
 );
 
 /// <summary>
 /// Lightweight, privacy-safe local session/transcript log watcher.
-/// Uses a single serialized bounded consumer over FileSystemWatcher events with bounded tail reads (&lt;= 8 KB),
+/// Uses a single serialized bounded consumer over FileSystemWatcher events and maintenance ticks
+/// with strictly bounded I/O (&lt;= 8 KB total per read including header probe),
 /// UTF-8 Span/Utf8JsonReader parsing inside a reusable cleared byte buffer, and extracts ONLY derived
 /// non-sensitive activity state and canonical tool action tokens.
 /// Only bounded file path/offset/identity bookkeeping (capped at MaxTrackedFiles) is kept in memory;
@@ -43,6 +45,7 @@ public sealed class SessionLogActivityCollector : IDisposable
 
     private sealed class TrackedFileState
     {
+        public string SessionId = string.Empty;
         public long LastCompleteRecordOffset;
         public bool AtRecordBoundary;
         public DateTime CreationTimeUtc;
@@ -52,6 +55,8 @@ public sealed class SessionLogActivityCollector : IDisposable
         public int HeaderFingerprintLength;
         public DateTime LastSeenUtc;
         public string Provider = string.Empty;
+        public int? VerifiedProcessId;
+        public long? VerifiedProcessStartTicks;
         public DerivedSessionActivity? LatestActivity;
     }
 
@@ -59,6 +64,8 @@ public sealed class SessionLogActivityCollector : IDisposable
     {
         public required SessionWatchRoot Root { get; init; }
         public required FileSystemWatcher Watcher { get; init; }
+        public ulong DirectoryVolumeSerial { get; init; }
+        public ulong DirectoryFileIndex { get; init; }
     }
 
     private readonly IReadOnlyList<SessionWatchRoot> _roots;
@@ -77,13 +84,13 @@ public sealed class SessionLogActivityCollector : IDisposable
 
     private readonly List<ActiveWatcherEntry> _watchers = new();
     private readonly Dictionary<string, TrackedFileState> _fileStates = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, DerivedSessionActivity> _providerActivity = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _pendingPaths = new(StringComparer.OrdinalIgnoreCase);
 
     private Timer? _debounceTimer;
     private Timer? _maintenanceTimer;
     private DateTimeOffset? _firstPendingAt;
     private bool _overflowPending;
+    private bool _maintenancePending;
     private bool _immediateTimerArmed;
     private bool _consumerScheduledOrRunning;
     private readonly ManualResetEventSlim _consumerIdleEvent = new(initialState: true);
@@ -92,6 +99,9 @@ public sealed class SessionLogActivityCollector : IDisposable
     private long _removalEpoch;
     private bool _started;
     private bool _disposed;
+
+    internal Action? OnMaintenanceStepForTest { get; set; }
+    internal int LastTotalFileBytesReadForTest { get; private set; }
 
     public event EventHandler<IReadOnlyList<AgentSnapshot>>? ActivityChanged;
 
@@ -219,6 +229,7 @@ public sealed class SessionLogActivityCollector : IDisposable
             _pendingPaths.Clear();
             _firstPendingAt = null;
             _overflowPending = false;
+            _maintenancePending = false;
             _immediateTimerArmed = false;
         }
 
@@ -240,7 +251,6 @@ public sealed class SessionLogActivityCollector : IDisposable
         lock (_stateLock)
         {
             _fileStates.Clear();
-            _providerActivity.Clear();
         }
     }
 
@@ -253,7 +263,7 @@ public sealed class SessionLogActivityCollector : IDisposable
     }
 
     /// <summary>
-    /// Synchronously processes a single file delta using bounded tail reading (&lt;= 8 KB)
+    /// Synchronously processes a single file delta using strictly bounded I/O (&lt;= 8 KB total)
     /// into a reusable cleared UTF-8 buffer.
     /// </summary>
     public DerivedSessionActivity? ProcessFileDelta(string filePath, string provider, string? displayName = null)
@@ -281,11 +291,9 @@ public sealed class SessionLogActivityCollector : IDisposable
 
             if (_fileStates.TryGetValue(filePath, out var st))
             {
-                st.Provider = provider;
-                st.LatestActivity = derived;
+                derived = ApplyTrackedSessionMetadataLocked(st, filePath, provider, derived);
             }
 
-            RecomputeProviderActivityLocked(provider, now);
             snapshots = BuildCurrentSnapshotsLocked(now);
         }
 
@@ -306,8 +314,8 @@ public sealed class SessionLogActivityCollector : IDisposable
     }
 
     /// <summary>
-    /// Reads at most <see cref="MaxTailReadBytes"/> complete newline-terminated UTF-8 bytes
-    /// from the file's previous committed record boundary (or bounded tail on initial &gt;8 KB seek / rotation).
+    /// Reads at most <see cref="MaxTailReadBytes"/> total bytes (including the 64-byte header probe)
+    /// and returns complete newline-terminated UTF-8 bytes from the file's previous committed record boundary.
     /// </summary>
     public byte[]? ReadBoundedTailDelta(string filePath)
     {
@@ -315,7 +323,7 @@ public sealed class SessionLogActivityCollector : IDisposable
         {
             try
             {
-                int count = ReadCompleteRecordsIntoBufferLocked(filePath, out int sliceStart);
+                int count = ReadCompleteRecordsIntoBufferLocked(filePath, out int sliceStart, out _);
                 if (count <= 0) return null;
 
                 byte[] copy = new byte[count];
@@ -344,15 +352,43 @@ public sealed class SessionLogActivityCollector : IDisposable
     }
 
     /// <summary>
-    /// Internal test hook to trigger bounded missing-root reconciliation synchronously.
+    /// Internal test hook to simulate a FileSystemWatcher.Error (dead/broken watcher) on a watched root.
+    /// </summary>
+    internal void SimulateWatcherErrorForTest(string directoryPath)
+    {
+        ActiveWatcherEntry? target = null;
+        lock (_stateLock)
+        {
+            foreach (var w in _watchers)
+            {
+                if (string.Equals(w.Root.DirectoryPath, directoryPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    target = w;
+                    break;
+                }
+            }
+        }
+
+        if (target != null)
+        {
+            HandleWatcherError(target);
+        }
+    }
+
+    /// <summary>
+    /// Internal test hook to trigger one unified maintenance tick through the single serial consumer.
+    /// </summary>
+    internal void TriggerMaintenanceNowForTest()
+    {
+        RunMaintenanceTick();
+    }
+
+    /// <summary>
+    /// Internal test hook to trigger bounded missing-root &amp; dead-watcher reconciliation synchronously.
     /// </summary>
     internal void ReconcileMissingRootsNow()
     {
-        lock (_stateLock)
-        {
-            if (_disposed || !_started) return;
-            AttachMissingRootsLocked();
-        }
+        ReconcileWatchersAndMissingRoots();
     }
 
     /// <summary>
@@ -371,14 +407,9 @@ public sealed class SessionLogActivityCollector : IDisposable
             Interlocked.Increment(ref _removalEpoch);
             _pendingPaths.Remove(fullPath);
 
-            if (_fileStates.TryGetValue(fullPath, out var removed))
+            if (_fileStates.Remove(fullPath))
             {
-                _fileStates.Remove(fullPath);
-                if (!string.IsNullOrEmpty(removed.Provider))
-                {
-                    RecomputeProviderActivityLocked(removed.Provider, now);
-                    snapshots = BuildCurrentSnapshotsLocked(now);
-                }
+                snapshots = BuildCurrentSnapshotsLocked(now);
             }
         }
 
@@ -386,6 +417,46 @@ public sealed class SessionLogActivityCollector : IDisposable
         {
             ActivityChanged?.Invoke(this, snapshots);
         }
+    }
+
+    private static string ComputeSessionId(string provider, string filePath)
+    {
+        string normProvider = string.IsNullOrWhiteSpace(provider) ? "external" : provider.Trim().ToLowerInvariant();
+        string canonical = Path.GetFullPath(filePath).ToUpperInvariant();
+        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
+        string shortHash = Convert.ToHexString(hash)[..12].ToLowerInvariant();
+        return $"session:{normProvider}:{shortHash}";
+    }
+
+    private static DerivedSessionActivity ApplyTrackedSessionMetadataLocked(
+        TrackedFileState st,
+        string filePath,
+        string provider,
+        DerivedSessionActivity derived)
+    {
+        st.Provider = provider;
+        if (string.IsNullOrEmpty(st.SessionId))
+        {
+            st.SessionId = ComputeSessionId(provider, filePath);
+        }
+
+        if (derived.CorrelatedProcessId.HasValue && derived.CorrelatedProcessId.Value > 0 &&
+            derived.CorrelatedProcessStartTicks.HasValue && derived.CorrelatedProcessStartTicks.Value > 0)
+        {
+            st.VerifiedProcessId = derived.CorrelatedProcessId;
+            st.VerifiedProcessStartTicks = derived.CorrelatedProcessStartTicks;
+        }
+        else if (st.VerifiedProcessId.HasValue && st.VerifiedProcessStartTicks.HasValue)
+        {
+            derived = derived with
+            {
+                CorrelatedProcessId = st.VerifiedProcessId,
+                CorrelatedProcessStartTicks = st.VerifiedProcessStartTicks
+            };
+        }
+
+        st.LatestActivity = derived;
+        return derived;
     }
 
     private DerivedSessionActivity? ReadAndParseFileDeltaInPlace(
@@ -398,14 +469,19 @@ public sealed class SessionLogActivityCollector : IDisposable
         {
             try
             {
-                int count = ReadCompleteRecordsIntoBufferLocked(filePath, out int sliceStart);
+                int count = ReadCompleteRecordsIntoBufferLocked(filePath, out int sliceStart, out DateTime fileLastWriteUtc);
                 if (count <= 0) return null;
+
+                // Use the file's own last-write timestamp (not batch scan time) as fallback when a JSON line has no explicit timestamp
+                DateTimeOffset fallbackTimestamp = fileLastWriteUtc != DateTime.MinValue
+                    ? new DateTimeOffset(fileLastWriteUtc, TimeSpan.Zero)
+                    : now;
 
                 return ParseDerivedActivityFromTail(
                     provider,
                     displayName,
                     new ReadOnlySpan<byte>(_readBuffer, sliceStart, count),
-                    now);
+                    fallbackTimestamp);
             }
             finally
             {
@@ -416,10 +492,12 @@ public sealed class SessionLogActivityCollector : IDisposable
         }
     }
 
-    private int ReadCompleteRecordsIntoBufferLocked(string filePath, out int sliceStart)
+    private int ReadCompleteRecordsIntoBufferLocked(string filePath, out int sliceStart, out DateTime fileLastWriteUtc)
     {
         sliceStart = 0;
+        fileLastWriteUtc = DateTime.MinValue;
         long removalEpochBeforeRead = Volatile.Read(ref _removalEpoch);
+        int totalBytesReadFromStream = 0;
         try
         {
             using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
@@ -427,9 +505,14 @@ public sealed class SessionLogActivityCollector : IDisposable
             if (length <= 0) return 0;
 
             FileIdentity identity = ReadFileIdentity(fs, length);
+            fileLastWriteUtc = identity.LastWriteTimeUtc;
+            int probeLen = identity.HeaderFingerprintLength;
+            totalBytesReadFromStream += probeLen;
 
             long startOffset;
             bool atRecordBoundary;
+            bool wasRotated = false;
+            int tailBudgetFromDisk = Math.Max(1, MaxTailReadBytes - probeLen);
 
             lock (_stateLock)
             {
@@ -438,41 +521,99 @@ public sealed class SessionLogActivityCollector : IDisposable
                 {
                     if (prev.LastCompleteRecordOffset == length)
                     {
+                        LastTotalFileBytesReadForTest = totalBytesReadFromStream;
                         return 0;
                     }
 
                     long delta = length - prev.LastCompleteRecordOffset;
-                    if (delta <= MaxTailReadBytes)
+                    long maxDirectDelta = prev.LastCompleteRecordOffset < probeLen
+                        ? MaxTailReadBytes
+                        : tailBudgetFromDisk;
+
+                    if (delta <= maxDirectDelta)
                     {
                         startOffset = prev.LastCompleteRecordOffset;
                         atRecordBoundary = prev.AtRecordBoundary;
                     }
                     else
                     {
-                        startOffset = length - MaxTailReadBytes;
+                        startOffset = length - tailBudgetFromDisk;
                         atRecordBoundary = false;
                     }
                 }
                 else
                 {
                     // Brand-new file OR rotated/replaced/truncated file
-                    startOffset = Math.Max(0, length - MaxTailReadBytes);
-                    atRecordBoundary = startOffset == 0;
+                    wasRotated = true;
+                    if (length <= MaxTailReadBytes)
+                    {
+                        startOffset = 0;
+                        atRecordBoundary = true;
+                    }
+                    else
+                    {
+                        // Fold the 64-byte header probe into the 8 KiB total I/O budget
+                        startOffset = length - tailBudgetFromDisk;
+                        atRecordBoundary = false;
+                    }
                 }
             }
 
-            int toRead = (int)Math.Min(MaxTailReadBytes, length - startOffset);
-            if (toRead <= 0) return 0;
-
-            fs.Seek(startOffset, SeekOrigin.Begin);
+            // Strictly bound total bytes read from FileStream to <= MaxTailReadBytes (8192 B),
+            // reusing the already-probed [0..probeLen) header prefix whenever startOffset < probeLen.
             int totalRead = 0;
-            while (totalRead < toRead)
+            int maxChunkBytes;
+            if (startOffset < probeLen)
             {
-                int read = fs.Read(_readBuffer, totalRead, toRead - totalRead);
-                if (read <= 0) break;
-                totalRead += read;
+                int reuseCount = (int)Math.Min(probeLen - startOffset, length - startOffset);
+                if (reuseCount > 0)
+                {
+                    Buffer.BlockCopy(_headerProbeBuffer, (int)startOffset, _readBuffer, 0, reuseCount);
+                    totalRead = reuseCount;
+                }
+
+                long diskStart = startOffset + totalRead;
+                int remainingToRead = (int)Math.Min(MaxTailReadBytes - probeLen, Math.Max(0L, length - diskStart));
+                maxChunkBytes = totalRead + remainingToRead;
+
+                if (remainingToRead > 0)
+                {
+                    if (fs.Position != diskStart)
+                    {
+                        fs.Seek(diskStart, SeekOrigin.Begin);
+                    }
+                    int diskRead = 0;
+                    while (diskRead < remainingToRead)
+                    {
+                        int read = fs.Read(_readBuffer, totalRead + diskRead, remainingToRead - diskRead);
+                        if (read <= 0) break;
+                        diskRead += read;
+                    }
+                    totalRead += diskRead;
+                    totalBytesReadFromStream += diskRead;
+                }
+            }
+            else
+            {
+                int toRead = (int)Math.Min(tailBudgetFromDisk, length - startOffset);
+                maxChunkBytes = tailBudgetFromDisk;
+                if (toRead <= 0)
+                {
+                    LastTotalFileBytesReadForTest = totalBytesReadFromStream;
+                    return 0;
+                }
+
+                fs.Seek(startOffset, SeekOrigin.Begin);
+                while (totalRead < toRead)
+                {
+                    int read = fs.Read(_readBuffer, totalRead, toRead - totalRead);
+                    if (read <= 0) break;
+                    totalRead += read;
+                }
+                totalBytesReadFromStream += totalRead;
             }
 
+            LastTotalFileBytesReadForTest = totalBytesReadFromStream;
             if (totalRead <= 0) return 0;
 
             int parseStart = 0;
@@ -486,8 +627,8 @@ public sealed class SessionLogActivityCollector : IDisposable
                 if (firstLf < 0)
                 {
                     // No newline anywhere in mid-file chunk
-                    long newOffset = totalRead >= MaxTailReadBytes ? startOffset + totalRead : startOffset;
-                    CommitFileState(filePath, identity, newOffset, atRecordBoundary: false, removalEpochBeforeRead);
+                    long newOffset = totalRead >= maxChunkBytes ? startOffset + totalRead : startOffset;
+                    CommitFileState(filePath, identity, newOffset, atRecordBoundary: false, removalEpochBeforeRead, wasRotated);
                     return 0;
                 }
 
@@ -513,17 +654,17 @@ public sealed class SessionLogActivityCollector : IDisposable
                 if (parseStart > 0)
                 {
                     // Advance past skipped leading mid-file fragment to its clean boundary
-                    CommitFileState(filePath, identity, startOffset + parseStart, atRecordBoundary: true, removalEpochBeforeRead);
+                    CommitFileState(filePath, identity, startOffset + parseStart, atRecordBoundary: true, removalEpochBeforeRead, wasRotated);
                 }
-                else if (totalRead >= MaxTailReadBytes)
+                else if (totalRead >= maxChunkBytes)
                 {
                     // Guard against an unbounded >8 KB malformed line without any '\n'
-                    CommitFileState(filePath, identity, startOffset + totalRead, atRecordBoundary: false, removalEpochBeforeRead);
+                    CommitFileState(filePath, identity, startOffset + totalRead, atRecordBoundary: false, removalEpochBeforeRead, wasRotated);
                 }
                 else
                 {
                     // Incomplete trailing line / split UTF-8 byte sequence: do NOT advance committed offset!
-                    CommitFileState(filePath, identity, startOffset, atRecordBoundary: boundaryAtParseStart, removalEpochBeforeRead);
+                    CommitFileState(filePath, identity, startOffset, atRecordBoundary: boundaryAtParseStart, removalEpochBeforeRead, wasRotated);
                 }
 
                 return 0;
@@ -531,7 +672,7 @@ public sealed class SessionLogActivityCollector : IDisposable
 
             int completeLen = (lastLf + 1) - parseStart;
             long committedOffset = startOffset + lastLf + 1;
-            if (!CommitFileState(filePath, identity, committedOffset, atRecordBoundary: true, removalEpochBeforeRead))
+            if (!CommitFileState(filePath, identity, committedOffset, atRecordBoundary: true, removalEpochBeforeRead, wasRotated))
             {
                 return 0;
             }
@@ -547,6 +688,7 @@ public sealed class SessionLogActivityCollector : IDisposable
 
     private readonly record struct FileIdentity(
         DateTime CreationTimeUtc,
+        DateTime LastWriteTimeUtc,
         ulong VolumeSerialNumber,
         ulong FileIndex,
         byte[] HeaderFingerprint,
@@ -556,6 +698,7 @@ public sealed class SessionLogActivityCollector : IDisposable
     private FileIdentity ReadFileIdentity(FileStream fs, long length)
     {
         DateTime creationUtc = DateTime.MinValue;
+        DateTime lastWriteUtc = DateTime.MinValue;
         ulong volumeSerial = 0;
         ulong fileIndex = 0;
 
@@ -563,10 +706,15 @@ public sealed class SessionLogActivityCollector : IDisposable
         {
             if (GetFileInformationByHandle(fs.SafeFileHandle, out var info))
             {
-                long ft = ((long)info.CreationTimeHigh << 32) | info.CreationTimeLow;
-                if (ft > 0)
+                long cft = ((long)info.CreationTimeHigh << 32) | info.CreationTimeLow;
+                if (cft > 0)
                 {
-                    creationUtc = DateTime.FromFileTimeUtc(ft);
+                    creationUtc = DateTime.FromFileTimeUtc(cft);
+                }
+                long wft = ((long)info.LastWriteTimeHigh << 32) | info.LastWriteTimeLow;
+                if (wft > 0)
+                {
+                    lastWriteUtc = DateTime.FromFileTimeUtc(wft);
                 }
                 volumeSerial = info.VolumeSerialNumber;
                 fileIndex = ((ulong)info.FileIndexHigh << 32) | info.FileIndexLow;
@@ -584,7 +732,7 @@ public sealed class SessionLogActivityCollector : IDisposable
         }
 
         byte[] hash = SHA256.HashData(new ReadOnlySpan<byte>(_headerProbeBuffer, 0, read));
-        return new FileIdentity(creationUtc, volumeSerial, fileIndex, hash, read);
+        return new FileIdentity(creationUtc, lastWriteUtc, volumeSerial, fileIndex, hash, read);
     }
 
     private static bool IsFileRotatedOrReplaced(TrackedFileState prev, FileIdentity current, long currentLength)
@@ -622,7 +770,7 @@ public sealed class SessionLogActivityCollector : IDisposable
         return false;
     }
 
-    private bool CommitFileState(string filePath, FileIdentity identity, long offset, bool atRecordBoundary, long removalEpochBeforeRead)
+    private bool CommitFileState(string filePath, FileIdentity identity, long offset, bool atRecordBoundary, long removalEpochBeforeRead, bool wasRotated)
     {
         lock (_stateLock)
         {
@@ -640,6 +788,13 @@ public sealed class SessionLogActivityCollector : IDisposable
 
                 st = new TrackedFileState();
                 _fileStates[filePath] = st;
+            }
+            else if (wasRotated)
+            {
+                // Clear stale identity and activity on file rotation/replacement
+                st.VerifiedProcessId = null;
+                st.VerifiedProcessStartTicks = null;
+                st.LatestActivity = null;
             }
 
             st.LastCompleteRecordOffset = offset;
@@ -760,7 +915,9 @@ public sealed class SessionLogActivityCollector : IDisposable
             bool isExplicitIdle = false;
             bool isWorkingSignal = false;
             string? canonicalToolToken = null;
-            int? correlatedPid = null;
+            int? parsedPid = null;
+            long? parsedStartTicks = null;
+            DateTimeOffset? parsedTimestamp = null;
 
             while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
             {
@@ -814,11 +971,43 @@ public sealed class SessionLogActivityCollector : IDisposable
                         SkipIfStructured(ref reader);
                     }
                 }
-                else if (reader.ValueTextEquals("pid"u8))
+                else if (reader.ValueTextEquals("timestamp"u8) ||
+                         reader.ValueTextEquals("created_at"u8) ||
+                         reader.ValueTextEquals("createdAt"u8) ||
+                         reader.ValueTextEquals("time"u8) ||
+                         reader.ValueTextEquals("ts"u8))
+                {
+                    if (reader.Read())
+                    {
+                        if (TryReadEventTimestamp(ref reader, out DateTimeOffset ts))
+                        {
+                            parsedTimestamp = ts;
+                        }
+                        else
+                        {
+                            SkipIfStructured(ref reader);
+                        }
+                    }
+                }
+                else if (reader.ValueTextEquals("pid"u8) || reader.ValueTextEquals("process_id"u8) || reader.ValueTextEquals("processId"u8))
                 {
                     if (reader.Read() && reader.TokenType == JsonTokenType.Number && reader.TryGetInt32(out int pid) && pid > 0)
                     {
-                        correlatedPid = pid;
+                        parsedPid = pid;
+                    }
+                    else
+                    {
+                        SkipIfStructured(ref reader);
+                    }
+                }
+                else if (reader.ValueTextEquals("process_start_ticks"u8) ||
+                         reader.ValueTextEquals("processStartTicks"u8) ||
+                         reader.ValueTextEquals("start_time_ticks"u8) ||
+                         reader.ValueTextEquals("startTimeTicks"u8))
+                {
+                    if (reader.Read() && reader.TokenType == JsonTokenType.Number && reader.TryGetInt64(out long ticks) && ticks > 0)
+                    {
+                        parsedStartTicks = ticks;
                     }
                     else
                     {
@@ -854,29 +1043,34 @@ public sealed class SessionLogActivityCollector : IDisposable
                 }
             }
 
+            // NEVER emit a bare JSON pid without verified start generation ticks!
+            int? verifiedPid = (parsedPid.HasValue && parsedStartTicks.HasValue) ? parsedPid : null;
+            long? verifiedStartTicks = (parsedPid.HasValue && parsedStartTicks.HasValue) ? parsedStartTicks : null;
+            DateTimeOffset eventTime = parsedTimestamp ?? observedAt;
+
             if (isApproval)
             {
-                return new DerivedSessionActivity(provider, displayName, AgentState.NeedsApproval, "approve", observedAt, IsExplicitIdle: false, CorrelatedProcessId: correlatedPid);
+                return new DerivedSessionActivity(provider, displayName, AgentState.NeedsApproval, "approve", eventTime, IsExplicitIdle: false, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
             }
 
             if (canonicalToolToken != null)
             {
-                return new DerivedSessionActivity(provider, displayName, AgentState.Working, canonicalToolToken, observedAt, IsExplicitIdle: false, CorrelatedProcessId: correlatedPid);
+                return new DerivedSessionActivity(provider, displayName, AgentState.Working, canonicalToolToken, eventTime, IsExplicitIdle: false, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
             }
 
             if (isCompletion)
             {
-                return new DerivedSessionActivity(provider, displayName, AgentState.Done, null, observedAt, IsExplicitIdle: false, CorrelatedProcessId: correlatedPid);
+                return new DerivedSessionActivity(provider, displayName, AgentState.Done, null, eventTime, IsExplicitIdle: false, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
             }
 
             if (isExplicitIdle)
             {
-                return new DerivedSessionActivity(provider, displayName, AgentState.Idle, null, observedAt, IsExplicitIdle: true, CorrelatedProcessId: correlatedPid);
+                return new DerivedSessionActivity(provider, displayName, AgentState.Idle, null, eventTime, IsExplicitIdle: true, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
             }
 
             if (isWorkingSignal)
             {
-                return new DerivedSessionActivity(provider, displayName, AgentState.Working, "think", observedAt, IsExplicitIdle: false, CorrelatedProcessId: correlatedPid);
+                return new DerivedSessionActivity(provider, displayName, AgentState.Working, "think", eventTime, IsExplicitIdle: false, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
             }
 
             return null;
@@ -885,6 +1079,38 @@ public sealed class SessionLogActivityCollector : IDisposable
         {
             return null;
         }
+    }
+
+    private static bool TryReadEventTimestamp(ref Utf8JsonReader reader, out DateTimeOffset result)
+    {
+        result = default;
+        if (reader.TokenType == JsonTokenType.String)
+        {
+            return reader.TryGetDateTimeOffset(out result);
+        }
+
+        if (reader.TokenType == JsonTokenType.Number && reader.TryGetInt64(out long unix))
+        {
+            try
+            {
+                if (unix >= 100_000_000_000L && unix <= 9_999_999_999_999L)
+                {
+                    result = DateTimeOffset.FromUnixTimeMilliseconds(unix);
+                    return true;
+                }
+                if (unix >= 1_000_000_000L && unix < 100_000_000_000L)
+                {
+                    result = DateTimeOffset.FromUnixTimeSeconds(unix);
+                    return true;
+                }
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                return false;
+            }
+        }
+
+        return false;
     }
 
     private static void ParseMessageObjectUtf8(
@@ -1320,11 +1546,21 @@ public sealed class SessionLogActivityCollector : IDisposable
         FileSystemWatcher? watcher = null;
         try
         {
+            TryGetDirectoryIdentity(root.DirectoryPath, out ulong dirVol, out ulong dirIdx);
+
             watcher = new FileSystemWatcher(root.DirectoryPath, root.SearchPattern)
             {
                 IncludeSubdirectories = true,
                 NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName | NotifyFilters.CreationTime,
                 InternalBufferSize = 16384
+            };
+
+            var entry = new ActiveWatcherEntry
+            {
+                Root = root,
+                Watcher = watcher,
+                DirectoryVolumeSerial = dirVol,
+                DirectoryFileIndex = dirIdx
             };
 
             string provider = root.Provider;
@@ -1353,23 +1589,50 @@ public sealed class SessionLogActivityCollector : IDisposable
                     EnqueuePendingFile(e.FullPath, provider);
                 }
             };
-            watcher.Error += (_, _) =>
-            {
-                if (_disposed) return;
-                lock (_stateLock)
-                {
-                    if (_disposed || !_started) return;
-                    _overflowPending = true;
-                    ScheduleConsumerLocked(_clock(), forceImmediate: false);
-                }
-            };
+            watcher.Error += (_, _) => HandleWatcherError(entry);
             watcher.EnableRaisingEvents = true;
-            return new ActiveWatcherEntry { Root = root, Watcher = watcher };
+            return entry;
         }
         catch
         {
             DisposeWatcherSafe(watcher);
             return null;
+        }
+    }
+
+    private void HandleWatcherError(ActiveWatcherEntry entry)
+    {
+        if (_disposed) return;
+
+        FileSystemWatcher? deadWatcher = null;
+        lock (_stateLock)
+        {
+            if (_disposed || !_started) return;
+
+            int idx = _watchers.IndexOf(entry);
+            if (idx >= 0)
+            {
+                deadWatcher = _watchers[idx].Watcher;
+                _watchers.RemoveAt(idx);
+            }
+
+            _overflowPending = true;
+            _maintenancePending = true;
+            ScheduleConsumerLocked(_clock(), forceImmediate: false);
+        }
+
+        DisposeWatcherSafe(deadWatcher);
+    }
+
+    private static bool IsWatcherHealthy(FileSystemWatcher watcher)
+    {
+        try
+        {
+            return watcher.EnableRaisingEvents;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -1380,25 +1643,69 @@ public sealed class SessionLogActivityCollector : IDisposable
         try { watcher.Dispose(); } catch { }
     }
 
-    private void AttachMissingRootsLocked()
+    private void ReconcileWatchersAndMissingRoots()
     {
-        if (_disposed || !_started) return;
+        List<FileSystemWatcher>? deadWatchers = null;
 
-        foreach (var root in _roots)
+        lock (_stateLock)
         {
-            if (string.IsNullOrWhiteSpace(root.DirectoryPath) || !Directory.Exists(root.DirectoryPath))
-                continue;
+            if (_disposed || !_started) return;
 
-            bool alreadyWatched = _watchers.Any(w =>
-                string.Equals(w.Root.DirectoryPath, root.DirectoryPath, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(w.Root.Provider, root.Provider, StringComparison.OrdinalIgnoreCase));
-
-            if (alreadyWatched) continue;
-
-            var entry = TryCreateWatcherLocked(root);
-            if (entry != null)
+            // 1. Prune dead, broken, deleted, or replaced-directory watchers from active map
+            for (int i = _watchers.Count - 1; i >= 0; i--)
             {
-                _watchers.Add(entry);
+                var w = _watchers[i];
+                bool rootExists = !string.IsNullOrWhiteSpace(w.Root.DirectoryPath) && Directory.Exists(w.Root.DirectoryPath);
+                bool healthy = rootExists && IsWatcherHealthy(w.Watcher);
+
+                if (healthy && w.DirectoryFileIndex != 0 &&
+                    TryGetDirectoryIdentity(w.Root.DirectoryPath, out ulong curVol, out ulong curIdx))
+                {
+                    if (curVol != w.DirectoryVolumeSerial || curIdx != w.DirectoryFileIndex)
+                    {
+                        healthy = false;
+                    }
+                }
+
+                if (!healthy)
+                {
+                    deadWatchers ??= new List<FileSystemWatcher>();
+                    deadWatchers.Add(w.Watcher);
+                    _watchers.RemoveAt(i);
+                }
+            }
+        }
+
+        // Dispose dead watchers outside lock before recreating fresh ones
+        if (deadWatchers != null)
+        {
+            foreach (var dw in deadWatchers)
+            {
+                DisposeWatcherSafe(dw);
+            }
+        }
+
+        // 2. Attach watchers for any existing roots not currently watched
+        lock (_stateLock)
+        {
+            if (_disposed || !_started) return;
+
+            foreach (var root in _roots)
+            {
+                if (string.IsNullOrWhiteSpace(root.DirectoryPath) || !Directory.Exists(root.DirectoryPath))
+                    continue;
+
+                bool alreadyWatched = _watchers.Any(w =>
+                    string.Equals(w.Root.DirectoryPath, root.DirectoryPath, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(w.Root.Provider, root.Provider, StringComparison.OrdinalIgnoreCase));
+
+                if (alreadyWatched) continue;
+
+                var entry = TryCreateWatcherLocked(root);
+                if (entry != null)
+                {
+                    _watchers.Add(entry);
+                }
             }
         }
     }
@@ -1421,6 +1728,8 @@ public sealed class SessionLogActivityCollector : IDisposable
             ScheduleConsumerLocked(_clock(), forceImmediate: false);
         }
     }
+
+    internal void EnqueuePathForTest(string fullPath, string provider = "claude") => EnqueuePendingFile(fullPath, provider);
 
     private void ScheduleConsumerLocked(DateTimeOffset now, bool forceImmediate)
     {
@@ -1477,27 +1786,52 @@ public sealed class SessionLogActivityCollector : IDisposable
             generation = Volatile.Read(ref _stopGeneration);
         }
 
+        ExecuteConsumerWithReschedule(generation);
+    }
+
+    private void RunMaintenanceTick()
+    {
+        long generation;
+        lock (_stateLock)
+        {
+            if (_disposed || !_started) return;
+            _maintenancePending = true;
+
+            if (_consumerScheduledOrRunning)
+            {
+                // Active serial consumer will pick up _maintenancePending before exiting!
+                return;
+            }
+
+            _consumerScheduledOrRunning = true;
+            _consumerIdleEvent.Reset();
+            generation = Volatile.Read(ref _stopGeneration);
+        }
+
+        ExecuteConsumerWithReschedule(generation);
+    }
+
+    /// <summary>
+    /// Single unified serial consumer entry point for BOTH pending-path drains AND maintenance.
+    /// On EVERY exit, re-checks whether pending paths, overflow, or maintenance were queued while running
+    /// and re-arms immediately so a final turn-end append during maintenance can NEVER be swallowed.
+    /// </summary>
+    private void ExecuteConsumerWithReschedule(long generation)
+    {
         try
         {
             RunSerializedConsumerLoop(generation);
         }
         finally
         {
-            bool needReschedule = false;
             lock (_stateLock)
             {
                 _consumerScheduledOrRunning = false;
-                if (!_disposed && _started && (_pendingPaths.Count > 0 || _overflowPending))
+                if (!_disposed && _started && (_pendingPaths.Count > 0 || _overflowPending || _maintenancePending))
                 {
-                    needReschedule = true;
-                    ScheduleConsumerLocked(_clock(), forceImmediate: false);
+                    ScheduleConsumerLocked(_clock(), forceImmediate: _maintenancePending || _overflowPending);
                 }
                 _consumerIdleEvent.Set();
-            }
-
-            if (needReschedule)
-            {
-                // Timer has already been armed under lock
             }
         }
     }
@@ -1508,18 +1842,21 @@ public sealed class SessionLogActivityCollector : IDisposable
         {
             List<(string Path, string Provider)> batch;
             bool runOverflowReconcile;
+            bool runMaintenance;
 
             lock (_stateLock)
             {
                 if (!_started || generation != Volatile.Read(ref _stopGeneration))
                     return;
 
+                runMaintenance = _maintenancePending;
+                _maintenancePending = false;
                 runOverflowReconcile = _overflowPending;
                 _overflowPending = false;
                 _firstPendingAt = null;
                 _immediateTimerArmed = false;
 
-                if (_pendingPaths.Count == 0 && !runOverflowReconcile)
+                if (_pendingPaths.Count == 0 && !runOverflowReconcile && !runMaintenance)
                     return;
 
                 batch = new List<(string, string)>(_pendingPaths.Count);
@@ -1530,8 +1867,19 @@ public sealed class SessionLogActivityCollector : IDisposable
                 _pendingPaths.Clear();
             }
 
+            if (runMaintenance)
+            {
+                ReconcileWatchersAndMissingRoots();
+                OnMaintenanceStepForTest?.Invoke();
+                PruneAndPublishIfChanged(generation);
+            }
+
             if (runOverflowReconcile)
             {
+                if (!runMaintenance)
+                {
+                    ReconcileWatchersAndMissingRoots();
+                }
                 AppendOverflowReconciliationFiles(batch);
             }
 
@@ -1539,7 +1887,6 @@ public sealed class SessionLogActivityCollector : IDisposable
 
             DateTimeOffset now = _clock();
             bool anyUpdated = false;
-            var touchedProviders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var (path, provider) in batch)
             {
@@ -1552,7 +1899,6 @@ public sealed class SessionLogActivityCollector : IDisposable
                     {
                         if (_fileStates.Remove(path))
                         {
-                            touchedProviders.Add(provider);
                             anyUpdated = true;
                         }
                     }
@@ -1569,10 +1915,8 @@ public sealed class SessionLogActivityCollector : IDisposable
 
                         if (_fileStates.TryGetValue(path, out var st))
                         {
-                            st.Provider = provider;
-                            st.LatestActivity = derived;
+                            ApplyTrackedSessionMetadataLocked(st, path, provider, derived);
                         }
-                        touchedProviders.Add(provider);
                         anyUpdated = true;
                     }
                 }
@@ -1585,10 +1929,6 @@ public sealed class SessionLogActivityCollector : IDisposable
                 {
                     if (!_disposed && _started && generation == Volatile.Read(ref _stopGeneration))
                     {
-                        foreach (string p in touchedProviders)
-                        {
-                            RecomputeProviderActivityLocked(p, now);
-                        }
                         snapshots = BuildCurrentSnapshotsLocked(now);
                     }
                 }
@@ -1653,33 +1993,6 @@ public sealed class SessionLogActivityCollector : IDisposable
         }
     }
 
-    private void RunMaintenanceTick()
-    {
-        long generation;
-        lock (_stateLock)
-        {
-            if (_disposed || !_started) return;
-            AttachMissingRootsLocked();
-            if (_consumerScheduledOrRunning) return;
-            _consumerScheduledOrRunning = true;
-            _consumerIdleEvent.Reset();
-            generation = Volatile.Read(ref _stopGeneration);
-        }
-
-        try
-        {
-            PruneAndPublishIfChanged(generation);
-        }
-        finally
-        {
-            lock (_stateLock)
-            {
-                _consumerScheduledOrRunning = false;
-                _consumerIdleEvent.Set();
-            }
-        }
-    }
-
     private void PruneAndPublishIfChanged(long generation)
     {
         if (_disposed || generation != Volatile.Read(ref _stopGeneration)) return;
@@ -1689,23 +2002,33 @@ public sealed class SessionLogActivityCollector : IDisposable
 
         lock (_stateLock)
         {
-            if (!_started || generation != Volatile.Read(ref _stopGeneration) || _providerActivity.Count == 0)
+            if (!_started || generation != Volatile.Read(ref _stopGeneration) || _fileStates.Count == 0)
                 return;
 
             bool changed = false;
-            var toRemove = new List<string>();
-            foreach (var (provider, act) in _providerActivity)
+            List<string>? deadPaths = null;
+
+            foreach (var (path, st) in _fileStates)
             {
-                if (IsActivityExpired(act, now))
+                if (st.LatestActivity != null && IsActivityExpired(st.LatestActivity, now))
                 {
-                    toRemove.Add(provider);
+                    st.LatestActivity = null;
                     changed = true;
+                }
+
+                if (st.LatestActivity == null && !File.Exists(path))
+                {
+                    deadPaths ??= new List<string>();
+                    deadPaths.Add(path);
                 }
             }
 
-            foreach (var k in toRemove)
+            if (deadPaths != null)
             {
-                _providerActivity.Remove(k);
+                foreach (string p in deadPaths)
+                {
+                    _fileStates.Remove(p);
+                }
             }
 
             if (changed)
@@ -1717,31 +2040,6 @@ public sealed class SessionLogActivityCollector : IDisposable
         if (snapshotsToPublish != null && !_disposed && generation == Volatile.Read(ref _stopGeneration))
         {
             ActivityChanged?.Invoke(this, snapshotsToPublish);
-        }
-    }
-
-    private void RecomputeProviderActivityLocked(string provider, DateTimeOffset now)
-    {
-        DerivedSessionActivity? newest = null;
-        foreach (var st in _fileStates.Values)
-        {
-            if (!string.Equals(st.Provider, provider, StringComparison.OrdinalIgnoreCase)) continue;
-            if (st.LatestActivity == null) continue;
-            if (IsActivityExpired(st.LatestActivity, now)) continue;
-
-            if (newest == null || st.LatestActivity.ObservedAt >= newest.ObservedAt)
-            {
-                newest = st.LatestActivity;
-            }
-        }
-
-        if (newest != null)
-        {
-            _providerActivity[provider] = newest;
-        }
-        else
-        {
-            _providerActivity.Remove(provider);
         }
     }
 
@@ -1760,19 +2058,27 @@ public sealed class SessionLogActivityCollector : IDisposable
 
     private IReadOnlyList<AgentSnapshot> BuildCurrentSnapshotsLocked(DateTimeOffset now)
     {
-        if (_providerActivity.Count == 0)
+        if (_fileStates.Count == 0)
             return Array.Empty<AgentSnapshot>();
 
-        var result = new List<AgentSnapshot>(_providerActivity.Count);
-        foreach (var (provider, act) in _providerActivity)
+        var result = new List<AgentSnapshot>(_fileStates.Count);
+        foreach (var (filePath, st) in _fileStates)
         {
+            DerivedSessionActivity? act = st.LatestActivity;
+            if (act == null)
+                continue;
+
             // Prompt freshness expiry: expired evidence is omitted so HqStateAggregator
             // falls back immediately to ProcessAgentCollector instead of masking it as Idle!
             if (IsActivityExpired(act, now))
                 continue;
 
+            string sessionId = !string.IsNullOrEmpty(st.SessionId)
+                ? st.SessionId
+                : ComputeSessionId(act.Provider, filePath);
+
             result.Add(new AgentSnapshot(
-                Id: $"session:{provider}",
+                Id: sessionId,
                 Name: act.DisplayName,
                 Role: AgentRole.External,
                 SpriteKey: "generic",
@@ -1781,10 +2087,13 @@ public sealed class SessionLogActivityCollector : IDisposable
                 LastActivityAt: act.ObservedAt,
                 UpdatedAt: act.ObservedAt,
                 Source: "session-log",
-                ProcessId: act.CorrelatedProcessId
+                ProcessId: act.CorrelatedProcessId,
+                ProcessStartTicks: act.CorrelatedProcessStartTicks
             ));
         }
 
+        // Order freshest-first by each session record's own event/write timestamp
+        result.Sort((a, b) => (b.UpdatedAt ?? DateTimeOffset.MinValue).CompareTo(a.UpdatedAt ?? DateTimeOffset.MinValue));
         return result;
     }
 
@@ -1799,6 +2108,46 @@ public sealed class SessionLogActivityCollector : IDisposable
             _ => AgentAppearanceRegistry.FormatProviderDisplayName(provider)
         };
     }
+
+    private static bool TryGetDirectoryIdentity(string directoryPath, out ulong volumeSerial, out ulong fileIndex)
+    {
+        volumeSerial = 0;
+        fileIndex = 0;
+        if (!OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(directoryPath))
+            return false;
+
+        try
+        {
+            using SafeFileHandle handle = CreateFileW(
+                directoryPath,
+                dwDesiredAccess: 0,
+                dwShareMode: FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                lpSecurityAttributes: IntPtr.Zero,
+                dwCreationDisposition: OPEN_EXISTING,
+                dwFlagsAndAttributes: FILE_FLAG_BACKUP_SEMANTICS,
+                hTemplateFile: IntPtr.Zero);
+
+            if (handle.IsInvalid)
+                return false;
+
+            if (!GetFileInformationByHandle(handle, out var info))
+                return false;
+
+            volumeSerial = info.VolumeSerialNumber;
+            fileIndex = ((ulong)info.FileIndexHigh << 32) | info.FileIndexLow;
+            return fileIndex != 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint FILE_SHARE_DELETE = 0x00000004;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct BY_HANDLE_FILE_INFORMATION
@@ -1821,4 +2170,14 @@ public sealed class SessionLogActivityCollector : IDisposable
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetFileInformationByHandle(SafeFileHandle hFile, out BY_HANDLE_FILE_INFORMATION lpFileInformation);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
 }

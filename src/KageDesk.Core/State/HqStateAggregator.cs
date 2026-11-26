@@ -821,12 +821,19 @@ public class HqStateAggregator
         var processOverrides = new Dictionary<string, AgentSnapshot>(StringComparer.OrdinalIgnoreCase);
         var matchedSessionLogKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        // Order session-log observations freshest-first by each record's own event/write timestamp
+        var orderedSessionLogs = new List<(string Key, AgentSnapshot Agent)>(_sessionLogAgents.Count);
         foreach (var (slKey, (slAgent, _)) in _sessionLogAgents)
         {
-            AgentSnapshot? verifiedMatch = null;
-            AgentSnapshot? singleProviderMatch = null;
-            int providerMatchCount = 0;
+            orderedSessionLogs.Add((slKey, slAgent));
+        }
+        orderedSessionLogs.Sort((a, b) =>
+            (b.Agent.UpdatedAt ?? b.Agent.LastActivityAt ?? DateTimeOffset.MinValue)
+                .CompareTo(a.Agent.UpdatedAt ?? a.Agent.LastActivityAt ?? DateTimeOffset.MinValue));
 
+        foreach (var (slKey, slAgent) in orderedSessionLogs)
+        {
+            AgentSnapshot? verifiedMatch = null;
             foreach (var proc in candidateProcesses)
             {
                 if (IsVerifiedSessionCorrelation(proc, slAgent))
@@ -834,26 +841,22 @@ public class HqStateAggregator
                     verifiedMatch = proc;
                     break;
                 }
-
-                if (MatchesSessionProvider(proc, slAgent))
-                {
-                    providerMatchCount++;
-                    singleProviderMatch = proc;
-                }
             }
 
-            // Correlate ONLY when identity is verified (PID / exact ID / workspace/repo) OR
-            // when exactly ONE process of that provider exists. Never overwrite multiple unrelated processes!
-            AgentSnapshot? targetProc = verifiedMatch ?? (providerMatchCount == 1 ? singleProviderMatch : null);
-            if (targetProc != null && !processOverrides.ContainsKey(targetProc.Id))
+            // Correlate ONLY when BOTH provider AND verified process identity (Pid + StartTimeTicks
+            // or verified session-workspace match) agree. NEVER overwrite an unrelated lone process!
+            if (verifiedMatch != null)
             {
-                processOverrides[targetProc.Id] = targetProc with
+                if (!processOverrides.ContainsKey(verifiedMatch.Id))
                 {
-                    State = slAgent.State,
-                    ToolName = slAgent.ToolName ?? targetProc.ToolName,
-                    LastActivityAt = slAgent.LastActivityAt ?? targetProc.LastActivityAt,
-                    UpdatedAt = slAgent.UpdatedAt ?? targetProc.UpdatedAt
-                };
+                    processOverrides[verifiedMatch.Id] = verifiedMatch with
+                    {
+                        State = slAgent.State,
+                        ToolName = slAgent.ToolName ?? verifiedMatch.ToolName,
+                        LastActivityAt = slAgent.LastActivityAt ?? verifiedMatch.LastActivityAt,
+                        UpdatedAt = slAgent.UpdatedAt ?? verifiedMatch.UpdatedAt
+                    };
+                }
                 matchedSessionLogKeys.Add(slKey);
             }
         }
@@ -863,11 +866,16 @@ public class HqStateAggregator
             mergedAgents[proc.Id] = processOverrides.TryGetValue(proc.Id, out var enriched) ? enriched : proc;
         }
 
-        // Include fresh uncorrelated session-log observations as one separate provider activity tile
-        // (unless already represented by an authoritative Orca/pushed agent or matched to a single process above)
-        foreach (var (slKey, (slAgent, _)) in _sessionLogAgents)
+        // Include fresh uncorrelated session-log observations as ONE separate provider activity tile
+        // (picking the freshest uncorrelated log per provider, never mutating unrelated live processes)
+        var emittedUncorrelatedProviders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (slKey, slAgent) in orderedSessionLogs)
         {
             if (matchedSessionLogKeys.Contains(slKey))
+                continue;
+
+            string providerKey = ExtractSessionProvider(slAgent);
+            if (!string.IsNullOrWhiteSpace(providerKey) && emittedUncorrelatedProviders.Contains(providerKey))
                 continue;
 
             bool alreadyRepresentedByAuthoritative = false;
@@ -890,6 +898,10 @@ public class HqStateAggregator
             if (!alreadyRepresentedByAuthoritative)
             {
                 mergedAgents[slAgent.Id] = slAgent;
+                if (!string.IsNullOrWhiteSpace(providerKey))
+                {
+                    emittedUncorrelatedProviders.Add(providerKey);
+                }
             }
         }
 
@@ -1201,17 +1213,42 @@ public class HqStateAggregator
 
     private static bool IsVerifiedSessionCorrelation(AgentSnapshot candidate, AgentSnapshot sessionAgent)
     {
-        if (sessionAgent.ProcessId.HasValue && candidate.ProcessId.HasValue &&
-            sessionAgent.ProcessId.Value > 0 &&
-            sessionAgent.ProcessId.Value == candidate.ProcessId.Value)
+        // ALWAYS verify provider match first — NEVER correlate across different providers even on reused PID!
+        if (!MatchesSessionProvider(candidate, sessionAgent))
+        {
+            return false;
+        }
+
+        bool sessionHasPid = sessionAgent.ProcessId.HasValue && sessionAgent.ProcessId.Value > 0;
+        bool sessionHasStartTicks = sessionAgent.ProcessStartTicks.HasValue && sessionAgent.ProcessStartTicks.Value > 0;
+        bool candidateHasPid = candidate.ProcessId.HasValue && candidate.ProcessId.Value > 0;
+        bool candidateHasStartTicks = candidate.ProcessStartTicks.HasValue && candidate.ProcessStartTicks.Value > 0;
+
+        // Verified PID + StartTimeTicks identity check (NEVER match a bare PID without verifying start generation!)
+        if (sessionHasPid && sessionHasStartTicks && candidateHasPid && candidateHasStartTicks)
+        {
+            return sessionAgent.ProcessId!.Value == candidate.ProcessId!.Value &&
+                   sessionAgent.ProcessStartTicks!.Value == candidate.ProcessStartTicks!.Value;
+        }
+
+        // If session carried an explicit PID that contradicts the candidate's PID (or lacks verified start ticks when PIDs match),
+        // refuse to guess by bare PID.
+        if (sessionHasPid && candidateHasPid && sessionAgent.ProcessId!.Value != candidate.ProcessId!.Value)
+        {
+            return false;
+        }
+
+        // Verified session-workspace / repo match (when provider matches and process identity did not contradict)
+        if (!string.IsNullOrWhiteSpace(sessionAgent.WorktreeId) &&
+            !string.IsNullOrWhiteSpace(candidate.WorktreeId) &&
+            string.Equals(sessionAgent.WorktreeId, candidate.WorktreeId, StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
 
         if (!string.IsNullOrWhiteSpace(sessionAgent.Repo) &&
             !string.IsNullOrWhiteSpace(candidate.Repo) &&
-            string.Equals(sessionAgent.Repo, candidate.Repo, StringComparison.OrdinalIgnoreCase) &&
-            MatchesSessionProvider(candidate, sessionAgent))
+            string.Equals(sessionAgent.Repo, candidate.Repo, StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
@@ -1219,17 +1256,33 @@ public class HqStateAggregator
         return false;
     }
 
+    private static string ExtractSessionProvider(AgentSnapshot sessionAgent)
+    {
+        if (!string.IsNullOrWhiteSpace(sessionAgent.Id) &&
+            sessionAgent.Id.StartsWith("session:", StringComparison.OrdinalIgnoreCase))
+        {
+            string rest = sessionAgent.Id.Substring("session:".Length);
+            int colon = rest.IndexOf(':');
+            return colon > 0 ? rest.Substring(0, colon) : rest;
+        }
+
+        return sessionAgent.Name ?? string.Empty;
+    }
+
     private static bool MatchesSessionProvider(AgentSnapshot candidate, AgentSnapshot sessionAgent)
     {
-        string provider = sessionAgent.Id.StartsWith("session:", StringComparison.OrdinalIgnoreCase)
-            ? sessionAgent.Id.Substring("session:".Length)
-            : sessionAgent.Name;
-
+        string provider = ExtractSessionProvider(sessionAgent);
         if (string.IsNullOrWhiteSpace(provider)) return false;
 
         string name = candidate.Name ?? string.Empty;
         if (name.Equals(provider, StringComparison.OrdinalIgnoreCase) ||
             name.StartsWith(provider + " ", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(candidate.SpriteKey) &&
+            candidate.SpriteKey.Equals(provider, StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }

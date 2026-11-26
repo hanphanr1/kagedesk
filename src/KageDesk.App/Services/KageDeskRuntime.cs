@@ -46,6 +46,7 @@ public class KageDeskRuntime : IDisposable
     private Task? _gifExportTask;
 
     private readonly object _effectsLock = new();
+    private readonly object _mediaSyncLock = new();
     private MixiChillActivity? _pinnedMixiActivity;
     private string? _mixiSpeechText;
     private long _mixiPokeStartedTicks;
@@ -98,7 +99,7 @@ public class KageDeskRuntime : IDisposable
     public string BridgeToken => _bridgeToken;
     public UiSnapshot? LatestSnapshot => _latestSnapshot;
 
-    public KageDeskRuntime(ConfigStore? configStore = null, bool noWallpaper = false)
+    public KageDeskRuntime(ConfigStore? configStore = null, bool noWallpaper = false, IMediaPlaybackProbe? mediaProbe = null)
     {
         _noWallpaperMode = noWallpaper;
         _configStore = configStore ?? new ConfigStore();
@@ -131,7 +132,7 @@ public class KageDeskRuntime : IDisposable
         _soundEngine.SetEnabled(_config.SoundEnabled);
         ApplyEffectiveAudioMute();
 
-        _mediaMonitor = new MediaSessionMonitor(enabled: _config.EnableMediaSync);
+        _mediaMonitor = new MediaSessionMonitor(enabled: _config.EnableMediaSync, probe: mediaProbe);
         _mediaMonitor.PlaybackChanged += OnMediaPlaybackChanged;
 
         InitCollectorsAndBridge();
@@ -170,11 +171,16 @@ public class KageDeskRuntime : IDisposable
             }
         }
 
+        // Always read authoritative lock-free effective state directly from MediaSessionMonitor
+        // so a late PlaybackChanged(true) callback can never re-enable animations after disable.
+        bool isMediaPlaying = _mediaMonitor.IsMediaPlaying;
+        _isMediaPlaying = isMediaPlaying;
+
         return new SceneEffectsState(
             PinnedMixiActivity: pinned,
             MixiSpeechText: speechText,
             MixiPokeElapsedSeconds: pokeElapsed,
-            IsMediaPlaying: _isMediaPlaying,
+            IsMediaPlaying: isMediaPlaying,
             WakeUpPulseRemainingSeconds: 0f);
     }
 
@@ -357,8 +363,43 @@ public class KageDeskRuntime : IDisposable
 
     private void OnMediaPlaybackChanged(object? sender, MediaPlaybackSnapshot snapshot)
     {
+        // Treat PlaybackChanged strictly as a wake/sync signal; never blindly trust the
+        // potentially stale callback snapshot payload over MediaSessionMonitor.IsMediaPlaying.
+        _ = snapshot;
+        SyncMediaPlayingFromMonitor();
+    }
+
+    internal void SetMediaSyncEnabledForTest(bool enabled)
+    {
+        SetMediaSyncEnabledInternal(enabled);
+    }
+
+    internal void SimulateMediaPlaybackCallbackForTest(MediaPlaybackSnapshot snapshot)
+    {
+        OnMediaPlaybackChanged(_mediaMonitor, snapshot);
+    }
+
+    private void SetMediaSyncEnabledInternal(bool enabled)
+    {
+        lock (_mediaSyncLock)
+        {
+            UpdateConfig(c => c.EnableMediaSync = enabled);
+            _mediaMonitor.SetEnabled(enabled);
+            _isMediaPlaying = _mediaMonitor.IsMediaPlaying;
+        }
+
+        RequestUiSync();
+    }
+
+    private void SyncMediaPlayingFromMonitor()
+    {
         if (_stopping || _disposed) return;
-        _isMediaPlaying = snapshot.IsPlaying;
+
+        lock (_mediaSyncLock)
+        {
+            _isMediaPlaying = _mediaMonitor.IsMediaPlaying;
+        }
+
         RequestUiSync();
     }
 
@@ -571,16 +612,7 @@ public class KageDeskRuntime : IDisposable
                     _aggregator.DisableAndClearCiBuilds();
                 }
             },
-            OnMediaSyncToggled = enabled =>
-            {
-                UpdateConfig(c => c.EnableMediaSync = enabled);
-                _mediaMonitor.SetEnabled(enabled);
-                if (!enabled)
-                {
-                    _isMediaPlaying = false;
-                    RequestUiSync();
-                }
-            },
+            OnMediaSyncToggled = SetMediaSyncEnabledInternal,
             OnSoundToggled = enabled => UpdateConfig(c => c.SoundEnabled = enabled),
             OnInstallHooks = () =>
             {

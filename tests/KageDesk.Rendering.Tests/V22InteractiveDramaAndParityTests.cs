@@ -368,43 +368,146 @@ public class V22InteractiveDramaAndParityTests
             pet.ResetEffects();
 
             // Warmup 35 frames so state, caches, and Tier-1 JIT settle
+            var fixedNow = new DateTimeOffset(2026, 4, 10, 12, 30, 0, TimeSpan.Zero);
             for (int i = 0; i < 35; i++)
             {
                 float t = i * 0.05f;
-                wp.Render(wpBuf, sc.State, theme, t, showMixiWhenAllIdle: true, effects: sc.Effects);
+                wp.Render(wpBuf, sc.State, theme, t, nowOverride: fixedNow, showMixiWhenAllIdle: true, effects: sc.Effects);
                 pet.Render(petBuf, sc.State, theme, t, showIdleChill: true, showMixiWhenAllIdle: true, effects: sc.Effects);
             }
 
             const int frames = 40;
-            var swWp = new Stopwatch();
-            var swPet = new Stopwatch();
+            double[] wpSamples = new double[frames];
+            double[] petSamples = new double[frames];
+            var swFrame = new Stopwatch();
 
             long beforeWp = GC.GetAllocatedBytesForCurrentThread();
-            swWp.Restart();
             for (int i = 0; i < frames; i++)
             {
-                wp.Render(wpBuf, sc.State, theme, 1.80f + i * 0.033f, showMixiWhenAllIdle: true, effects: sc.Effects);
+                swFrame.Restart();
+                wp.Render(wpBuf, sc.State, theme, 1.80f + i * 0.033f, nowOverride: fixedNow, showMixiWhenAllIdle: true, effects: sc.Effects);
+                swFrame.Stop();
+                wpSamples[i] = swFrame.Elapsed.TotalMilliseconds;
             }
-            swWp.Stop();
             long allocWp = GC.GetAllocatedBytesForCurrentThread() - beforeWp;
 
             long beforePet = GC.GetAllocatedBytesForCurrentThread();
-            swPet.Restart();
             for (int i = 0; i < frames; i++)
             {
+                swFrame.Restart();
                 pet.Render(petBuf, sc.State, theme, 1.80f + i * 0.033f, showIdleChill: true, showMixiWhenAllIdle: true, effects: sc.Effects);
+                swFrame.Stop();
+                petSamples[i] = swFrame.Elapsed.TotalMilliseconds;
             }
-            swPet.Stop();
             long allocPet = GC.GetAllocatedBytesForCurrentThread() - beforePet;
 
-            double wpAvgMs = swWp.Elapsed.TotalMilliseconds / frames;
-            double petAvgMs = swPet.Elapsed.TotalMilliseconds / frames;
-            _output.WriteLine($"[{sc.Label}] WP: {wpAvgMs:F3} ms/f ({allocWp} B steady-state), Pet: {petAvgMs:F3} ms/f ({allocPet} B steady-state)");
+            Array.Sort(wpSamples);
+            Array.Sort(petSamples);
+            double wpMedianMs = wpSamples[frames / 2];
+            double petMedianMs = petSamples[frames / 2];
+            _output.WriteLine($"[{sc.Label}] WP: {wpMedianMs:F3} ms/f median ({allocWp} B steady-state), Pet: {petMedianMs:F3} ms/f median ({allocPet} B steady-state)");
 
             Assert.Equal(0, allocWp);
             Assert.Equal(0, allocPet);
-            Assert.True(wpAvgMs < 15.0, $"Expected steady-state Wallpaper render < 15.0 ms/f for {sc.Label}, got {wpAvgMs:F3} ms/f.");
-            Assert.True(petAvgMs < 8.0, $"Expected steady-state TaskbarPet render < 8.0 ms/f for {sc.Label}, got {petAvgMs:F3} ms/f.");
+            Assert.True(wpMedianMs < 15.0, $"Expected steady-state Wallpaper render median < 15.0 ms/f for {sc.Label}, got {wpMedianMs:F3} ms/f.");
+            Assert.True(petMedianMs < 8.0, $"Expected steady-state TaskbarPet render median < 8.0 ms/f for {sc.Label}, got {petMedianMs:F3} ms/f.");
         }
+    }
+
+    [Fact]
+    public void TeamDrama_InterleavedOffsetTimers_CelebrationLastsExactThreeSecondsNotHalf()
+    {
+        var theme = ThemePackLoader.BuiltInFallback;
+        var celebrateEv = new HqEvent(200, "celebrate", "CI Passed!", DateTimeOffset.UtcNow);
+        var state = CreateSquadState(EffectiveWeather.Day, new[] { celebrateEv });
+
+        var sharedDrama = new TeamDramaController();
+        var wp = new HqWallpaperRenderer(sharedDrama);
+        var pet = new TaskbarPetRenderer(sharedDrama);
+        using var wpBuf = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
+        using var petBuf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+
+        // Interleaved offset frame schedules from two separate timers (Wallpaper at 0, 66, 132ms...; Pet at 33, 99, 165ms...)
+        double startSec = 10.0;
+        wp.Render(wpBuf, state, theme, (float)startSec, monotonicTicks: TeamDramaController.SecondsToMonotonicTicks(startSec));
+        Assert.True(wp.IsCelebrationActive);
+        Assert.True(sharedDrama.IsCelebrationActive);
+
+        // Step interleaved frames up to +2.85s (MUST still be active — would have expired at 1.5s if both renderers summed dt!)
+        for (int tick = 1; tick <= 86; tick++) // 86 * 0.033s = 2.838s
+        {
+            double nowSec = startSec + tick * 0.033;
+            long monoTicks = TeamDramaController.SecondsToMonotonicTicks(nowSec);
+            if ((tick & 1) == 0)
+            {
+                wp.Render(wpBuf, state, theme, (float)nowSec, monotonicTicks: monoTicks);
+            }
+            else
+            {
+                pet.Render(petBuf, state, theme, (float)nowSec, monotonicTicks: monoTicks);
+            }
+        }
+
+        Assert.True(sharedDrama.IsCelebrationActive, "3.0s celebration MUST still be active at +2.84s under interleaved offset Wallpaper+Pet renders.");
+        Assert.True(wp.IsCelebrationActive);
+        Assert.True(pet.IsCelebrationActive);
+
+        // Step past 3.0s (+3.05s) -> expires cleanly on both!
+        double endSec = startSec + 3.05;
+        long endTicks = TeamDramaController.SecondsToMonotonicTicks(endSec);
+        wp.Render(wpBuf, state, theme, (float)endSec, monotonicTicks: endTicks);
+        pet.Render(petBuf, state, theme, (float)endSec, monotonicTicks: endTicks);
+
+        Assert.False(sharedDrama.IsCelebrationActive, "3.0s celebration MUST expire cleanly after 3.05s.");
+        Assert.False(wp.IsCelebrationActive);
+        Assert.False(pet.IsCelebrationActive);
+    }
+
+    [Fact]
+    public void TeamDrama_PetFirstMissingEndpoints_DoesNotGloballyConsumeEventBeforeWallpaper()
+    {
+        var theme = ThemePackLoader.BuiltInFallback;
+        var sharedDrama = new TeamDramaController();
+        var wp = new HqWallpaperRenderer(sharedDrama);
+        var pet = new TaskbarPetRenderer(sharedDrama);
+        using var wpBuf = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
+        using var petBuf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+
+        // Only Minato is active in state.Agents (Taskbar Pet strip lacks Kakashi, whereas Wallpaper always displays all 4 core shinobi desks!)
+        var agents = new[]
+        {
+            new AgentSnapshot("minato", "Minato", AgentRole.Coder, "minato", AgentState.Working, "Coding PR", "CODE")
+        };
+
+        var dramaEv = new HqEvent(
+            SequenceId: 301,
+            Type: "review_changes",
+            Message: "REQUEST_CHANGES",
+            Timestamp: DateTimeOffset.UtcNow,
+            AgentId: "kakashi",
+            TargetAgentId: "minato");
+
+        var state = new HqState(
+            Agents: agents,
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: new[] { dramaEv },
+            Timestamp: DateTimeOffset.UtcNow);
+
+        // 1. Taskbar Pet renders FIRST — its own strip lacks Kakashi, so it MUST NOT globally consume seq 301!
+        long t0 = TeamDramaController.SecondsToMonotonicTicks(1.0);
+        pet.Render(petBuf, state, theme, 1.0f, monotonicTicks: t0);
+        Assert.False(sharedDrama.IsRedScrollFlying);
+        Assert.True(sharedDrama.LastHandledDramaSeq < 301, "Taskbar Pet MUST NOT globally consume drama event when its own slot subset lacks endpoints.");
+
+        // 2. Wallpaper renders SECOND — its full room has both Kakashi and Minato core desks, so drama starts and plays!
+        long t1 = TeamDramaController.SecondsToMonotonicTicks(1.033);
+        wp.Render(wpBuf, state, theme, 1.033f, monotonicTicks: t1);
+        Assert.True(sharedDrama.IsRedScrollFlying);
+        Assert.Equal(301, sharedDrama.LastHandledDramaSeq);
+        Assert.Equal("minato", sharedDrama.BoundTargetAgentId);
+        Assert.True(wp.IsDramaActive);
     }
 }

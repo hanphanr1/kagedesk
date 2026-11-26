@@ -1,7 +1,29 @@
+using System.Diagnostics;
 using KageDesk.Core.Models;
 using KageDesk.Rendering.Canvas;
 
 namespace KageDesk.Rendering.Sprites;
+
+/// <summary>
+/// Zero-allocation read-only snapshot of central TeamDramaController visual state
+/// consumed independently by HqWallpaperRenderer and TaskbarPetRenderer.
+/// </summary>
+public readonly record struct DramaEffectSnapshot(
+    bool IsRedScrollFlying,
+    float ScrollProgress,
+    bool IsPanicSprintActive,
+    bool IsImpactFlashActive,
+    bool IsCelebrationActive,
+    string? BoundFromAgentId,
+    string? BoundFromSpriteKey,
+    string? BoundTargetAgentId,
+    string? BoundTargetSpriteKey,
+    int CelebrationBurstSeq,
+    int ImpactEventSeq
+)
+{
+    public bool IsDramaActive => IsRedScrollFlying || IsPanicSprintActive;
+}
 
 /// <summary>
 /// Zero-allocation shared controller for KageDesk v2.2 Real Team Bot Drama:
@@ -9,8 +31,10 @@ namespace KageDesk.Rendering.Sprites;
 ///    to ONE single bound target actor, triggering a 6-second Panic Sprint (sweat drops, 2x typing, sparks).
 /// 2) Squad Celebration: 3-second coordinated celebratory hop + falling pixel confetti across
 ///    both Wallpaper HQ and Taskbar Pet.
-/// Supports being shared by both HqWallpaperRenderer and TaskbarPetRenderer with synchronized single-advance
-/// timeline stepping and per-canvas overlay coordinates.
+/// Advances strictly ONCE against a single monotonic clock timestamp (AdvanceTo(long monotonicTicks))
+/// so interleaved Wallpaper + Taskbar Pet WinForms timers NEVER double-tick durations, and exposes a
+/// read-only DramaEffectSnapshot so renderers never clobber shared coordinates or prematurely consume
+/// events that another renderer can display.
 /// </summary>
 public sealed class TeamDramaController
 {
@@ -30,10 +54,6 @@ public sealed class TeamDramaController
 
     private bool _scrollActive;
     private float _scrollElapsed;
-    private float _fromX;
-    private float _fromY;
-    private float _toX;
-    private float _toY;
 
     // Active drama request metadata (never overwritten until a new drama resolves cleanly)
     private string? _dramaFromId;
@@ -49,16 +69,16 @@ public sealed class TeamDramaController
 
     private float _panicRemaining;
     private float _impactFlashRemaining;
-    private int _impactX;
-    private int _impactY;
     private float _celebrationRemaining;
 
-    // Shared-instance timeline deduplication across Wallpaper + Taskbar Pet
-    private float _lastAdvanceTimeSeconds = float.NaN;
-    private int _lastAdvanceRendererToken = -1;
-    private int _timelineEpoch;
-    private int _impactEpoch = -1;
-    private int _celebrateBurstEpoch = -1;
+    // Single monotonic timeline clock shared across all renderers
+    private long _lastMonotonicTicks = -1;
+    private int _celebrationBurstSeq;
+    private int _impactEventSeq;
+
+    // Fallback sequence cursors used only by legacy direct Update() callers
+    private int _legacyCelebrateBurstSeen;
+    private int _legacyImpactEventSeen;
 
     public long LastHandledDramaSeq => _lastHandledDramaSeq;
     public long LastHandledCelebrateSeq => _lastHandledCelebrateSeq;
@@ -66,6 +86,8 @@ public sealed class TeamDramaController
     public bool IsPanicSprintActive => _panicRemaining > 0f;
     public bool IsDramaActive => _scrollActive || _panicRemaining > 0f;
     public bool IsCelebrationActive => _celebrationRemaining > 0f;
+    public float CelebrationRemainingSeconds => _celebrationRemaining;
+    public float PanicRemainingSeconds => _panicRemaining;
     public string? DramaFromAgentId => _dramaFromId;
     public string? DramaToAgentId => _dramaToId;
     public bool DramaFromIsConcreteId => _dramaFromConcrete;
@@ -73,6 +95,13 @@ public sealed class TeamDramaController
     public string? BoundFromAgentId => _boundFromAgentId;
     public string? BoundTargetAgentId => _boundTargetAgentId;
     public string? BoundTargetSpriteKey => _boundTargetSpriteKey;
+
+    public static long SecondsToMonotonicTicks(double seconds)
+    {
+        if (double.IsNaN(seconds) || double.IsInfinity(seconds) || seconds <= 0.0)
+            return 0L;
+        return (long)Math.Round(seconds * Stopwatch.Frequency);
+    }
 
     public void Reset()
     {
@@ -91,11 +120,93 @@ public sealed class TeamDramaController
         _panicRemaining = 0f;
         _impactFlashRemaining = 0f;
         _celebrationRemaining = 0f;
-        _lastAdvanceTimeSeconds = float.NaN;
-        _lastAdvanceRendererToken = -1;
-        _timelineEpoch = 0;
-        _impactEpoch = -1;
-        _celebrateBurstEpoch = -1;
+        _lastMonotonicTicks = -1;
+        _celebrationBurstSeq = 0;
+        _impactEventSeq = 0;
+        _legacyCelebrateBurstSeen = 0;
+        _legacyImpactEventSeen = 0;
+    }
+
+    /// <summary>
+    /// Returns a zero-allocation read-only snapshot of all currently active drama/celebration effects.
+    /// </summary>
+    public DramaEffectSnapshot GetSnapshot() => new(
+        IsRedScrollFlying: _scrollActive,
+        ScrollProgress: _scrollActive ? Math.Clamp(_scrollElapsed / ScrollFlightDuration, 0f, 1f) : 0f,
+        IsPanicSprintActive: _panicRemaining > 0f,
+        IsImpactFlashActive: _impactFlashRemaining > 0f,
+        IsCelebrationActive: _celebrationRemaining > 0f,
+        BoundFromAgentId: _boundFromAgentId,
+        BoundFromSpriteKey: _boundFromSpriteKey,
+        BoundTargetAgentId: _boundTargetAgentId,
+        BoundTargetSpriteKey: _boundTargetSpriteKey,
+        CelebrationBurstSeq: _celebrationBurstSeq,
+        ImpactEventSeq: _impactEventSeq);
+
+    /// <summary>
+    /// Advances all active drama/celebration timers ONCE against a single monotonic clock timestamp.
+    /// Computes dt = max(0, now - _lastMonotonicTicks) / Stopwatch.Frequency, so interleaved calls from
+    /// independent Wallpaper and Taskbar Pet WinForms timers NEVER double-tick durations!
+    /// </summary>
+    public float AdvanceTo(long monotonicTicks)
+    {
+        if (monotonicTicks < 0) monotonicTicks = 0;
+
+        if (_lastMonotonicTicks < 0)
+        {
+            _lastMonotonicTicks = monotonicTicks;
+            return 0f;
+        }
+
+        long deltaTicks = monotonicTicks - _lastMonotonicTicks;
+        if (deltaTicks <= 0)
+        {
+            return 0f;
+        }
+
+        _lastMonotonicTicks = monotonicTicks;
+        float dt = (float)((double)deltaTicks / Stopwatch.Frequency);
+        if (dt > 0.2f) dt = 0.2f;
+
+        // 1. Advance red scroll parabolic flight
+        if (_scrollActive)
+        {
+            _scrollElapsed += dt;
+            if (_scrollElapsed >= ScrollFlightDuration)
+            {
+                _scrollActive = false;
+                _panicRemaining = PanicSprintDuration;
+                _impactFlashRemaining = 1.2f;
+                _impactEventSeq++;
+            }
+        }
+
+        // 2. Advance 6-second Panic Sprint
+        if (_panicRemaining > 0f)
+        {
+            _panicRemaining = MathF.Max(0f, _panicRemaining - dt);
+            if (_panicRemaining <= 0f)
+            {
+                // Clear stale bound actor once Panic Sprint completes
+                _boundFromAgentId = null;
+                _boundFromSpriteKey = null;
+                _boundTargetAgentId = null;
+                _boundTargetSpriteKey = null;
+            }
+        }
+
+        if (_impactFlashRemaining > 0f)
+        {
+            _impactFlashRemaining = MathF.Max(0f, _impactFlashRemaining - dt);
+        }
+
+        // 3. Advance 3-second Squad Celebration
+        if (_celebrationRemaining > 0f)
+        {
+            _celebrationRemaining = MathF.Max(0f, _celebrationRemaining - dt);
+        }
+
+        return dt;
     }
 
     /// <summary>
@@ -103,8 +214,11 @@ public sealed class TeamDramaController
     /// </summary>
     public void StartCelebrationWindow()
     {
+        if (_celebrationRemaining >= CelebrationDuration - 0.15f)
+            return;
+
         _celebrationRemaining = CelebrationDuration;
-        _celebrateBurstEpoch = _timelineEpoch;
+        _celebrationBurstSeq++;
     }
 
     public bool TryGetPendingDramaEvent(HqState state, out HqEvent pending)
@@ -141,32 +255,147 @@ public sealed class TeamDramaController
         return false;
     }
 
-    public void MarkDramaEventHandled(long seqId)
-    {
-        if (seqId > _lastHandledDramaSeq)
-            _lastHandledDramaSeq = seqId;
-    }
-
     /// <summary>
     /// Returns true ONLY for the single concrete bound target actor of the active Panic Sprint.
     /// </summary>
     public bool IsSlotInPanicSprint(string? agentId, string spriteKey)
     {
         if (_panicRemaining <= 0f) return false;
+        return MatchesBoundActor(agentId, spriteKey, _boundTargetAgentId, _boundTargetSpriteKey);
+    }
 
-        if (!string.IsNullOrEmpty(_boundTargetAgentId))
+    public static bool IsSlotInPanicSprint(in DramaEffectSnapshot snapshot, string? agentId, string spriteKey)
+    {
+        if (!snapshot.IsPanicSprintActive) return false;
+        return MatchesBoundActor(agentId, spriteKey, snapshot.BoundTargetAgentId, snapshot.BoundTargetSpriteKey);
+    }
+
+    private static bool MatchesBoundActor(string? agentId, string spriteKey, string? boundAgentId, string? boundSpriteKey)
+    {
+        if (!string.IsNullOrEmpty(boundAgentId))
         {
             return !string.IsNullOrEmpty(agentId) &&
-                   string.Equals(agentId, _boundTargetAgentId, StringComparison.OrdinalIgnoreCase);
+                   string.Equals(agentId, boundAgentId, StringComparison.OrdinalIgnoreCase);
         }
 
-        if (!string.IsNullOrEmpty(_boundTargetSpriteKey))
+        if (!string.IsNullOrEmpty(boundSpriteKey))
         {
             return string.IsNullOrEmpty(agentId) &&
-                   string.Equals(spriteKey, _boundTargetSpriteKey, StringComparison.OrdinalIgnoreCase);
+                   string.Equals(spriteKey, boundSpriteKey, StringComparison.OrdinalIgnoreCase);
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Advances the single monotonic timeline to <paramref name="monotonicTicks"/>, centrally resolves
+    /// pending drama/celebration events (ONLY consuming a drama event when BOTH endpoints actually resolve
+    /// so a renderer with a subset of slots can NEVER globally swallow an event before another renderer sees it!),
+    /// and returns a pure read-only <see cref="DramaEffectSnapshot"/>.
+    /// </summary>
+    public DramaEffectSnapshot AdvanceAndConsume(
+        long monotonicTicks,
+        HqState state,
+        ReadOnlySpan<SlotBinding> slots,
+        bool allowConsumeDrama = true,
+        bool allowConsumeCelebrate = true)
+    {
+        // 1. Advance existing timers once against the single monotonic clock
+        AdvanceTo(monotonicTicks);
+
+        // 2. Scan for new review_changes / drama & celebrate events
+        var events = state.PendingVisualEvents;
+        for (int i = 0; i < events.Count; i++)
+        {
+            var e = events[i];
+            if (allowConsumeDrama && e.SequenceId > _lastHandledDramaSeq && IsDramaEventType(e.Type))
+            {
+                // ONLY mark consumed if endpoints actually resolved in this slot set!
+                // If this renderer's subset of slots lacked the endpoints, leave it unconsumed so
+                // the full-scene renderer (e.g. Wallpaper HQ) still receives and plays it!
+                if (TryStartRedScrollThrow(e, slots))
+                {
+                    _lastHandledDramaSeq = e.SequenceId;
+                }
+            }
+            else if (allowConsumeCelebrate && e.SequenceId > _lastHandledCelebrateSeq && IsCelebrateEventType(e.Type))
+            {
+                _lastHandledCelebrateSeq = e.SequenceId;
+                _celebrationRemaining = CelebrationDuration;
+                _celebrationBurstSeq++;
+            }
+        }
+
+        // Demo Studio -> celebrate keeps celebration gently topped up during demo preview
+        if (string.Equals(state.DemoScenario, "celebrate", StringComparison.OrdinalIgnoreCase) && _celebrationRemaining < 0.5f)
+        {
+            _celebrationRemaining = CelebrationDuration;
+        }
+
+        return GetSnapshot();
+    }
+
+    /// <summary>
+    /// Pure read-only local particle emission for a renderer reading <paramref name="snapshot"/>.
+    /// Never mutates TeamDramaController state or shared coordinates!
+    /// </summary>
+    public static void EmitLocalParticles(
+        in DramaEffectSnapshot snapshot,
+        ReadOnlySpan<SlotBinding> slots,
+        ParticleSystem particles,
+        int canvasWidth,
+        int confettiMinX,
+        int confettiMaxX,
+        int confettiTopY,
+        bool emitTick,
+        ref int lastSeenCelebrateBurstSeq,
+        ref int lastSeenImpactEventSeq)
+    {
+        if (snapshot.CelebrationBurstSeq != lastSeenCelebrateBurstSeq)
+        {
+            lastSeenCelebrateBurstSeq = snapshot.CelebrationBurstSeq;
+            if (snapshot.IsCelebrationActive)
+            {
+                particles.EmitCelebrationConfettiShower(confettiMinX, confettiMaxX, confettiTopY, count: 22);
+            }
+        }
+
+        if (snapshot.IsRedScrollFlying && emitTick)
+        {
+            ResolveScrollEndpoints(in snapshot, slots, canvasWidth, out float fx, out float fy, out float tx, out float ty);
+            ComputeScrollPosition(fx, fy, tx, ty, snapshot.ScrollProgress, out float sx, out float sy);
+            particles.Emit(ParticleKind.Spark, sx, sy, 0f, -6f, 0.25f, CrimsonBright, 1);
+        }
+
+        if (snapshot.ImpactEventSeq != lastSeenImpactEventSeq)
+        {
+            lastSeenImpactEventSeq = snapshot.ImpactEventSeq;
+            if (snapshot.IsImpactFlashActive || snapshot.IsPanicSprintActive)
+            {
+                ResolveTargetImpactPoint(in snapshot, slots, canvasWidth, out int ix, out int iy);
+                particles.EmitSparks(ix, iy, 6);
+                particles.EmitSweatDrops(ix, iy - 6, 4);
+            }
+        }
+
+        if (snapshot.IsPanicSprintActive && emitTick)
+        {
+            for (int i = 0; i < slots.Length; i++)
+            {
+                ref readonly var s = ref slots[i];
+                if (IsSlotInPanicSprint(in snapshot, s.AgentId, s.SpriteKey))
+                {
+                    particles.EmitSweatDrops(s.CenterX, s.DeskY - 18, 2);
+                    particles.EmitSparks(s.CenterX, s.DeskY - 6, 3);
+                    break;
+                }
+            }
+        }
+
+        if (snapshot.IsCelebrationActive && emitTick)
+        {
+            particles.EmitCelebrationConfettiShower(confettiMinX, confettiMaxX, confettiTopY, count: 6);
+        }
     }
 
     public void Update(
@@ -184,155 +413,22 @@ public sealed class TeamDramaController
         bool allowConsumeCelebrate = true,
         int rendererToken = 0)
     {
-        if (dt < 0f) dt = 0f;
-        if (dt > 0.2f) dt = 0.2f;
+        _ = dt;
+        _ = rendererToken;
 
-        // When shared between Wallpaper (token=1) and TaskbarPet (token=2), advance timers at most once per
-        // render timestamp while still allowing each renderer to emit local particles to its own ParticleSystem.
-        bool alreadyAdvancedThisTimestamp =
-            rendererToken != 0 &&
-            _lastAdvanceRendererToken != 0 &&
-            _lastAdvanceRendererToken != rendererToken &&
-            !float.IsNaN(_lastAdvanceTimeSeconds) &&
-            MathF.Abs(timeSeconds - _lastAdvanceTimeSeconds) <= 0.0005f;
-
-        if (!alreadyAdvancedThisTimestamp)
-        {
-            _lastAdvanceTimeSeconds = timeSeconds;
-            _lastAdvanceRendererToken = rendererToken;
-            _timelineEpoch++;
-
-            // 1. Scan for new review_changes / drama & celebrate events (respecting consumption gates)
-            var events = state.PendingVisualEvents;
-            for (int i = 0; i < events.Count; i++)
-            {
-                var e = events[i];
-                if (allowConsumeDrama && e.SequenceId > _lastHandledDramaSeq && IsDramaEventType(e.Type))
-                {
-                    _lastHandledDramaSeq = e.SequenceId;
-                    TryStartRedScrollThrow(e, slots);
-                }
-                else if (allowConsumeCelebrate && e.SequenceId > _lastHandledCelebrateSeq && IsCelebrateEventType(e.Type))
-                {
-                    _lastHandledCelebrateSeq = e.SequenceId;
-                    _celebrationRemaining = CelebrationDuration;
-                    _celebrateBurstEpoch = _timelineEpoch;
-                }
-            }
-
-            // Demo Studio -> celebrate keeps celebration gently topped up during demo preview
-            if (string.Equals(state.DemoScenario, "celebrate", StringComparison.OrdinalIgnoreCase) && _celebrationRemaining < 0.5f)
-            {
-                _celebrationRemaining = CelebrationDuration;
-            }
-
-            // 2. Advance red scroll parabolic flight
-            if (_scrollActive)
-            {
-                _scrollElapsed += dt;
-                if (_scrollElapsed >= ScrollFlightDuration)
-                {
-                    _scrollActive = false;
-                    _panicRemaining = PanicSprintDuration;
-                    _impactFlashRemaining = 1.2f;
-                    _impactEpoch = _timelineEpoch;
-                }
-            }
-
-            // 3. Advance 6-second Panic Sprint
-            if (_panicRemaining > 0f)
-            {
-                _panicRemaining = MathF.Max(0f, _panicRemaining - dt);
-                if (_panicRemaining <= 0f)
-                {
-                    // Clear stale bound actor once Panic Sprint completes
-                    _boundFromAgentId = null;
-                    _boundFromSpriteKey = null;
-                    _boundTargetAgentId = null;
-                    _boundTargetSpriteKey = null;
-                }
-            }
-
-            if (_impactFlashRemaining > 0f)
-            {
-                _impactFlashRemaining = MathF.Max(0f, _impactFlashRemaining - dt);
-            }
-
-            // 4. Advance 3-second Squad Celebration
-            if (_celebrationRemaining > 0f)
-            {
-                _celebrationRemaining = MathF.Max(0f, _celebrationRemaining - dt);
-            }
-        }
-        else if (allowConsumeDrama || allowConsumeCelebrate)
-        {
-            // Second renderer at the same timestamp: if the first renderer was gated from consuming
-            // (e.g. had no matching slots or was blocked), allow this renderer to consume pending events.
-            var events = state.PendingVisualEvents;
-            for (int i = 0; i < events.Count; i++)
-            {
-                var e = events[i];
-                if (allowConsumeDrama && e.SequenceId > _lastHandledDramaSeq && IsDramaEventType(e.Type))
-                {
-                    _lastHandledDramaSeq = e.SequenceId;
-                    TryStartRedScrollThrow(e, slots);
-                }
-                else if (allowConsumeCelebrate && e.SequenceId > _lastHandledCelebrateSeq && IsCelebrateEventType(e.Type))
-                {
-                    _lastHandledCelebrateSeq = e.SequenceId;
-                    _celebrationRemaining = CelebrationDuration;
-                    _celebrateBurstEpoch = _timelineEpoch;
-                }
-            }
-        }
-
-        // Per-renderer particle emission (safe for both standalone and shared instances)
-        if (_celebrateBurstEpoch == _timelineEpoch)
-        {
-            particles.EmitCelebrationConfettiShower(confettiMinX, confettiMaxX, confettiTopY, count: 22);
-        }
-
-        if (_scrollActive)
-        {
-            ResolveScrollEndpoints(slots, canvasWidth, out float fx, out float fy, out float tx, out float ty);
-            _fromX = fx;
-            _fromY = fy;
-            _toX = tx;
-            _toY = ty;
-            if (emitTick)
-            {
-                ComputeScrollPosition(fx, fy, tx, ty, Math.Clamp(_scrollElapsed / ScrollFlightDuration, 0f, 1f), out float sx, out float sy);
-                particles.Emit(ParticleKind.Spark, sx, sy, 0f, -6f, 0.25f, CrimsonBright, 1);
-            }
-        }
-
-        if (_impactEpoch == _timelineEpoch)
-        {
-            ResolveTargetImpactPoint(slots, canvasWidth, out int ix, out int iy);
-            _impactX = ix;
-            _impactY = iy;
-            particles.EmitSparks(ix, iy, 6);
-            particles.EmitSweatDrops(ix, iy - 6, 4);
-        }
-
-        if (_panicRemaining > 0f && emitTick)
-        {
-            for (int i = 0; i < slots.Length; i++)
-            {
-                ref readonly var s = ref slots[i];
-                if (IsSlotInPanicSprint(s.AgentId, s.SpriteKey))
-                {
-                    particles.EmitSweatDrops(s.CenterX, s.DeskY - 18, 2);
-                    particles.EmitSparks(s.CenterX, s.DeskY - 6, 3);
-                    break;
-                }
-            }
-        }
-
-        if (_celebrationRemaining > 0f && emitTick)
-        {
-            particles.EmitCelebrationConfettiShower(confettiMinX, confettiMaxX, confettiTopY, count: 6);
-        }
+        long ticks = SecondsToMonotonicTicks(timeSeconds);
+        DramaEffectSnapshot snapshot = AdvanceAndConsume(ticks, state, slots, allowConsumeDrama, allowConsumeCelebrate);
+        EmitLocalParticles(
+            in snapshot,
+            slots,
+            particles,
+            canvasWidth,
+            confettiMinX,
+            confettiMaxX,
+            confettiTopY,
+            emitTick,
+            ref _legacyCelebrateBurstSeen,
+            ref _legacyImpactEventSeen);
     }
 
     public void DrawOverlays(PixelBuffer buf, float timeSeconds) =>
@@ -340,10 +436,20 @@ public sealed class TeamDramaController
 
     public void DrawOverlays(PixelBuffer buf, float timeSeconds, ReadOnlySpan<SlotBinding> slots)
     {
-        if (_scrollActive)
+        DramaEffectSnapshot snapshot = GetSnapshot();
+        DrawOverlays(buf, timeSeconds, in snapshot, slots);
+    }
+
+    public static void DrawOverlays(
+        PixelBuffer buf,
+        float timeSeconds,
+        in DramaEffectSnapshot snapshot,
+        ReadOnlySpan<SlotBinding> slots)
+    {
+        if (snapshot.IsRedScrollFlying)
         {
-            ResolveScrollEndpoints(slots, buf.Width, out float fromX, out float fromY, out float toX, out float toY);
-            float t = Math.Clamp(_scrollElapsed / ScrollFlightDuration, 0f, 1f);
+            ResolveScrollEndpoints(in snapshot, slots, buf.Width, out float fromX, out float fromY, out float toX, out float toY);
+            float t = snapshot.ScrollProgress;
             ComputeScrollPosition(fromX, fromY, toX, toY, t, out float fx, out float fy);
             int x = Math.Clamp((int)fx, 6, buf.Width - 7);
             int y = Math.Clamp((int)fy, 6, buf.Height - 7);
@@ -384,9 +490,9 @@ public sealed class TeamDramaController
             }
         }
 
-        if (_impactFlashRemaining > 0f)
+        if (snapshot.IsImpactFlashActive)
         {
-            ResolveTargetImpactPoint(slots, buf.Width, out int impactX, out int impactY);
+            ResolveTargetImpactPoint(in snapshot, slots, buf.Width, out int impactX, out int impactY);
             int badgeW = 48;
             int badgeH = 11;
             int bx = Math.Clamp(impactX - badgeW / 2, 4, buf.Width - badgeW - 4);
@@ -428,16 +534,13 @@ public sealed class TeamDramaController
         _boundTargetAgentId = toSlot.AgentId;
         _boundTargetSpriteKey = toSlot.SpriteKey;
 
-        _fromX = fromSlot.CenterX;
-        _fromY = fromSlot.DeskY - 14;
-        _toX = toSlot.CenterX;
-        _toY = toSlot.DeskY - 14;
         _scrollActive = true;
         _scrollElapsed = 0f;
         return true;
     }
 
-    private void ResolveScrollEndpoints(
+    private static void ResolveScrollEndpoints(
+        in DramaEffectSnapshot snapshot,
         ReadOnlySpan<SlotBinding> slots,
         int canvasWidth,
         out float fromX,
@@ -445,40 +548,45 @@ public sealed class TeamDramaController
         out float toX,
         out float toY)
     {
-        if (TryFindBoundSlot(slots, _boundFromAgentId, _boundFromSpriteKey, out int fx, out int fy))
+        if (TryFindBoundSlot(slots, snapshot.BoundFromAgentId, snapshot.BoundFromSpriteKey, out int fx, out int fy))
         {
             fromX = fx;
             fromY = fy - 14;
         }
         else
         {
-            fromX = _fromX > 0f ? Math.Clamp(_fromX, 16, canvasWidth - 16) : Math.Min(canvasWidth - 28, 328);
-            fromY = _fromY > 0f ? _fromY : 90f;
+            fromX = Math.Min(canvasWidth - 28, 328);
+            fromY = 90f;
         }
 
-        if (TryFindBoundSlot(slots, _boundTargetAgentId, _boundTargetSpriteKey, out int tx, out int ty))
+        if (TryFindBoundSlot(slots, snapshot.BoundTargetAgentId, snapshot.BoundTargetSpriteKey, out int tx, out int ty))
         {
             toX = tx;
             toY = ty - 14;
         }
         else
         {
-            toX = _toX > 0f ? Math.Clamp(_toX, 16, canvasWidth - 16) : Math.Max(42, fromX - 120);
-            toY = _toY > 0f ? _toY : fromY;
+            toX = Math.Max(42, fromX - 120);
+            toY = fromY;
         }
     }
 
-    private void ResolveTargetImpactPoint(ReadOnlySpan<SlotBinding> slots, int canvasWidth, out int impactX, out int impactY)
+    private static void ResolveTargetImpactPoint(
+        in DramaEffectSnapshot snapshot,
+        ReadOnlySpan<SlotBinding> slots,
+        int canvasWidth,
+        out int impactX,
+        out int impactY)
     {
-        if (TryFindBoundSlot(slots, _boundTargetAgentId, _boundTargetSpriteKey, out int tx, out int ty))
+        if (TryFindBoundSlot(slots, snapshot.BoundTargetAgentId, snapshot.BoundTargetSpriteKey, out int tx, out int ty))
         {
             impactX = Math.Clamp(tx, 16, canvasWidth - 16);
             impactY = Math.Max(14, ty - 14);
             return;
         }
 
-        impactX = _impactX > 0 ? Math.Clamp(_impactX, 16, canvasWidth - 16) : Math.Clamp((int)_toX, 16, canvasWidth - 16);
-        impactY = _impactY > 0 ? Math.Max(14, _impactY) : Math.Max(14, (int)_toY);
+        impactX = Math.Clamp(canvasWidth / 2, 16, canvasWidth - 16);
+        impactY = 76;
     }
 
     private static void ComputeScrollPosition(float fromX, float fromY, float toX, float toY, float t, out float x, out float y)

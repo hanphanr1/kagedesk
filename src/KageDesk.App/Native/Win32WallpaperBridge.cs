@@ -202,7 +202,12 @@ public class Win32WallpaperBridge
             return false;
         }
 
-        Rectangle targetRect = ComputeHostClientRect(targetWorkerW, _targetMonitorDeviceName);
+        if (!TryComputeHostClientRect(targetWorkerW, _targetMonitorDeviceName, out Rectangle targetRect))
+        {
+            _statusReason = "Failed to map monitor bounds to WorkerW client coordinates";
+            RollbackAttach(form, formHandle);
+            return false;
+        }
 
         bool posOk = Win32Interop.SetWindowPos(
             formHandle,
@@ -264,7 +269,12 @@ public class Win32WallpaperBridge
             return false;
         }
 
-        Rectangle targetRect = ComputeHostClientRect(progman, _targetMonitorDeviceName);
+        if (!TryComputeHostClientRect(progman, _targetMonitorDeviceName, out Rectangle targetRect))
+        {
+            _statusReason = "Failed to map monitor bounds to Progman client coordinates";
+            RollbackAttach(form, formHandle);
+            return false;
+        }
 
         // Place directly below SHELLDLL_DefView
         bool posOk = Win32Interop.SetWindowPos(
@@ -301,7 +311,12 @@ public class Win32WallpaperBridge
             return false;
         }
 
-        Rectangle targetRect = ComputeHostClientRect(_hostHwnd, _targetMonitorDeviceName);
+        if (!TryComputeHostClientRect(_hostHwnd, _targetMonitorDeviceName, out Rectangle targetRect))
+        {
+            _statusReason = "Failed to map monitor bounds to host client coordinates; recovery required";
+            return false;
+        }
+
         return Win32Interop.SetWindowPos(
             _attachedHwnd,
             IntPtr.Zero,
@@ -312,25 +327,44 @@ public class Win32WallpaperBridge
             Win32Interop.SWP_NOZORDER | Win32Interop.SWP_NOACTIVATE | Win32Interop.SWP_SHOWWINDOW);
     }
 
-    private static Rectangle ComputeHostClientRect(IntPtr hostHwnd, string? targetMonitorDeviceName)
+    internal static bool TryComputeHostClientRect(
+        IntPtr hostHwnd,
+        string? targetMonitorDeviceName,
+        out Rectangle clientRect)
     {
         var monitor = MonitorLayoutHelper.ResolveMonitorFromSystem(targetMonitorDeviceName);
-        Rectangle virtualScreen = SystemInformation.VirtualScreen;
-        Rectangle virtualOffset = MonitorLayoutHelper.ComputeWallpaperVirtualOffset(monitor.Bounds, virtualScreen);
+        return TryComputeHostClientRect(hostHwnd, monitor.Bounds, out clientRect);
+    }
 
-        if (hostHwnd != IntPtr.Zero && Win32Interop.IsWindow(hostHwnd))
+    internal static bool TryComputeHostClientRect(
+        IntPtr hostHwnd,
+        Rectangle monitorBounds,
+        out Rectangle clientRect,
+        Func<IntPtr, bool>? isWindow = null,
+        Func<IntPtr, Win32Interop.RECT, (int Result, int LastError, Win32Interop.RECT Mapped)>? mapWindowPoints = null)
+    {
+        Func<IntPtr, bool> windowCheck = isWindow ?? Win32Interop.IsWindow;
+        if (hostHwnd == IntPtr.Zero || !windowCheck(hostHwnd))
         {
-            var rect = new Win32Interop.RECT(monitor.Bounds.Left, monitor.Bounds.Top, monitor.Bounds.Right, monitor.Bounds.Bottom);
-            Marshal.SetLastPInvokeError(0);
-            int mapResult = Win32Interop.MapWindowPoints(IntPtr.Zero, hostHwnd, ref rect, 2);
-            int lastError = Marshal.GetLastWin32Error();
-            if (TryResolveMappedRect(mapResult, lastError, rect, out Rectangle mapped))
-            {
-                return mapped;
-            }
+            clientRect = Rectangle.Empty;
+            return false;
         }
 
-        return virtualOffset;
+        var rect = new Win32Interop.RECT(monitorBounds.Left, monitorBounds.Top, monitorBounds.Right, monitorBounds.Bottom);
+        int mapResult;
+        int lastError;
+        if (mapWindowPoints != null)
+        {
+            (mapResult, lastError, rect) = mapWindowPoints(hostHwnd, rect);
+        }
+        else
+        {
+            Marshal.SetLastPInvokeError(0);
+            mapResult = Win32Interop.MapWindowPoints(IntPtr.Zero, hostHwnd, ref rect, 2);
+            lastError = Marshal.GetLastWin32Error();
+        }
+
+        return TryResolveMappedRect(mapResult, lastError, rect, out clientRect);
     }
 
     internal static bool TryResolveMappedRect(

@@ -1,7 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
 namespace KageDesk.Core.Hooks;
@@ -52,6 +52,7 @@ public sealed record HookOperationSummary(
 public sealed class HookInstaller
 {
     private const string EmitterMarkerPs1 = "kagedesk-emit.ps1";
+    private const string ProvenanceFileName = "provenance.json";
     private const string OpenCodePluginFileName = "kagedesk-plugin.js";
     private const string OpenCodePluginOwnershipMarker = "// kagedesk-managed-opencode-plugin:v1";
     private const string ClaudeApprovalNotificationMatcher = "permission_prompt|elicitation_dialog";
@@ -64,6 +65,9 @@ public sealed class HookInstaller
         '\0', '\r', '\n', '"', ';', '|', '&', '<', '>', '`', '$', '%'
     };
 
+    private static readonly UTF8Encoding Utf8NoBomStrict = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+    private static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
+
     private readonly string _userProfileDir;
     private readonly string _appDataDir;
     private readonly string? _codexHomeDir;
@@ -71,7 +75,8 @@ public sealed class HookInstaller
     private readonly Func<DateTimeOffset> _clock;
 
     /// <summary>
-    /// Internal test seam invoked immediately before snapshot revalidation & commit under the per-target lock.
+    /// Internal test seam invoked after staging/flushing the temp file and immediately before
+    /// final identity/content revalidation and commit under the per-target lock.
     /// </summary>
     internal Action<string>? BeforeCommitHookForTest { get; set; }
 
@@ -94,6 +99,8 @@ public sealed class HookInstaller
     }
 
     public string DefaultEmitterScriptPath => Path.Combine(_appDataDir, "hooks", EmitterMarkerPs1);
+
+    private string ProvenanceStorePath => Path.Combine(_appDataDir, "hooks", ProvenanceFileName);
 
     public string ResolveCodexHomeDirectory()
     {
@@ -160,7 +167,7 @@ public sealed class HookInstaller
         WithTargetLock(targetPath, () =>
         {
             ValidateNoReparsePointsInPath(targetPath);
-            byte[] desiredBytes = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(EmbeddedEmitterScript);
+            byte[] desiredBytes = Utf8NoBom.GetBytes(EmbeddedEmitterScript);
             if (File.Exists(targetPath))
             {
                 byte[] existing = File.ReadAllBytes(targetPath);
@@ -169,11 +176,11 @@ public sealed class HookInstaller
                     return;
                 }
 
-                WriteBytesAtomicWithReplace(targetPath, desiredBytes, backupPath: null, fileExisted: true);
+                WriteInternalBytesAtomic(targetPath, desiredBytes, fileExisted: true);
             }
             else
             {
-                WriteBytesAtomicWithReplace(targetPath, desiredBytes, backupPath: null, fileExisted: false);
+                WriteInternalBytesAtomic(targetPath, desiredBytes, fileExisted: false);
             }
         });
 
@@ -360,13 +367,14 @@ public sealed class HookInstaller
             {
                 ValidateNoReparsePointsInPath(pluginPath);
 
+                // Single read into before.OriginalBytes: validate ownership & equality from THAT EXACT buffer
                 FileSnapshot before = CaptureSnapshot(pluginPath);
                 string desiredContent = BuildOpenCodePluginSource(_bridgePort);
-                byte[] desiredBytes = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(desiredContent);
+                byte[] desiredBytes = Utf8NoBom.GetBytes(desiredContent);
 
                 if (before.Exists)
                 {
-                    byte[] existingBytes = File.ReadAllBytes(pluginPath);
+                    byte[] existingBytes = before.OriginalBytes!;
                     string existingText = Encoding.UTF8.GetString(existingBytes);
                     if (!IsOwnedOpenCodePlugin(existingText))
                     {
@@ -387,9 +395,8 @@ public sealed class HookInstaller
                     }
                 }
 
-                BeforeCommitHookForTest?.Invoke(pluginPath);
-
-                if (!MatchesSnapshot(pluginPath, before))
+                string? backupPath = before.Exists ? BuildUniqueBackupPath(pluginPath) : null;
+                if (!CommitBytesWithPreReplaceCheck(pluginPath, desiredBytes, backupPath, before))
                 {
                     return new HookTargetResult(
                         HookTargetKind.OpenCode,
@@ -397,9 +404,6 @@ public sealed class HookInstaller
                         HookActionStatus.Failed,
                         "OpenCode plugin file was modified concurrently; aborted to prevent clobbering changes.");
                 }
-
-                string? backupPath = before.Exists ? BuildUniqueBackupPath(pluginPath) : null;
-                WriteBytesAtomicWithReplace(pluginPath, desiredBytes, backupPath, before.Exists);
 
                 return new HookTargetResult(
                     HookTargetKind.OpenCode,
@@ -458,6 +462,8 @@ public sealed class HookInstaller
             return WithTargetLock(targetPlugin, () =>
             {
                 ValidateNoReparsePointsInPath(targetPlugin);
+
+                // Single read into before.OriginalBytes
                 FileSnapshot before = CaptureSnapshot(targetPlugin);
                 if (!before.Exists)
                 {
@@ -468,7 +474,7 @@ public sealed class HookInstaller
                         "No KageDesk OpenCode plugin found.");
                 }
 
-                string existingText = File.ReadAllText(targetPlugin, Encoding.UTF8);
+                string existingText = Encoding.UTF8.GetString(before.OriginalBytes!);
                 if (!IsOwnedOpenCodePlugin(existingText))
                 {
                     return new HookTargetResult(
@@ -511,6 +517,19 @@ public sealed class HookInstaller
         bool AsyncDispatch = false
     );
 
+    private sealed record LegacyHookFingerprint(
+        string EventKey,
+        string EventType,
+        string Message
+    );
+
+    private static readonly LegacyHookFingerprint[] LegacyHookFingerprints =
+    [
+        new LegacyHookFingerprint("PostToolUse", "tool_done", "Tool execution completed"),
+        new LegacyHookFingerprint("Notification", "notification", "Notification received"),
+        new LegacyHookFingerprint("Stop", "idle", "Agent stopped")
+    ];
+
     private static HookEventSpec[] GetClaudeHookSpecs() =>
     [
         new HookEventSpec("PreToolUse", "tool_start", "Tool execution started", Matcher: null, AsyncDispatch: true),
@@ -540,22 +559,64 @@ public sealed class HookInstaller
         return WithTargetLock(configPath, () =>
         {
             ValidateNoReparsePointsInPath(configPath);
-            FileSnapshot before = CaptureSnapshot(configPath);
 
-            var loadResult = LoadStrictJsonObject(configPath, before);
-            if (loadResult.ErrorStatus.HasValue)
+            // Single read into before.OriginalBytes; compute hash AND parse from THAT EXACT buffer
+            FileSnapshot before = CaptureSnapshot(configPath);
+            ContainerProvenance existingProv = LoadContainerProvenance(configPath);
+
+            if (!before.Exists)
             {
-                return new HookTargetResult(target, configPath, loadResult.ErrorStatus.Value, loadResult.ErrorMessage!);
+                byte[] freshBytes = BuildFreshHooksJsonDocument(specs, agentId, emitterScriptPath);
+                if (!CommitBytesWithPreReplaceCheck(configPath, freshBytes, backupPath: null, before))
+                {
+                    return new HookTargetResult(
+                        target,
+                        configPath,
+                        HookActionStatus.Failed,
+                        "Target config was created concurrently; aborted to prevent clobbering changes.");
+                }
+
+                var freshProv = new ContainerProvenance(
+                    CreatedHooksObject: true,
+                    CreatedEventKeys: new HashSet<string>(specs.Select(s => s.EventKey), StringComparer.Ordinal));
+                SaveContainerProvenance(configPath, freshProv);
+
+                string freshNote = extraNote == null ? "" : $" Note: {extraNote}";
+                return new HookTargetResult(
+                    target,
+                    configPath,
+                    HookActionStatus.Installed,
+                    $"Installed KageDesk hooks.{freshNote}");
             }
 
-            JsonObject root = loadResult.Root!;
-
-            // Preflight "hooks" property: distinguish absent vs explicit null vs non-object
-            JsonObject? existingHooks = null;
-            bool hooksWasAbsent = false;
-            if (root.TryGetPropertyValue("hooks", out JsonNode? hooksNode))
+            SpanParseResult parsed = ParseStrictJsonSpans(configPath, before.OriginalBytes!);
+            if (parsed.ErrorStatus.HasValue)
             {
-                if (hooksNode == null)
+                return new HookTargetResult(target, configPath, parsed.ErrorStatus.Value, parsed.ErrorMessage!);
+            }
+
+            JsonSpanObject root = parsed.Root!;
+            ReadOnlySpan<byte> body = before.OriginalBytes.AsSpan(parsed.BomLength);
+            JsonDocStyle style = DetectJsonDocStyle(body, root);
+
+            // Preflight "hooks" property (absent vs duplicate vs explicit null vs non-object)
+            if (!TryGetUniqueProperty(root, "hooks", out JsonSpanProperty? hooksProp, out bool duplicateHooks))
+            {
+                if (duplicateHooks)
+                {
+                    return new HookTargetResult(
+                        target,
+                        configPath,
+                        HookActionStatus.UnsupportedLayout,
+                        "Existing 'hooks' property appears multiple times; refused to modify user config.");
+                }
+            }
+
+            JsonSpanObject? existingHooks = null;
+            bool hooksWasAbsent = hooksProp == null;
+            if (hooksProp != null)
+            {
+                if (hooksProp.Value.TokenType == JsonTokenType.Null)
                 {
                     return new HookTargetResult(
                         target,
@@ -564,7 +625,7 @@ public sealed class HookInstaller
                         "Existing 'hooks' property is explicit null; refused to modify user config.");
                 }
 
-                if (hooksNode is not JsonObject obj)
+                if (hooksProp.Value is not JsonSpanObject hooksObj)
                 {
                     return new HookTargetResult(
                         target,
@@ -573,51 +634,151 @@ public sealed class HookInstaller
                         "Existing 'hooks' property is not a JSON object; refused to modify user config.");
                 }
 
-                existingHooks = obj;
+                existingHooks = hooksObj;
 
-                // Preflight ALL managed event keys before mutating anything
+                // Preflight ALL managed event keys before planning any edits
                 foreach (var spec in specs)
                 {
-                    if (existingHooks.TryGetPropertyValue(spec.EventKey, out JsonNode? eventNode))
+                    if (!TryGetUniqueProperty(existingHooks, spec.EventKey, out JsonSpanProperty? eventProp, out bool duplicateEvent))
                     {
-                        if (eventNode == null)
+                        if (duplicateEvent)
                         {
                             return new HookTargetResult(
                                 target,
                                 configPath,
                                 HookActionStatus.UnsupportedLayout,
-                                $"Managed hook event '{spec.EventKey}' is explicit null; refused to modify user config.");
+                                $"Managed hook event '{spec.EventKey}' appears multiple times; refused to modify user config.");
                         }
+                        continue;
+                    }
 
-                        if (eventNode is not JsonArray)
-                        {
-                            return new HookTargetResult(
-                                target,
-                                configPath,
-                                HookActionStatus.UnsupportedLayout,
-                                $"Managed hook event '{spec.EventKey}' is not a JSON array; refused to modify user config.");
-                        }
+                    if (eventProp!.Value.TokenType == JsonTokenType.Null)
+                    {
+                        return new HookTargetResult(
+                            target,
+                            configPath,
+                            HookActionStatus.UnsupportedLayout,
+                            $"Managed hook event '{spec.EventKey}' is explicit null; refused to modify user config.");
+                    }
+
+                    if (eventProp.Value is not JsonSpanArray)
+                    {
+                        return new HookTargetResult(
+                            target,
+                            configPath,
+                            HookActionStatus.UnsupportedLayout,
+                            $"Managed hook event '{spec.EventKey}' is not a JSON array; refused to modify user config.");
                     }
                 }
             }
+
+            var edits = new List<ByteEdit>();
+            bool createdHooksObjNow = hooksWasAbsent;
+            var createdEventKeysNow = new HashSet<string>(existingProv.CreatedEventKeys, StringComparer.Ordinal);
+            bool effectiveCreatedHooksObj = existingProv.CreatedHooksObject || createdHooksObjNow;
+
+            if (hooksWasAbsent)
+            {
+                foreach (var spec in specs)
+                {
+                    createdEventKeysNow.Add(spec.EventKey);
+                }
+
+                string rootChildIndent = GetChildIndentForObject(body, root, style);
+                string rootObjIndent = GetLineIndent(body, root.Start);
+                string hooksPropText = FormatHooksProperty(specs, agentId, emitterScriptPath, style, rootChildIndent);
+                AddInsertPropertyIntoObjectEdit(edits, body, root, hooksPropText, style, rootChildIndent, rootObjIndent);
+            }
             else
             {
-                hooksWasAbsent = true;
-            }
+                string hooksObjIndent = GetLineIndent(body, existingHooks!.Start);
+                string hooksChildIndent = GetChildIndentForObject(body, existingHooks, style);
 
-            JsonObject hooksObj = existingHooks ?? new JsonObject();
-            bool modified = false;
+                var specByKey = new Dictionary<string, HookEventSpec>(StringComparer.Ordinal);
+                foreach (var s in specs) specByKey[s.EventKey] = s;
 
-            foreach (var spec in specs)
-            {
-                string desiredCommand = BuildHookCommand(emitterScriptPath, spec.EventType, agentId, spec.Message);
-                if (UpsertHookEvent(hooksObj, spec, agentId, emitterScriptPath, desiredCommand))
+                var newEventPropsToAppend = new List<string>();
+                var deprecatedLegacyKeysToRemove = new HashSet<int>();
+
+                // Plan edits on existing properties in hooksObj
+                for (int pIdx = 0; pIdx < existingHooks.Properties.Count; pIdx++)
                 {
-                    modified = true;
+                    JsonSpanProperty prop = existingHooks.Properties[pIdx];
+                    if (specByKey.TryGetValue(prop.Name, out HookEventSpec? spec))
+                    {
+                        var eventArr = (JsonSpanArray)prop.Value;
+                        string desiredCmd = BuildHookCommand(emitterScriptPath, spec.EventType, agentId, spec.Message);
+                        PlanUpsertEventArrayEdits(edits, body, eventArr, spec, agentId, emitterScriptPath, desiredCmd, style);
+                    }
+                    else if (IsLegacyOnlyEventKey(prop.Name, specByKey) && prop.Value is JsonSpanArray legacyArr)
+                    {
+                        // E.g. Codex previously installed Notification; clean legacy KageDesk entries on upgrade!
+                        bool removeKey = PlanRemoveEntriesFromEventArrayEdits(
+                            edits,
+                            body,
+                            legacyArr,
+                            eventKey: prop.Name,
+                            currentSpec: null,
+                            agentId,
+                            emitterScriptPath,
+                            canRemoveEmptyEventKey: existingProv.CreatedEventKeys.Contains(prop.Name),
+                            out bool removedAny);
+                        if (removedAny && removeKey)
+                        {
+                            deprecatedLegacyKeysToRemove.Add(pIdx);
+                            createdEventKeysNow.Remove(prop.Name);
+                        }
+                    }
+                }
+
+                // Append missing managed event keys
+                foreach (var spec in specs)
+                {
+                    if (!HasProperty(existingHooks, spec.EventKey))
+                    {
+                        createdEventKeysNow.Add(spec.EventKey);
+                        string desiredCmd = BuildHookCommand(emitterScriptPath, spec.EventType, agentId, spec.Message);
+                        string propText = FormatEventProperty(spec, desiredCmd, style, hooksChildIndent);
+                        newEventPropsToAppend.Add(propText);
+                    }
+                }
+
+                if (deprecatedLegacyKeysToRemove.Count > 0)
+                {
+                    // Remove deprecated legacy keys from hooksObj (only when they became empty AND provenance allows)
+                    if (deprecatedLegacyKeysToRemove.Count == existingHooks.Properties.Count && newEventPropsToAppend.Count == 0)
+                    {
+                        edits.Add(new ByteEdit(existingHooks.Start + 1, existingHooks.CloseBraceIndex, Array.Empty<byte>()));
+                    }
+                    else if (deprecatedLegacyKeysToRemove.Count < existingHooks.Properties.Count)
+                    {
+                        AddRemoveObjectPropertiesEdits(edits, existingHooks, deprecatedLegacyKeysToRemove);
+                    }
+                }
+
+                if (newEventPropsToAppend.Count > 0)
+                {
+                    string combined = string.Join(
+                        style.IsCompact ? "," : "," + style.NewLine + hooksChildIndent,
+                        newEventPropsToAppend);
+
+                    if (deprecatedLegacyKeysToRemove.Count == existingHooks.Properties.Count)
+                    {
+                        // Replacing all old deprecated keys with new ones
+                        string replacement = style.IsCompact
+                            ? combined
+                            : style.NewLine + hooksChildIndent + combined + style.NewLine + hooksObjIndent;
+                        edits.Add(new ByteEdit(existingHooks.Start + 1, existingHooks.CloseBraceIndex, Utf8NoBom.GetBytes(replacement)));
+                    }
+                    else
+                    {
+                        // Append after last property (if last property is being removed, insert after its FullEnd which is right after deletion range)
+                        AddInsertPropertyIntoObjectEdit(edits, body, existingHooks, combined, style, hooksChildIndent, hooksObjIndent);
+                    }
                 }
             }
 
-            if (!modified && before.Exists)
+            if (edits.Count == 0)
             {
                 string alreadyMsg = extraNote == null
                     ? "KageDesk hooks already installed and up to date."
@@ -629,14 +790,9 @@ public sealed class HookInstaller
                     alreadyMsg);
             }
 
-            if (hooksWasAbsent)
-            {
-                root["hooks"] = hooksObj;
-            }
-
-            BeforeCommitHookForTest?.Invoke(configPath);
-
-            if (!MatchesSnapshot(configPath, before))
+            byte[] outBytes = ApplyByteEdits(before.OriginalBytes!, parsed.BomLength, edits);
+            string backupPath = BuildUniqueBackupPath(configPath);
+            if (!CommitBytesWithPreReplaceCheck(configPath, outBytes, backupPath, before))
             {
                 return new HookTargetResult(
                     target,
@@ -645,14 +801,10 @@ public sealed class HookInstaller
                     "Target config was modified concurrently; aborted to prevent clobbering changes.");
             }
 
-            byte[] outBytes = SerializeJsonPreservingStyle(root, loadResult.HasUtf8Bom, loadResult.NewLine);
-            string? backupPath = before.Exists ? BuildUniqueBackupPath(configPath) : null;
-            WriteBytesAtomicWithReplace(configPath, outBytes, backupPath, before.Exists);
+            SaveContainerProvenance(configPath, new ContainerProvenance(effectiveCreatedHooksObj, createdEventKeysNow));
 
             string noteSuffix = extraNote == null ? "" : $" Note: {extraNote}";
-            string installedMsg = backupPath != null
-                ? $"Installed KageDesk hooks (backup saved to {Path.GetFileName(backupPath)}).{noteSuffix}"
-                : $"Installed KageDesk hooks.{noteSuffix}";
+            string installedMsg = $"Installed KageDesk hooks (backup saved to {Path.GetFileName(backupPath)}).{noteSuffix}";
 
             return new HookTargetResult(
                 target,
@@ -675,6 +827,8 @@ public sealed class HookInstaller
         return WithTargetLock(configPath, () =>
         {
             ValidateNoReparsePointsInPath(configPath);
+
+            // Single read into before.OriginalBytes; compute hash AND parse from THAT EXACT buffer
             FileSnapshot before = CaptureSnapshot(configPath);
             if (!before.Exists)
             {
@@ -685,15 +839,26 @@ public sealed class HookInstaller
                     "Config file does not exist.");
             }
 
-            var loadResult = LoadStrictJsonObject(configPath, before);
-            if (loadResult.ErrorStatus.HasValue)
+            SpanParseResult parsed = ParseStrictJsonSpans(configPath, before.OriginalBytes!);
+            if (parsed.ErrorStatus.HasValue)
             {
-                return new HookTargetResult(target, configPath, loadResult.ErrorStatus.Value, loadResult.ErrorMessage!);
+                return new HookTargetResult(target, configPath, parsed.ErrorStatus.Value, parsed.ErrorMessage!);
             }
 
-            JsonObject root = loadResult.Root!;
-            if (!root.TryGetPropertyValue("hooks", out JsonNode? hooksNode))
+            JsonSpanObject root = parsed.Root!;
+            ReadOnlySpan<byte> body = before.OriginalBytes.AsSpan(parsed.BomLength);
+
+            if (!TryGetUniqueProperty(root, "hooks", out JsonSpanProperty? hooksProp, out bool duplicateHooks))
             {
+                if (duplicateHooks)
+                {
+                    return new HookTargetResult(
+                        target,
+                        configPath,
+                        HookActionStatus.UnsupportedLayout,
+                        "Existing 'hooks' property appears multiple times; refused to modify user config.");
+                }
+
                 return new HookTargetResult(
                     target,
                     configPath,
@@ -701,7 +866,7 @@ public sealed class HookInstaller
                     "No KageDesk hooks found.");
             }
 
-            if (hooksNode == null || hooksNode is not JsonObject hooksObj)
+            if (hooksProp!.Value.TokenType == JsonTokenType.Null || hooksProp.Value is not JsonSpanObject hooksObj)
             {
                 return new HookTargetResult(
                     target,
@@ -710,24 +875,83 @@ public sealed class HookInstaller
                     "Existing 'hooks' property is null or not a JSON object; refused to modify user config.");
             }
 
+            var specByKey = new Dictionary<string, HookEventSpec>(StringComparer.Ordinal);
+            foreach (var s in specs) specByKey[s.EventKey] = s;
+
             // Preflight managed events before mutating anything
             foreach (var spec in specs)
             {
-                if (hooksObj.TryGetPropertyValue(spec.EventKey, out JsonNode? eventNode))
+                if (!TryGetUniqueProperty(hooksObj, spec.EventKey, out JsonSpanProperty? eventProp, out bool duplicateEvent))
                 {
-                    if (eventNode == null || eventNode is not JsonArray)
+                    if (duplicateEvent)
                     {
                         return new HookTargetResult(
                             target,
                             configPath,
                             HookActionStatus.UnsupportedLayout,
-                            $"Managed hook event '{spec.EventKey}' is null or not a JSON array; refused to modify user config.");
+                            $"Managed hook event '{spec.EventKey}' appears multiple times; refused to modify user config.");
+                    }
+                    continue;
+                }
+
+                if (eventProp!.Value.TokenType == JsonTokenType.Null || eventProp.Value is not JsonSpanArray)
+                {
+                    return new HookTargetResult(
+                        target,
+                        configPath,
+                        HookActionStatus.UnsupportedLayout,
+                        $"Managed hook event '{spec.EventKey}' is null or not a JSON array; refused to modify user config.");
+                }
+            }
+
+            ContainerProvenance prov = LoadContainerProvenance(configPath);
+            var remainingProvKeys = new HashSet<string>(prov.CreatedEventKeys, StringComparer.Ordinal);
+            var innerEdits = new List<ByteEdit>();
+            var eventPropIndicesToRemove = new HashSet<int>();
+            bool anyModified = false;
+
+            for (int pIdx = 0; pIdx < hooksObj.Properties.Count; pIdx++)
+            {
+                JsonSpanProperty prop = hooksObj.Properties[pIdx];
+                bool isCurrentManaged = specByKey.TryGetValue(prop.Name, out HookEventSpec? spec);
+                bool isLegacyEvent = IsLegacyOnlyEventKey(prop.Name, specByKey);
+
+                if (!isCurrentManaged && !isLegacyEvent)
+                {
+                    // Never touch unrelated/unknown user event arrays (even if empty!)
+                    continue;
+                }
+
+                if (prop.Value is not JsonSpanArray eventArr)
+                {
+                    continue;
+                }
+
+                // Never delete an empty managed event array unless KageDesk provably created it!
+                bool canRemoveEmptyEventKey = prov.CreatedEventKeys.Contains(prop.Name);
+                bool removeEventKey = PlanRemoveEntriesFromEventArrayEdits(
+                    innerEdits,
+                    body,
+                    eventArr,
+                    eventKey: prop.Name,
+                    currentSpec: spec,
+                    agentId,
+                    emitterScriptPath,
+                    canRemoveEmptyEventKey,
+                    out bool removedAnyFromEvent);
+
+                if (removedAnyFromEvent)
+                {
+                    anyModified = true;
+                    if (removeEventKey)
+                    {
+                        eventPropIndicesToRemove.Add(pIdx);
+                        remainingProvKeys.Remove(prop.Name);
                     }
                 }
             }
 
-            bool modified = RemoveOwnedKageDeskEntries(hooksObj, specs, agentId, emitterScriptPath);
-            if (!modified)
+            if (!anyModified)
             {
                 return new HookTargetResult(
                     target,
@@ -736,15 +960,62 @@ public sealed class HookInstaller
                     "No KageDesk hooks found.");
             }
 
-            // Remove "hooks" object ONLY because KageDesk removed entries and it became empty
-            if (hooksObj.Count == 0)
+            var finalEdits = new List<ByteEdit>();
+            bool hooksBecomesEmpty = eventPropIndicesToRemove.Count == hooksObj.Properties.Count && hooksObj.Properties.Count > 0;
+            bool removeHooksProp = hooksBecomesEmpty && prov.CreatedHooksObject;
+
+            if (removeHooksProp)
             {
-                root.Remove("hooks");
+                // Remove entire "hooks" property from root (skipping any inner edits inside "hooks")
+                int hooksIndex = root.Properties.IndexOf(hooksProp);
+                if (root.Properties.Count == 1)
+                {
+                    finalEdits.Add(new ByteEdit(root.Start + 1, root.CloseBraceIndex, Array.Empty<byte>()));
+                }
+                else
+                {
+                    AddRemoveObjectPropertiesEdits(finalEdits, root, new HashSet<int> { hooksIndex });
+                }
+            }
+            else
+            {
+                if (hooksBecomesEmpty)
+                {
+                    // Ownership of "hooks" is unproven: conservatively preserve empty "hooks": {}
+                    finalEdits.Add(new ByteEdit(hooksObj.Start + 1, hooksObj.CloseBraceIndex, Array.Empty<byte>()));
+                }
+                else
+                {
+                    // Keep inner edits for properties that are NOT being removed as a whole
+                    foreach (var edit in innerEdits)
+                    {
+                        bool insideRemovedProp = false;
+                        foreach (int remIdx in eventPropIndicesToRemove)
+                        {
+                            var rp = hooksObj.Properties[remIdx];
+                            if (edit.Start >= rp.FullStart && edit.End <= rp.FullEnd)
+                            {
+                                insideRemovedProp = true;
+                                break;
+                            }
+                        }
+
+                        if (!insideRemovedProp)
+                        {
+                            finalEdits.Add(edit);
+                        }
+                    }
+
+                    if (eventPropIndicesToRemove.Count > 0)
+                    {
+                        AddRemoveObjectPropertiesEdits(finalEdits, hooksObj, eventPropIndicesToRemove);
+                    }
+                }
             }
 
-            BeforeCommitHookForTest?.Invoke(configPath);
-
-            if (!MatchesSnapshot(configPath, before))
+            byte[] outBytes = ApplyByteEdits(before.OriginalBytes!, parsed.BomLength, finalEdits);
+            string backupPath = BuildUniqueBackupPath(configPath);
+            if (!CommitBytesWithPreReplaceCheck(configPath, outBytes, backupPath, before))
             {
                 return new HookTargetResult(
                     target,
@@ -753,9 +1024,14 @@ public sealed class HookInstaller
                     "Target config was modified concurrently; aborted uninstall to prevent clobbering changes.");
             }
 
-            byte[] outBytes = SerializeJsonPreservingStyle(root, loadResult.HasUtf8Bom, loadResult.NewLine);
-            string backupPath = BuildUniqueBackupPath(configPath);
-            WriteBytesAtomicWithReplace(configPath, outBytes, backupPath, fileExisted: true);
+            if (removeHooksProp)
+            {
+                ClearContainerProvenance(configPath);
+            }
+            else if (prov.CreatedHooksObject || prov.CreatedEventKeys.Count > 0)
+            {
+                SaveContainerProvenance(configPath, new ContainerProvenance(prov.CreatedHooksObject, remainingProvKeys));
+            }
 
             return new HookTargetResult(
                 target,
@@ -811,175 +1087,248 @@ public sealed class HookInstaller
         return sb.ToString();
     }
 
-    private static bool UpsertHookEvent(
-        JsonObject hooksObj,
+    private static bool IsLegacyOnlyEventKey(string eventKey, Dictionary<string, HookEventSpec> currentSpecs)
+    {
+        if (currentSpecs.ContainsKey(eventKey))
+            return false;
+
+        foreach (var legacy in LegacyHookFingerprints)
+        {
+            if (string.Equals(legacy.EventKey, eventKey, StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
+
+    private static void PlanUpsertEventArrayEdits(
+        List<ByteEdit> edits,
+        ReadOnlySpan<byte> body,
+        JsonSpanArray eventArr,
         HookEventSpec spec,
         string agentId,
         string emitterScriptPath,
-        string desiredCommand)
+        string desiredCommand,
+        JsonDocStyle style)
     {
-        JsonArray eventArr;
-        if (hooksObj.TryGetPropertyValue(spec.EventKey, out JsonNode? existingNode) && existingNode is JsonArray existingArr)
-        {
-            eventArr = existingArr;
-        }
-        else
-        {
-            eventArr = new JsonArray();
-            hooksObj[spec.EventKey] = eventArr;
-        }
+        // Search for existing current OR exact legacy KageDesk hook entries.
+        // If multiple owned entries exist (e.g. a legacy entry + a current entry), upgrade/keep the first and remove duplicates.
+        bool foundPrimary = false;
+        var extraGroupIndicesToRemove = new HashSet<int>();
 
-        // Look ONLY for an exact KageDesk-owned entry for this spec & emitter path
-        foreach (JsonNode? entryNode in eventArr)
+        for (int gIdx = 0; gIdx < eventArr.Elements.Count; gIdx++)
         {
-            if (entryNode is not JsonObject groupObj) continue;
+            if (eventArr.Elements[gIdx] is not JsonSpanObject groupObj)
+                continue;
 
-            if (groupObj.TryGetPropertyValue("hooks", out JsonNode? innerNode) && innerNode is JsonArray innerHooks)
+            if (!TryGetUniqueProperty(groupObj, "hooks", out JsonSpanProperty? innerProp, out _) ||
+                innerProp?.Value is not JsonSpanArray innerHooks)
             {
-                foreach (JsonNode? item in innerHooks)
-                {
-                    if (item is JsonObject hookObj && IsExactOwnedHookObject(hookObj, spec, agentId, emitterScriptPath))
-                    {
-                        bool changed = false;
-                        string? existingCmd = hookObj["command"]?.GetValue<string>();
-                        if (!string.Equals(existingCmd, desiredCommand, StringComparison.Ordinal))
-                        {
-                            hookObj["type"] = "command";
-                            hookObj["command"] = desiredCommand;
-                            changed = true;
-                        }
-
-                        if (spec.AsyncDispatch)
-                        {
-                            bool existingAsync = hookObj.TryGetPropertyValue("async", out JsonNode? aNode)
-                                && aNode is JsonValue av && av.TryGetValue<bool>(out bool ab) && ab;
-                            if (!existingAsync)
-                            {
-                                hookObj["async"] = true;
-                                changed = true;
-                            }
-                        }
-
-                        if (!string.IsNullOrEmpty(spec.Matcher))
-                        {
-                            string? existingMatcher = groupObj.TryGetPropertyValue("matcher", out JsonNode? mNode)
-                                && mNode is JsonValue mv && mv.TryGetValue<string>(out string? ms) ? ms : null;
-                            if (!string.Equals(existingMatcher, spec.Matcher, StringComparison.Ordinal) && innerHooks.Count == 1)
-                            {
-                                groupObj["matcher"] = spec.Matcher;
-                                changed = true;
-                            }
-                        }
-
-                        return changed;
-                    }
-                }
-            }
-        }
-
-        var newHookObj = new JsonObject
-        {
-            ["type"] = "command",
-            ["command"] = desiredCommand
-        };
-        if (spec.AsyncDispatch)
-        {
-            newHookObj["async"] = true;
-        }
-
-        var newGroup = new JsonObject();
-        if (!string.IsNullOrEmpty(spec.Matcher))
-        {
-            newGroup["matcher"] = spec.Matcher;
-        }
-        newGroup["hooks"] = new JsonArray { newHookObj };
-
-        eventArr.Add(newGroup);
-        return true;
-    }
-
-    private static bool RemoveOwnedKageDeskEntries(
-        JsonObject hooksObj,
-        HookEventSpec[] specs,
-        string agentId,
-        string emitterScriptPath)
-    {
-        bool anyModified = false;
-        var specByEventKey = new Dictionary<string, HookEventSpec>(StringComparer.Ordinal);
-        foreach (var s in specs)
-        {
-            specByEventKey[s.EventKey] = s;
-        }
-
-        var keysToRemove = new List<string>();
-
-        foreach (var kv in hooksObj)
-        {
-            if (!specByEventKey.TryGetValue(kv.Key, out var spec))
-            {
-                // Never touch unrelated/unknown user event arrays (even if empty!)
                 continue;
             }
 
-            if (kv.Value is not JsonArray eventArr) continue;
+            var extraInnerIndicesToRemove = new HashSet<int>();
+            bool matchedInThisGroup = false;
 
-            bool removedFromThisEvent = false;
-
-            for (int i = eventArr.Count - 1; i >= 0; i--)
+            for (int hIdx = 0; hIdx < innerHooks.Elements.Count; hIdx++)
             {
-                if (eventArr[i] is not JsonObject groupObj) continue;
+                if (innerHooks.Elements[hIdx] is not JsonSpanObject hookObj)
+                    continue;
 
-                if (groupObj.TryGetPropertyValue("hooks", out JsonNode? innerNode) && innerNode is JsonArray innerHooks)
+                bool isCurrent = IsCurrentOwnedHookObject(hookObj, spec, agentId, emitterScriptPath);
+                bool isLegacy = !isCurrent && IsLegacyOwnedHookObject(hookObj, spec.EventKey, agentId, emitterScriptPath);
+                if (!isCurrent && !isLegacy)
+                    continue;
+
+                matchedInThisGroup = true;
+                if (!foundPrimary)
                 {
-                    bool removedFromThisGroup = false;
-                    for (int j = innerHooks.Count - 1; j >= 0; j--)
+                    foundPrimary = true;
+                    bool isUpToDate = isCurrent && IsHookEntryUpToDate(groupObj, innerHooks, hookObj, spec, desiredCommand);
+                    if (!isUpToDate)
                     {
-                        if (innerHooks[j] is JsonObject hookObj && IsExactOwnedHookObject(hookObj, spec, agentId, emitterScriptPath))
+                        if (innerHooks.Elements.Count == 1 && IsKageDeskOwnedWrapperGroup(groupObj, spec.Matcher))
                         {
-                            innerHooks.RemoveAt(j);
-                            removedFromThisGroup = true;
-                            removedFromThisEvent = true;
-                            anyModified = true;
+                            string groupIndent = GetLineIndent(body, groupObj.Start);
+                            string newGroupJson = FormatWrapperGroup(spec, desiredCommand, style, groupIndent);
+                            edits.Add(new ByteEdit(groupObj.Start, groupObj.End, Utf8NoBom.GetBytes(newGroupJson)));
+                        }
+                        else
+                        {
+                            string hookIndent = GetLineIndent(body, hookObj.Start);
+                            string newHookJson = FormatHookObject(desiredCommand, spec.AsyncDispatch, style, hookIndent);
+                            edits.Add(new ByteEdit(hookObj.Start, hookObj.End, Utf8NoBom.GetBytes(newHookJson)));
                         }
                     }
-
-                    // Remove wrapper group ONLY if KageDesk itself emptied it AND it has only KageDesk-owned keys
-                    if (removedFromThisGroup && innerHooks.Count == 0 && IsKageDeskOwnedWrapperGroup(groupObj, spec))
-                    {
-                        eventArr.RemoveAt(i);
-                    }
+                }
+                else
+                {
+                    extraInnerIndicesToRemove.Add(hIdx);
                 }
             }
 
-            // Remove event array key ONLY if KageDesk itself removed entries from it and it became empty
-            if (removedFromThisEvent && eventArr.Count == 0)
+            if (matchedInThisGroup && extraInnerIndicesToRemove.Count > 0)
             {
-                keysToRemove.Add(kv.Key);
+                if (extraInnerIndicesToRemove.Count == innerHooks.Elements.Count &&
+                    IsKageDeskOwnedWrapperGroup(groupObj, spec.Matcher))
+                {
+                    extraGroupIndicesToRemove.Add(gIdx);
+                }
+                else
+                {
+                    AddRemoveArrayElementsEdits(edits, innerHooks, extraInnerIndicesToRemove);
+                }
             }
         }
 
-        foreach (string key in keysToRemove)
+        if (extraGroupIndicesToRemove.Count > 0)
         {
-            hooksObj.Remove(key);
+            AddRemoveArrayElementsEdits(edits, eventArr, extraGroupIndicesToRemove);
         }
 
-        return anyModified;
+        if (!foundPrimary)
+        {
+            string arrIndent = GetLineIndent(body, eventArr.Start);
+            string elemIndent = GetChildIndentForArray(body, eventArr, style);
+            string newGroupJson = FormatWrapperGroup(spec, desiredCommand, style, elemIndent);
+            AddInsertElementIntoArrayEdit(edits, body, eventArr, newGroupJson, style, elemIndent, arrIndent);
+        }
     }
 
-    private static bool IsKageDeskOwnedWrapperGroup(JsonObject groupObj, HookEventSpec spec)
+    private static bool IsHookEntryUpToDate(
+        JsonSpanObject groupObj,
+        JsonSpanArray innerHooks,
+        JsonSpanObject hookObj,
+        HookEventSpec spec,
+        string desiredCommand)
     {
-        if (groupObj.Count == 1 && groupObj.ContainsKey("hooks"))
+        if (!TryGetStringProperty(hookObj, "command", out string? existingCmd) ||
+            !string.Equals(existingCmd, desiredCommand, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (spec.AsyncDispatch)
+        {
+            if (!TryGetBoolProperty(hookObj, "async", out bool asyncVal) || !asyncVal)
+            {
+                return false;
+            }
+        }
+
+        if (!string.IsNullOrEmpty(spec.Matcher) && innerHooks.Elements.Count == 1)
+        {
+            if (!TryGetStringProperty(groupObj, "matcher", out string? existingMatcher) ||
+                !string.Equals(existingMatcher, spec.Matcher, StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool PlanRemoveEntriesFromEventArrayEdits(
+        List<ByteEdit> edits,
+        ReadOnlySpan<byte> body,
+        JsonSpanArray eventArr,
+        string eventKey,
+        HookEventSpec? currentSpec,
+        string agentId,
+        string emitterScriptPath,
+        bool canRemoveEmptyEventKey,
+        out bool removedAny)
+    {
+        removedAny = false;
+        var groupIndicesToRemove = new HashSet<int>();
+        var nestedEdits = new List<ByteEdit>();
+
+        for (int gIdx = 0; gIdx < eventArr.Elements.Count; gIdx++)
+        {
+            if (eventArr.Elements[gIdx] is not JsonSpanObject groupObj)
+                continue;
+
+            if (!TryGetUniqueProperty(groupObj, "hooks", out JsonSpanProperty? innerProp, out _) ||
+                innerProp?.Value is not JsonSpanArray innerHooks)
+            {
+                continue;
+            }
+
+            var innerToRemove = new HashSet<int>();
+            for (int hIdx = 0; hIdx < innerHooks.Elements.Count; hIdx++)
+            {
+                if (innerHooks.Elements[hIdx] is not JsonSpanObject hookObj)
+                    continue;
+
+                bool isOwned =
+                    (currentSpec != null && IsCurrentOwnedHookObject(hookObj, currentSpec, agentId, emitterScriptPath)) ||
+                    IsLegacyOwnedHookObject(hookObj, eventKey, agentId, emitterScriptPath);
+
+                if (isOwned)
+                {
+                    innerToRemove.Add(hIdx);
+                    removedAny = true;
+                }
+            }
+
+            if (innerToRemove.Count == 0)
+                continue;
+
+            bool groupBecomesEmpty = innerToRemove.Count == innerHooks.Elements.Count;
+            if (groupBecomesEmpty && IsKageDeskOwnedWrapperGroup(groupObj, currentSpec?.Matcher))
+            {
+                groupIndicesToRemove.Add(gIdx);
+            }
+            else if (groupBecomesEmpty)
+            {
+                // User's wrapper group (extra keys or non-matching matcher): preserve wrapper with empty hooks array
+                nestedEdits.Add(new ByteEdit(innerHooks.Start + 1, innerHooks.CloseBracketIndex, Array.Empty<byte>()));
+            }
+            else
+            {
+                AddRemoveArrayElementsEdits(nestedEdits, innerHooks, innerToRemove);
+            }
+        }
+
+        if (!removedAny)
+        {
+            return false;
+        }
+
+        bool eventArrBecomesEmpty = groupIndicesToRemove.Count == eventArr.Elements.Count && eventArr.Elements.Count > 0;
+        if (eventArrBecomesEmpty && canRemoveEmptyEventKey)
+        {
+            // Caller will remove the whole event key property from hooksObj
+            return true;
+        }
+
+        if (eventArrBecomesEmpty)
+        {
+            // Pre-existing / unproven container: preserve empty array [] verbatim!
+            edits.Add(new ByteEdit(eventArr.Start + 1, eventArr.CloseBracketIndex, Array.Empty<byte>()));
+            return false;
+        }
+
+        edits.AddRange(nestedEdits);
+        if (groupIndicesToRemove.Count > 0)
+        {
+            AddRemoveArrayElementsEdits(edits, eventArr, groupIndicesToRemove);
+        }
+
+        return false;
+    }
+
+    private static bool IsKageDeskOwnedWrapperGroup(JsonSpanObject groupObj, string? expectedMatcher)
+    {
+        if (groupObj.Properties.Count == 1 && HasProperty(groupObj, "hooks"))
         {
             return true;
         }
 
-        if (groupObj.Count == 2 &&
-            !string.IsNullOrEmpty(spec.Matcher) &&
-            groupObj.ContainsKey("hooks") &&
-            groupObj.TryGetPropertyValue("matcher", out JsonNode? mNode) &&
-            mNode is JsonValue mv &&
-            mv.TryGetValue<string>(out string? matcherVal) &&
-            string.Equals(matcherVal, spec.Matcher, StringComparison.Ordinal))
+        if (groupObj.Properties.Count == 2 &&
+            !string.IsNullOrEmpty(expectedMatcher) &&
+            HasProperty(groupObj, "hooks") &&
+            TryGetStringProperty(groupObj, "matcher", out string? matcherVal) &&
+            string.Equals(matcherVal, expectedMatcher, StringComparison.Ordinal))
         {
             return true;
         }
@@ -987,38 +1336,84 @@ public sealed class HookInstaller
         return false;
     }
 
-    private static bool IsExactOwnedHookObject(
-        JsonObject hookObj,
+    private static bool IsCurrentOwnedHookObject(
+        JsonSpanObject hookObj,
         HookEventSpec spec,
         string agentId,
         string emitterScriptPath)
     {
-        if (!hookObj.TryGetPropertyValue("type", out JsonNode? typeNode) ||
-            typeNode is not JsonValue typeVal ||
-            !typeVal.TryGetValue<string>(out string? typeStr) ||
+        return TryGetStrictKageDeskCommand(hookObj, out string? cmd) &&
+               IsExactCommandMatch(cmd!, emitterScriptPath, spec.EventType, agentId, spec.Message);
+    }
+
+    private static bool IsLegacyOwnedHookObject(
+        JsonSpanObject hookObj,
+        string eventKey,
+        string agentId,
+        string emitterScriptPath)
+    {
+        if (!TryGetStrictKageDeskCommand(hookObj, out string? cmd))
+            return false;
+
+        foreach (var legacy in LegacyHookFingerprints)
+        {
+            if (string.Equals(legacy.EventKey, eventKey, StringComparison.Ordinal) &&
+                IsExactCommandMatch(cmd!, emitterScriptPath, legacy.EventType, agentId, legacy.Message))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryGetStrictKageDeskCommand(JsonSpanObject hookObj, out string? command)
+    {
+        command = null;
+
+        // Reject customized user objects carrying unexpected extra properties
+        foreach (var p in hookObj.Properties)
+        {
+            if (!string.Equals(p.Name, "type", StringComparison.Ordinal) &&
+                !string.Equals(p.Name, "command", StringComparison.Ordinal) &&
+                !string.Equals(p.Name, "async", StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        if (!TryGetStringProperty(hookObj, "type", out string? typeStr) ||
             !string.Equals(typeStr, "command", StringComparison.Ordinal))
         {
             return false;
         }
 
-        if (!hookObj.TryGetPropertyValue("command", out JsonNode? cmdNode) ||
-            cmdNode is not JsonValue cmdVal ||
-            !cmdVal.TryGetValue<string>(out string? cmd) ||
+        if (!TryGetStringProperty(hookObj, "command", out string? cmd) ||
             string.IsNullOrWhiteSpace(cmd))
         {
             return false;
         }
 
-        // Exact ownership verification:
-        // Must match our exact generated command shape anchored start-to-end with the EXACT canonical emitter script path,
-        // exact agentId, exact eventType (current or legacy v2.2 spec for clean upgrade), exact message, and optional valid -Port.
+        command = cmd;
+        return true;
+    }
+
+    private static bool IsExactCommandMatch(
+        string cmd,
+        string emitterScriptPath,
+        string eventType,
+        string agentId,
+        string message)
+    {
+        // Exact ownership verification anchored start-to-end with the canonical emitter script path,
+        // exact agentId, exact eventType, exact message, and optional valid -Port.
         string quotedEmitter = EscapeForWindowsDoubleQuotedArg(emitterScriptPath);
-        string quotedMessage = EscapeForWindowsDoubleQuotedArg(spec.Message);
+        string quotedMessage = EscapeForWindowsDoubleQuotedArg(message);
 
         string pattern =
             "^powershell -NoProfile -ExecutionPolicy Bypass -File \"" +
             Regex.Escape(quotedEmitter) +
-            "\" -Type " + Regex.Escape(spec.EventType) +
+            "\" -Type " + Regex.Escape(eventType) +
             " -AgentId " + Regex.Escape(agentId) +
             " -Message \"" + Regex.Escape(quotedMessage) +
             "\"(?: -Port [0-9]{1,5})?$";
@@ -1081,90 +1476,158 @@ export const KageDeskPlugin = async () => ({
   "tool.execute.after": async () => {
     emitEvent("tool_complete", "Tool execution completed");
   },
-  "permission.asked": async () => {
-    emitEvent("approval", "Approval requested");
-  },
-  "session.idle": async () => {
-    emitEvent("turn_done", "Agent turn completed");
-  },
-  "session.error": async () => {
-    emitEvent("fail", "Session error");
+  event: async ({ event }) => {
+    const eventType = event && typeof event.type === "string" ? event.type : "";
+    switch (eventType) {
+      case "permission.asked":
+      case "permission.updated":
+        emitEvent("approval", "Approval requested");
+        break;
+      case "session.idle":
+        emitEvent("turn_done", "Agent turn completed");
+        break;
+      case "session.error":
+        emitEvent("fail", "Session error");
+        break;
+      default:
+        break;
+    }
   }
 });
 """;
     }
 
-    private sealed record JsonLoadResult(
-        JsonObject? Root,
-        bool HasUtf8Bom,
-        string NewLine,
+    // ------------------------------------------------------------------------
+    // Lossless UTF-8 JSON Span AST & Surgical Byte Splicing
+    // ------------------------------------------------------------------------
+
+    private abstract class JsonSpanNode
+    {
+        public int Start { get; init; }
+        public int End { get; init; }
+        public JsonTokenType TokenType { get; init; }
+    }
+
+    private sealed class JsonSpanPrimitive : JsonSpanNode
+    {
+        public string? StringValue { get; init; }
+        public bool? BoolValue { get; init; }
+    }
+
+    private sealed class JsonSpanProperty
+    {
+        public required string Name { get; init; }
+        public int NameStart { get; init; }
+        public int NameEnd { get; init; }
+        public required JsonSpanNode Value { get; init; }
+        public int FullStart => NameStart;
+        public int FullEnd => Value.End;
+    }
+
+    private sealed class JsonSpanObject : JsonSpanNode
+    {
+        public int CloseBraceIndex { get; init; }
+        public List<JsonSpanProperty> Properties { get; } = new();
+    }
+
+    private sealed class JsonSpanArray : JsonSpanNode
+    {
+        public int CloseBracketIndex { get; init; }
+        public List<JsonSpanNode> Elements { get; } = new();
+    }
+
+    private sealed record SpanParseResult(
+        JsonSpanObject? Root,
+        int BomLength,
         HookActionStatus? ErrorStatus,
         string? ErrorMessage
     );
 
-    private static JsonLoadResult LoadStrictJsonObject(string path, FileSnapshot snapshot)
+    private readonly record struct JsonDocStyle(
+        bool IsCompact,
+        string NewLine,
+        string IndentUnit,
+        string ColonSep
+    );
+
+    private readonly record struct ByteEdit(int Start, int End, byte[] Replacement);
+
+    private static SpanParseResult ParseStrictJsonSpans(string path, byte[] rawBytes)
     {
-        if (!snapshot.Exists)
-        {
-            return new JsonLoadResult(new JsonObject(), HasUtf8Bom: false, NewLine: Environment.NewLine, null, null);
-        }
+        int bomLen = rawBytes.Length >= 3 && rawBytes[0] == 0xEF && rawBytes[1] == 0xBB && rawBytes[2] == 0xBF ? 3 : 0;
+        ReadOnlySpan<byte> utf8Body = rawBytes.AsSpan(bomLen);
 
-        byte[] raw = File.ReadAllBytes(path);
-        bool hasBom = raw.Length >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF;
-        int offset = hasBom ? 3 : 0;
-
-        string text;
+        // Validate strict UTF-8 encoding first (zero invalid sequences allowed)
         try
         {
-            text = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
-                .GetString(raw, offset, raw.Length - offset);
+            _ = Utf8NoBomStrict.GetCharCount(utf8Body);
         }
         catch (DecoderFallbackException)
         {
-            return new JsonLoadResult(null, hasBom, Environment.NewLine, HookActionStatus.MalformedConfig,
+            return new SpanParseResult(null, bomLen, HookActionStatus.MalformedConfig,
                 $"File '{path}' is not valid UTF-8 JSON; refused to modify.");
         }
 
-        string newLine = text.Contains("\r\n", StringComparison.Ordinal)
-            ? "\r\n"
-            : (text.Contains('\n') ? "\n" : Environment.NewLine);
-
-        if (string.IsNullOrWhiteSpace(text))
+        if (IsAsciiWhitespaceOnly(utf8Body))
         {
-            return new JsonLoadResult(null, hasBom, newLine, HookActionStatus.MalformedConfig,
+            return new SpanParseResult(null, bomLen, HookActionStatus.MalformedConfig,
                 $"File '{path}' is empty/whitespace and not a valid JSON object; refused to modify.");
         }
 
         try
         {
-            JsonNode? strictNode = JsonNode.Parse(text, documentOptions: new JsonDocumentOptions
+            var reader = new Utf8JsonReader(utf8Body, new JsonReaderOptions
             {
                 AllowTrailingCommas = false,
                 CommentHandling = JsonCommentHandling.Disallow
             });
 
-            if (strictNode is not JsonObject obj)
+            if (!reader.Read())
             {
-                return new JsonLoadResult(null, hasBom, newLine, HookActionStatus.UnsupportedLayout,
+                return new SpanParseResult(null, bomLen, HookActionStatus.MalformedConfig,
+                    $"File '{path}' contains malformed JSON; refused to modify.");
+            }
+
+            if (reader.TokenType != JsonTokenType.StartObject)
+            {
+                // Still consume the rest to verify well-formed JSON vs malformed
+                SkipOrReadNode(ref reader, depth: 0);
+                if (reader.Read())
+                {
+                    return new SpanParseResult(null, bomLen, HookActionStatus.MalformedConfig,
+                        $"File '{path}' contains malformed JSON; refused to modify.");
+                }
+
+                return new SpanParseResult(null, bomLen, HookActionStatus.UnsupportedLayout,
                     $"Root JSON value in '{path}' is not an object; refused to modify.");
             }
 
-            return new JsonLoadResult(obj, hasBom, newLine, null, null);
+            JsonSpanObject root = ReadObjectSpan(ref reader, depth: 0);
+
+            // Reject trailing garbage after root object
+            if (reader.Read())
+            {
+                return new SpanParseResult(null, bomLen, HookActionStatus.MalformedConfig,
+                    $"File '{path}' contains trailing tokens after root JSON object; refused to modify.");
+            }
+
+            return new SpanParseResult(root, bomLen, null, null);
         }
         catch (JsonException)
         {
             // Distinguish JSONC (comments/trailing commas -> UnsupportedLayout) from genuinely malformed JSON
             try
             {
-                JsonNode? relaxedNode = JsonNode.Parse(text, documentOptions: new JsonDocumentOptions
+                var relaxed = new Utf8JsonReader(utf8Body, new JsonReaderOptions
                 {
                     AllowTrailingCommas = true,
                     CommentHandling = JsonCommentHandling.Skip
                 });
 
-                if (relaxedNode != null)
+                if (relaxed.Read())
                 {
-                    return new JsonLoadResult(null, hasBom, newLine, HookActionStatus.UnsupportedLayout,
+                    while (relaxed.Read()) { }
+                    return new SpanParseResult(null, bomLen, HookActionStatus.UnsupportedLayout,
                         $"File '{path}' contains JSON comments or trailing commas; refused to modify to avoid losing formatting/comments.");
                 }
             }
@@ -1173,40 +1636,739 @@ export const KageDeskPlugin = async () => ({
                 // Truly malformed JSON
             }
 
-            return new JsonLoadResult(null, hasBom, newLine, HookActionStatus.MalformedConfig,
+            return new SpanParseResult(null, bomLen, HookActionStatus.MalformedConfig,
                 $"File '{path}' contains malformed JSON; refused to modify.");
         }
     }
 
-    private static byte[] SerializeJsonPreservingStyle(JsonObject root, bool includeUtf8Bom, string newLine)
+    private static JsonSpanNode SkipOrReadNode(ref Utf8JsonReader reader, int depth)
     {
-        string serialized = root.ToJsonString(new JsonSerializerOptions
+        int start = (int)reader.TokenStartIndex;
+        switch (reader.TokenType)
         {
-            WriteIndented = true
+            case JsonTokenType.StartObject:
+                return ReadObjectSpan(ref reader, depth);
+            case JsonTokenType.StartArray:
+                return ReadArraySpan(ref reader, depth);
+            case JsonTokenType.String:
+                // Decode string value only inside shallow hook structure (depth <= 6)
+                string? strVal = depth <= 6 ? reader.GetString() : null;
+                return new JsonSpanPrimitive
+                {
+                    Start = start,
+                    End = (int)reader.BytesConsumed,
+                    TokenType = JsonTokenType.String,
+                    StringValue = strVal
+                };
+            case JsonTokenType.True:
+                return new JsonSpanPrimitive { Start = start, End = (int)reader.BytesConsumed, TokenType = JsonTokenType.True, BoolValue = true };
+            case JsonTokenType.False:
+                return new JsonSpanPrimitive { Start = start, End = (int)reader.BytesConsumed, TokenType = JsonTokenType.False, BoolValue = false };
+            default:
+                return new JsonSpanPrimitive { Start = start, End = (int)reader.BytesConsumed, TokenType = reader.TokenType };
+        }
+    }
+
+    private static JsonSpanObject ReadObjectSpan(ref Utf8JsonReader reader, int depth)
+    {
+        int start = (int)reader.TokenStartIndex;
+        var props = new List<JsonSpanProperty>();
+
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.EndObject)
+            {
+                var obj = new JsonSpanObject
+                {
+                    Start = start,
+                    CloseBraceIndex = (int)reader.TokenStartIndex,
+                    End = (int)reader.BytesConsumed,
+                    TokenType = JsonTokenType.StartObject
+                };
+                obj.Properties.AddRange(props);
+                return obj;
+            }
+
+            if (reader.TokenType != JsonTokenType.PropertyName)
+            {
+                throw new JsonException("Expected property name.");
+            }
+
+            int nameStart = (int)reader.TokenStartIndex;
+            int nameEnd = (int)reader.BytesConsumed;
+            string name = reader.GetString()!;
+
+            if (!reader.Read())
+            {
+                throw new JsonException("Unexpected end of JSON after property name.");
+            }
+
+            JsonSpanNode value = SkipOrReadNode(ref reader, depth + 1);
+            props.Add(new JsonSpanProperty
+            {
+                Name = name,
+                NameStart = nameStart,
+                NameEnd = nameEnd,
+                Value = value
+            });
+        }
+
+        throw new JsonException("Unterminated JSON object.");
+    }
+
+    private static JsonSpanArray ReadArraySpan(ref Utf8JsonReader reader, int depth)
+    {
+        int start = (int)reader.TokenStartIndex;
+        var elems = new List<JsonSpanNode>();
+
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.EndArray)
+            {
+                var arr = new JsonSpanArray
+                {
+                    Start = start,
+                    CloseBracketIndex = (int)reader.TokenStartIndex,
+                    End = (int)reader.BytesConsumed,
+                    TokenType = JsonTokenType.StartArray
+                };
+                arr.Elements.AddRange(elems);
+                return arr;
+            }
+
+            elems.Add(SkipOrReadNode(ref reader, depth + 1));
+        }
+
+        throw new JsonException("Unterminated JSON array.");
+    }
+
+    private static bool IsAsciiWhitespaceOnly(ReadOnlySpan<byte> bytes)
+    {
+        for (int i = 0; i < bytes.Length; i++)
+        {
+            byte b = bytes[i];
+            if (b != (byte)' ' && b != (byte)'\t' && b != (byte)'\r' && b != (byte)'\n')
+                return false;
+        }
+        return true;
+    }
+
+    private static bool TryGetUniqueProperty(JsonSpanObject obj, string name, out JsonSpanProperty? property, out bool isDuplicate)
+    {
+        property = null;
+        isDuplicate = false;
+        foreach (var p in obj.Properties)
+        {
+            if (string.Equals(p.Name, name, StringComparison.Ordinal))
+            {
+                if (property != null)
+                {
+                    isDuplicate = true;
+                    property = null;
+                    return false;
+                }
+                property = p;
+            }
+        }
+        return property != null;
+    }
+
+    private static bool HasProperty(JsonSpanObject obj, string name)
+    {
+        foreach (var p in obj.Properties)
+        {
+            if (string.Equals(p.Name, name, StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool TryGetStringProperty(JsonSpanObject obj, string name, out string? value)
+    {
+        value = null;
+        if (TryGetUniqueProperty(obj, name, out JsonSpanProperty? prop, out _) &&
+            prop?.Value is JsonSpanPrimitive prim &&
+            prim.TokenType == JsonTokenType.String)
+        {
+            value = prim.StringValue;
+            return true;
+        }
+        return false;
+    }
+
+    private static bool TryGetBoolProperty(JsonSpanObject obj, string name, out bool value)
+    {
+        value = false;
+        if (TryGetUniqueProperty(obj, name, out JsonSpanProperty? prop, out _) &&
+            prop?.Value is JsonSpanPrimitive prim &&
+            prim.BoolValue.HasValue)
+        {
+            value = prim.BoolValue.Value;
+            return true;
+        }
+        return false;
+    }
+
+    private static JsonDocStyle DetectJsonDocStyle(ReadOnlySpan<byte> body, JsonSpanObject root)
+    {
+        int lfIdx = body.IndexOf((byte)'\n');
+        bool isCompact = lfIdx < 0;
+        string newLine = "\n";
+        if (!isCompact)
+        {
+            newLine = lfIdx > 0 && body[lfIdx - 1] == (byte)'\r' ? "\r\n" : "\n";
+        }
+
+        string indentUnit = "  ";
+        if (!isCompact && root.Properties.Count > 0)
+        {
+            string rootIndent = GetLineIndent(body, root.Start);
+            string firstPropIndent = GetLineIndent(body, root.Properties[0].NameStart);
+            if (firstPropIndent.Length > rootIndent.Length && firstPropIndent.StartsWith(rootIndent, StringComparison.Ordinal))
+            {
+                indentUnit = firstPropIndent.Substring(rootIndent.Length);
+            }
+            else if (firstPropIndent.Length > 0)
+            {
+                indentUnit = firstPropIndent;
+            }
+        }
+
+        string colonSep = isCompact ? ":" : ": ";
+        if (root.Properties.Count > 0)
+        {
+            var p = root.Properties[0];
+            if (p.Value.Start > p.NameEnd)
+            {
+                string between = Encoding.ASCII.GetString(body.Slice(p.NameEnd, p.Value.Start - p.NameEnd));
+                if (between.Contains(':', StringComparison.Ordinal))
+                {
+                    colonSep = between;
+                }
+            }
+        }
+
+        return new JsonDocStyle(isCompact, newLine, indentUnit, colonSep);
+    }
+
+    private static string GetLineIndent(ReadOnlySpan<byte> body, int pos)
+    {
+        int clamped = Math.Clamp(pos, 0, body.Length);
+        int lineStart = clamped;
+        while (lineStart > 0 && body[lineStart - 1] != (byte)'\n')
+        {
+            lineStart--;
+        }
+
+        int wsEnd = lineStart;
+        while (wsEnd < body.Length && (body[wsEnd] == (byte)' ' || body[wsEnd] == (byte)'\t'))
+        {
+            wsEnd++;
+        }
+
+        return Encoding.ASCII.GetString(body.Slice(lineStart, wsEnd - lineStart));
+    }
+
+    private static string GetChildIndentForObject(ReadOnlySpan<byte> body, JsonSpanObject obj, JsonDocStyle style)
+    {
+        if (style.IsCompact) return "";
+        if (obj.Properties.Count > 0)
+        {
+            string existingIndent = GetLineIndent(body, obj.Properties[0].NameStart);
+            if (existingIndent.Length > 0 || GetLineIndent(body, obj.Start).Length == 0)
+            {
+                // Ensure it is on its own line; if inline like {"a": 1}, fall back to parent + unit
+                if (IsFirstNonWsOnLine(body, obj.Properties[0].NameStart))
+                {
+                    return existingIndent;
+                }
+            }
+        }
+        return GetLineIndent(body, obj.Start) + style.IndentUnit;
+    }
+
+    private static string GetChildIndentForArray(ReadOnlySpan<byte> body, JsonSpanArray arr, JsonDocStyle style)
+    {
+        if (style.IsCompact) return "";
+        if (arr.Elements.Count > 0 && IsFirstNonWsOnLine(body, arr.Elements[0].Start))
+        {
+            return GetLineIndent(body, arr.Elements[0].Start);
+        }
+        return GetLineIndent(body, arr.Start) + style.IndentUnit;
+    }
+
+    private static bool IsFirstNonWsOnLine(ReadOnlySpan<byte> body, int pos)
+    {
+        int i = Math.Clamp(pos, 0, body.Length) - 1;
+        while (i >= 0 && body[i] != (byte)'\n')
+        {
+            if (body[i] != (byte)' ' && body[i] != (byte)'\t' && body[i] != (byte)'\r')
+                return false;
+            i--;
+        }
+        return true;
+    }
+
+    private static void AddInsertPropertyIntoObjectEdit(
+        List<ByteEdit> edits,
+        ReadOnlySpan<byte> body,
+        JsonSpanObject obj,
+        string formattedProps,
+        JsonDocStyle style,
+        string childIndent,
+        string objIndent)
+    {
+        if (obj.Properties.Count == 0)
+        {
+            string replacement = style.IsCompact
+                ? formattedProps
+                : style.NewLine + childIndent + formattedProps + style.NewLine + objIndent;
+            edits.Add(new ByteEdit(obj.Start + 1, obj.CloseBraceIndex, Utf8NoBom.GetBytes(replacement)));
+        }
+        else
+        {
+            int insertPos = obj.Properties[^1].FullEnd;
+            string prefix = style.IsCompact ? "," : "," + style.NewLine + childIndent;
+            edits.Add(new ByteEdit(insertPos, insertPos, Utf8NoBom.GetBytes(prefix + formattedProps)));
+        }
+    }
+
+    private static void AddInsertElementIntoArrayEdit(
+        List<ByteEdit> edits,
+        ReadOnlySpan<byte> body,
+        JsonSpanArray arr,
+        string formattedElem,
+        JsonDocStyle style,
+        string elemIndent,
+        string arrIndent)
+    {
+        if (arr.Elements.Count == 0)
+        {
+            string replacement = style.IsCompact
+                ? formattedElem
+                : style.NewLine + elemIndent + formattedElem + style.NewLine + arrIndent;
+            edits.Add(new ByteEdit(arr.Start + 1, arr.CloseBracketIndex, Utf8NoBom.GetBytes(replacement)));
+        }
+        else
+        {
+            int insertPos = arr.Elements[^1].End;
+            string prefix = style.IsCompact ? "," : "," + style.NewLine + elemIndent;
+            edits.Add(new ByteEdit(insertPos, insertPos, Utf8NoBom.GetBytes(prefix + formattedElem)));
+        }
+    }
+
+    private static void AddRemoveObjectPropertiesEdits(
+        List<ByteEdit> edits,
+        JsonSpanObject obj,
+        HashSet<int> indicesToRemove)
+    {
+        var kept = new List<int>(obj.Properties.Count);
+        for (int i = 0; i < obj.Properties.Count; i++)
+        {
+            if (!indicesToRemove.Contains(i))
+            {
+                kept.Add(i);
+            }
+        }
+
+        if (kept.Count == 0)
+        {
+            edits.Add(new ByteEdit(obj.Start + 1, obj.CloseBraceIndex, Array.Empty<byte>()));
+            return;
+        }
+
+        // Remove leading deleted properties before first kept property
+        if (kept[0] > 0)
+        {
+            edits.Add(new ByteEdit(obj.Properties[0].FullStart, obj.Properties[kept[0]].FullStart, Array.Empty<byte>()));
+        }
+
+        // Remove middle gaps between consecutive kept properties
+        for (int k = 0; k < kept.Count - 1; k++)
+        {
+            int left = kept[k];
+            int right = kept[k + 1];
+            if (right > left + 1)
+            {
+                edits.Add(new ByteEdit(obj.Properties[left].FullEnd, obj.Properties[right - 1].FullEnd, Array.Empty<byte>()));
+            }
+        }
+
+        // Remove trailing deleted properties after last kept property
+        int lastKept = kept[^1];
+        if (lastKept < obj.Properties.Count - 1)
+        {
+            edits.Add(new ByteEdit(obj.Properties[lastKept].FullEnd, obj.Properties[^1].FullEnd, Array.Empty<byte>()));
+        }
+    }
+
+    private static void AddRemoveArrayElementsEdits(
+        List<ByteEdit> edits,
+        JsonSpanArray arr,
+        HashSet<int> indicesToRemove)
+    {
+        var kept = new List<int>(arr.Elements.Count);
+        for (int i = 0; i < arr.Elements.Count; i++)
+        {
+            if (!indicesToRemove.Contains(i))
+            {
+                kept.Add(i);
+            }
+        }
+
+        if (kept.Count == 0)
+        {
+            edits.Add(new ByteEdit(arr.Start + 1, arr.CloseBracketIndex, Array.Empty<byte>()));
+            return;
+        }
+
+        if (kept[0] > 0)
+        {
+            edits.Add(new ByteEdit(arr.Elements[0].Start, arr.Elements[kept[0]].Start, Array.Empty<byte>()));
+        }
+
+        for (int k = 0; k < kept.Count - 1; k++)
+        {
+            int left = kept[k];
+            int right = kept[k + 1];
+            if (right > left + 1)
+            {
+                edits.Add(new ByteEdit(arr.Elements[left].End, arr.Elements[right - 1].End, Array.Empty<byte>()));
+            }
+        }
+
+        int lastKept = kept[^1];
+        if (lastKept < arr.Elements.Count - 1)
+        {
+            edits.Add(new ByteEdit(arr.Elements[lastKept].End, arr.Elements[^1].End, Array.Empty<byte>()));
+        }
+    }
+
+    private static byte[] ApplyByteEdits(byte[] originalBytes, int bomLength, List<ByteEdit> edits)
+    {
+        edits.Sort((a, b) =>
+        {
+            int cmp = a.Start.CompareTo(b.Start);
+            return cmp != 0 ? cmp : a.End.CompareTo(b.End);
         });
 
-        // Normalize EOL to match original file's newline style
-        serialized = serialized.Replace("\r\n", "\n", StringComparison.Ordinal);
-        if (!string.Equals(newLine, "\n", StringComparison.Ordinal))
+        int bodyLen = originalBytes.Length - bomLength;
+        using var ms = new MemoryStream(originalBytes.Length + 512);
+
+        if (bomLength > 0)
         {
-            serialized = serialized.Replace("\n", newLine, StringComparison.Ordinal);
+            ms.Write(originalBytes, 0, bomLength);
         }
 
-        serialized += newLine;
-
-        var encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: includeUtf8Bom);
-        if (!includeUtf8Bom)
+        int cursor = 0;
+        foreach (var edit in edits)
         {
-            return encoding.GetBytes(serialized);
+            if (edit.Start < cursor || edit.End < edit.Start || edit.End > bodyLen)
+            {
+                throw new InvalidOperationException($"Overlapping or out-of-range JSON splice edit [{edit.Start}..{edit.End}] after cursor {cursor}.");
+            }
+
+            if (edit.Start > cursor)
+            {
+                ms.Write(originalBytes, bomLength + cursor, edit.Start - cursor);
+            }
+
+            if (edit.Replacement.Length > 0)
+            {
+                ms.Write(edit.Replacement, 0, edit.Replacement.Length);
+            }
+
+            cursor = edit.End;
         }
 
-        byte[] preamble = encoding.GetPreamble();
-        byte[] body = encoding.GetBytes(serialized);
-        byte[] combined = new byte[preamble.Length + body.Length];
-        Buffer.BlockCopy(preamble, 0, combined, 0, preamble.Length);
-        Buffer.BlockCopy(body, 0, combined, preamble.Length, body.Length);
-        return combined;
+        if (cursor < bodyLen)
+        {
+            ms.Write(originalBytes, bomLength + cursor, bodyLen - cursor);
+        }
+
+        return ms.ToArray();
     }
+
+    private byte[] BuildFreshHooksJsonDocument(HookEventSpec[] specs, string agentId, string emitterScriptPath)
+    {
+        var style = new JsonDocStyle(IsCompact: false, Environment.NewLine, "  ", ": ");
+        string hooksProp = FormatHooksProperty(specs, agentId, emitterScriptPath, style, "  ");
+        string json = "{" + style.NewLine + "  " + hooksProp + style.NewLine + "}" + style.NewLine;
+        return Utf8NoBom.GetBytes(json);
+    }
+
+    private string FormatHooksProperty(
+        HookEventSpec[] specs,
+        string agentId,
+        string emitterScriptPath,
+        JsonDocStyle style,
+        string propIndent)
+    {
+        string innerIndent = style.IsCompact ? "" : propIndent + style.IndentUnit;
+        var eventParts = new List<string>(specs.Length);
+        foreach (var spec in specs)
+        {
+            string cmd = BuildHookCommand(emitterScriptPath, spec.EventType, agentId, spec.Message);
+            eventParts.Add(FormatEventProperty(spec, cmd, style, innerIndent));
+        }
+
+        if (style.IsCompact)
+        {
+            return $"\"hooks\"{style.ColonSep}{{{string.Join(",", eventParts)}}}";
+        }
+
+        return $"\"hooks\"{style.ColonSep}{{{style.NewLine}{innerIndent}" +
+               string.Join($",{style.NewLine}{innerIndent}", eventParts) +
+               $"{style.NewLine}{propIndent}}}";
+    }
+
+    private static string FormatEventProperty(
+        HookEventSpec spec,
+        string desiredCommand,
+        JsonDocStyle style,
+        string propIndent)
+    {
+        string groupIndent = style.IsCompact ? "" : propIndent + style.IndentUnit;
+        string groupJson = FormatWrapperGroup(spec, desiredCommand, style, groupIndent);
+        string key = EncodeJsonString(spec.EventKey);
+
+        if (style.IsCompact)
+        {
+            return $"{key}{style.ColonSep}[{groupJson}]";
+        }
+
+        return $"{key}{style.ColonSep}[{style.NewLine}{groupIndent}{groupJson}{style.NewLine}{propIndent}]";
+    }
+
+    private static string FormatWrapperGroup(
+        HookEventSpec spec,
+        string desiredCommand,
+        JsonDocStyle style,
+        string groupIndent)
+    {
+        string propIndent = style.IsCompact ? "" : groupIndent + style.IndentUnit;
+        string hookIndent = style.IsCompact ? "" : propIndent + style.IndentUnit;
+        string hookJson = FormatHookObject(desiredCommand, spec.AsyncDispatch, style, hookIndent);
+
+        if (style.IsCompact)
+        {
+            if (!string.IsNullOrEmpty(spec.Matcher))
+            {
+                return $"{{\"matcher\"{style.ColonSep}{EncodeJsonString(spec.Matcher)},\"hooks\"{style.ColonSep}[{hookJson}]}}";
+            }
+            return $"{{\"hooks\"{style.ColonSep}[{hookJson}]}}";
+        }
+
+        var sb = new StringBuilder();
+        sb.Append('{').Append(style.NewLine);
+        if (!string.IsNullOrEmpty(spec.Matcher))
+        {
+            sb.Append(propIndent).Append("\"matcher\"").Append(style.ColonSep).Append(EncodeJsonString(spec.Matcher)).Append(',').Append(style.NewLine);
+        }
+        sb.Append(propIndent).Append("\"hooks\"").Append(style.ColonSep).Append('[').Append(style.NewLine);
+        sb.Append(hookIndent).Append(hookJson).Append(style.NewLine);
+        sb.Append(propIndent).Append(']').Append(style.NewLine);
+        sb.Append(groupIndent).Append('}');
+        return sb.ToString();
+    }
+
+    private static string FormatHookObject(
+        string desiredCommand,
+        bool asyncDispatch,
+        JsonDocStyle style,
+        string hookIndent)
+    {
+        string propIndent = style.IsCompact ? "" : hookIndent + style.IndentUnit;
+        string encodedCmd = EncodeJsonString(desiredCommand);
+
+        if (style.IsCompact)
+        {
+            return asyncDispatch
+                ? $"{{\"type\"{style.ColonSep}\"command\",\"command\"{style.ColonSep}{encodedCmd},\"async\"{style.ColonSep}true}}"
+                : $"{{\"type\"{style.ColonSep}\"command\",\"command\"{style.ColonSep}{encodedCmd}}}";
+        }
+
+        var sb = new StringBuilder();
+        sb.Append('{').Append(style.NewLine);
+        sb.Append(propIndent).Append("\"type\"").Append(style.ColonSep).Append("\"command\",").Append(style.NewLine);
+        sb.Append(propIndent).Append("\"command\"").Append(style.ColonSep).Append(encodedCmd);
+        if (asyncDispatch)
+        {
+            sb.Append(',').Append(style.NewLine);
+            sb.Append(propIndent).Append("\"async\"").Append(style.ColonSep).Append("true");
+        }
+        sb.Append(style.NewLine).Append(hookIndent).Append('}');
+        return sb.ToString();
+    }
+
+    private static string EncodeJsonString(string value)
+    {
+        return "\"" + JsonEncodedText.Encode(value, JavaScriptEncoder.UnsafeRelaxedJsonEscaping).Value + "\"";
+    }
+
+    // ------------------------------------------------------------------------
+    // Container Provenance Store (stored in KageDesk AppData, never polluting user configs)
+    // ------------------------------------------------------------------------
+
+    private sealed record ContainerProvenance(
+        bool CreatedHooksObject,
+        HashSet<string> CreatedEventKeys
+    )
+    {
+        public static ContainerProvenance Unknown => new(false, new HashSet<string>(StringComparer.Ordinal));
+    }
+
+    private ContainerProvenance LoadContainerProvenance(string targetConfigPath)
+    {
+        try
+        {
+            string storePath = ProvenanceStorePath;
+            if (!File.Exists(storePath))
+                return ContainerProvenance.Unknown;
+
+            ValidateNoReparsePointsInPath(storePath);
+            Dictionary<string, ContainerProvenance> map = ReadProvenanceMap(File.ReadAllBytes(storePath));
+            string key = Path.GetFullPath(targetConfigPath).ToUpperInvariant();
+            return map.TryGetValue(key, out ContainerProvenance? found) ? found : ContainerProvenance.Unknown;
+        }
+        catch
+        {
+            // Conservative fallback: when provenance cannot be read, treat ownership as unproven
+            return ContainerProvenance.Unknown;
+        }
+    }
+
+    private void SaveContainerProvenance(string targetConfigPath, ContainerProvenance provenance)
+    {
+        try
+        {
+            string storePath = ProvenanceStorePath;
+            string? dir = Path.GetDirectoryName(storePath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                EnsureDirectorySafe(dir);
+            }
+
+            WithTargetLock(storePath, () =>
+            {
+                ValidateNoReparsePointsInPath(storePath);
+                Dictionary<string, ContainerProvenance> map = new(StringComparer.Ordinal);
+                bool existed = File.Exists(storePath);
+                if (existed)
+                {
+                    try
+                    {
+                        map = ReadProvenanceMap(File.ReadAllBytes(storePath));
+                    }
+                    catch { }
+                }
+
+                string key = Path.GetFullPath(targetConfigPath).ToUpperInvariant();
+                map[key] = provenance;
+
+                byte[] bytes = SerializeProvenanceMap(map);
+                WriteInternalBytesAtomic(storePath, bytes, fileExisted: existed);
+            });
+        }
+        catch
+        {
+            // Non-fatal: provenance failure simply falls back to conservative empty-container preservation
+        }
+    }
+
+    private void ClearContainerProvenance(string targetConfigPath)
+    {
+        try
+        {
+            string storePath = ProvenanceStorePath;
+            if (!File.Exists(storePath)) return;
+
+            WithTargetLock(storePath, () =>
+            {
+                ValidateNoReparsePointsInPath(storePath);
+                if (!File.Exists(storePath)) return;
+
+                Dictionary<string, ContainerProvenance> map = ReadProvenanceMap(File.ReadAllBytes(storePath));
+                string key = Path.GetFullPath(targetConfigPath).ToUpperInvariant();
+                if (!map.Remove(key))
+                    return;
+
+                byte[] bytes = SerializeProvenanceMap(map);
+                WriteInternalBytesAtomic(storePath, bytes, fileExisted: true);
+            });
+        }
+        catch
+        {
+            // Non-fatal
+        }
+    }
+
+    private static Dictionary<string, ContainerProvenance> ReadProvenanceMap(byte[] raw)
+    {
+        var map = new Dictionary<string, ContainerProvenance>(StringComparer.Ordinal);
+        using JsonDocument doc = JsonDocument.Parse(raw);
+        if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            return map;
+
+        foreach (JsonProperty prop in doc.RootElement.EnumerateObject())
+        {
+            if (prop.Value.ValueKind != JsonValueKind.Object)
+                continue;
+
+            bool createdHooks = prop.Value.TryGetProperty("createdHooksObject", out JsonElement chEl) &&
+                                chEl.ValueKind == JsonValueKind.True;
+
+            var keys = new HashSet<string>(StringComparer.Ordinal);
+            if (prop.Value.TryGetProperty("createdEventKeys", out JsonElement keysEl) &&
+                keysEl.ValueKind == JsonValueKind.Array)
+            {
+                foreach (JsonElement item in keysEl.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.String)
+                    {
+                        string? s = item.GetString();
+                        if (!string.IsNullOrEmpty(s))
+                        {
+                            keys.Add(s);
+                        }
+                    }
+                }
+            }
+
+            map[prop.Name] = new ContainerProvenance(createdHooks, keys);
+        }
+
+        return map;
+    }
+
+    private static byte[] SerializeProvenanceMap(Dictionary<string, ContainerProvenance> map)
+    {
+        using var ms = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(ms, new JsonWriterOptions { Indented = true }))
+        {
+            writer.WriteStartObject();
+            foreach (KeyValuePair<string, ContainerProvenance> kvp in map.OrderBy(p => p.Key, StringComparer.Ordinal))
+            {
+                writer.WritePropertyName(kvp.Key);
+                writer.WriteStartObject();
+                writer.WriteBoolean("createdHooksObject", kvp.Value.CreatedHooksObject);
+                writer.WritePropertyName("createdEventKeys");
+                writer.WriteStartArray();
+                foreach (string k in kvp.Value.CreatedEventKeys.OrderBy(x => x, StringComparer.Ordinal))
+                {
+                    writer.WriteStringValue(k);
+                }
+                writer.WriteEndArray();
+                writer.WriteEndObject();
+            }
+            writer.WriteEndObject();
+        }
+        return ms.ToArray();
+    }
+
+    // ------------------------------------------------------------------------
+    // Path Validation, Single-Read Snapshot, Post-Flush Check & Coupled Backup Replace
+    // ------------------------------------------------------------------------
 
     private static string ValidateEmitterScriptPath(string rawPath)
     {
@@ -1288,21 +2450,25 @@ export const KageDeskPlugin = async () => ({
         bool Exists,
         long Length,
         DateTime LastWriteTimeUtc,
-        byte[]? Sha256
+        byte[]? Sha256,
+        byte[]? OriginalBytes
     );
 
+    /// <summary>
+    /// Reads target file ONCE into OriginalBytes and computes SHA-256 over that exact buffer.
+    /// Callers MUST parse and validate exclusively from OriginalBytes (never performing a second read).
+    /// </summary>
     private static FileSnapshot CaptureSnapshot(string path)
     {
         if (!File.Exists(path))
         {
-            return new FileSnapshot(false, 0, DateTime.MinValue, null);
+            return new FileSnapshot(false, 0, DateTime.MinValue, null, null);
         }
 
-        var fi = new FileInfo(path);
         byte[] bytes = File.ReadAllBytes(path);
         byte[] hash = SHA256.HashData(bytes);
-        fi.Refresh();
-        return new FileSnapshot(true, bytes.Length, fi.LastWriteTimeUtc, hash);
+        var fi = new FileInfo(path);
+        return new FileSnapshot(true, bytes.Length, fi.LastWriteTimeUtc, hash, bytes);
     }
 
     private static bool MatchesSnapshot(string path, FileSnapshot expected)
@@ -1327,6 +2493,11 @@ export const KageDeskPlugin = async () => ({
 
         byte[] bytes = File.ReadAllBytes(path);
         if (bytes.Length != expected.Length)
+        {
+            return false;
+        }
+
+        if (expected.OriginalBytes != null && !bytes.AsSpan().SequenceEqual(expected.OriginalBytes))
         {
             return false;
         }
@@ -1392,7 +2563,67 @@ export const KageDeskPlugin = async () => ({
         return backupPath;
     }
 
-    private static void WriteBytesAtomicWithReplace(string targetPath, byte[] bytes, string? backupPath, bool fileExisted)
+    /// <summary>
+    /// Stages, writes, and flushes the temp file to disk FIRST, then performs the final identity/content check
+    /// against <paramref name="expectedSnapshot"/> immediately before committing.
+    /// Note: Windows File.Replace is not an OS-level compare-and-swap against external writers, so the pre-replace
+    /// check minimizes the conflict window while the coupled unique timestamped backup preserves any replaced
+    /// version for conflict recovery; metadata errors are propagated strictly (ignoreMetadataErrors: false).
+    /// </summary>
+    private bool CommitBytesWithPreReplaceCheck(
+        string targetPath,
+        byte[] bytes,
+        string? backupPath,
+        FileSnapshot expectedSnapshot)
+    {
+        string? dir = Path.GetDirectoryName(targetPath);
+        if (!string.IsNullOrEmpty(dir))
+        {
+            EnsureDirectorySafe(dir);
+        }
+
+        string tempPath = Path.Combine(
+            dir ?? ".",
+            $".{Path.GetFileName(targetPath)}.{Guid.NewGuid():N}.tmp");
+
+        try
+        {
+            // 1. Stage, write, and Flush(true) temp file FIRST so I/O latency is outside the final check window
+            using (var fs = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                fs.Write(bytes, 0, bytes.Length);
+                fs.Flush(flushToDisk: true);
+            }
+
+            // 2. Test seam + final identity/content check immediately before File.Replace / File.Move
+            BeforeCommitHookForTest?.Invoke(targetPath);
+            if (!MatchesSnapshot(targetPath, expectedSnapshot))
+            {
+                return false;
+            }
+
+            // 3. Commit with coupled unique backup for conflict recovery and strict metadata propagation
+            if (expectedSnapshot.Exists)
+            {
+                File.Replace(tempPath, targetPath, destinationBackupFileName: backupPath, ignoreMetadataErrors: false);
+            }
+            else
+            {
+                File.Move(tempPath, targetPath, overwrite: false);
+            }
+
+            return true;
+        }
+        finally
+        {
+            if (File.Exists(tempPath))
+            {
+                try { File.Delete(tempPath); } catch { }
+            }
+        }
+    }
+
+    private static void WriteInternalBytesAtomic(string targetPath, byte[] bytes, bool fileExisted)
     {
         string? dir = Path.GetDirectoryName(targetPath);
         if (!string.IsNullOrEmpty(dir))
@@ -1414,8 +2645,7 @@ export const KageDeskPlugin = async () => ({
 
             if (fileExisted)
             {
-                // Coupled atomic backup + replace; fail on metadata errors (ignoreMetadataErrors: false)
-                File.Replace(tempPath, targetPath, destinationBackupFileName: backupPath, ignoreMetadataErrors: false);
+                File.Replace(tempPath, targetPath, destinationBackupFileName: null, ignoreMetadataErrors: false);
             }
             else
             {

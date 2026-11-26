@@ -585,6 +585,7 @@ public class PetOverlayForm : Form
             effects = effects with { WakeUpPulseRemainingSeconds = localPulse };
         }
 
+        long monotonicTicks = Stopwatch.GetTimestamp();
         _renderer.Render(
             _petBuffer,
             _currentState,
@@ -594,7 +595,8 @@ public class PetOverlayForm : Form
             DateTimeOffset.UtcNow,
             _showMixiWhenAllIdle,
             _dismissedAlerts,
-            effects);
+            effects,
+            monotonicTicks);
 
         // Detach/close Mixi quick menu promptly whenever Mixi is no longer active
         if (!_renderer.IsMixiChillActive && _activeMixiMenu != null)

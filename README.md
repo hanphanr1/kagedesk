@@ -20,7 +20,7 @@ KageDesk v2.2.0 turns your Windows desktop and taskbar into an interactive pixel
 ### Highlights in v2.2.0
 - **Interactive Do Mixi Poking & Quick Activity Picker**: Left-click Do Mixi on either the Live Wallpaper or Taskbar Pet to trigger a startled bounce, heart/spark emote, 8-bit chirp, and crisp Vietnamese pixel speech bubble (`"DANG LAM BAT MI!"`, `"LEN NHAC DI ANH EM!"`, `"BO TOC MIXIGAMING!"`, and more). Right-click directly on Do Mixi on the Taskbar Pet to pin any of the 5 chill activities (`Auto Cycle`, `An mi`, `Coi YouTube`, `Choi game`, `Noi chuyen stream`, `Hat karaoke`) immediately.
 - **Team Drama & Squad Celebration (Wallpaper + Taskbar Pet Parity)**: Review rejections (`REQUEST_CHANGES` / `review_changes`) animate Kakashi tossing a glowing red scroll to Minato, triggering a 6-second Panic Sprint with flying pixel sweat drops and 2x typing sparks. Task completions and CI passes trigger a synchronized 3-second squad hop with falling pixel confetti particles and optional 8-bit fanfare.
-- **1-Click Safe CLI Hook Installer & Live Session Log Watcher**: Run `KageDesk.exe --setup-hooks` (or use System Tray → `Settings`) to safely configure Claude Code (`PreToolUse`, `PostToolUse`, approval-scoped `Notification`, `Stop` with async dispatch), Codex (`CODEX_HOME` / `~/.codex` supported hook events; requires interactive trust in Codex), and OpenCode (owned standalone plugin `~/.config/opencode/plugins/kagedesk-plugin.js` leaving `opencode.json`/`opencode.jsonc` untouched) with exact-ownership matching, automatic timestamped `*.kagedesk.bak` backups, atomic `File.Replace` writes, and idempotent `--uninstall-hooks` cleanup. The companion `SessionLogActivityCollector` tracks only bounded path/offset/identity bookkeeping and parses complete `<= 8 KB` UTF-8 JSONL lines inside a reusable cleared byte buffer (`Utf8JsonReader`), deriving only canonical states/actions without retaining raw prompt text or secrets.
+- **1-Click Safe CLI Hook Installer & Live Session Log Watcher**: Run `KageDesk.exe --setup-hooks` (or use System Tray → `Settings`) to safely configure Claude Code (`PreToolUse`, `PostToolUse`, approval-scoped `Notification`, `Stop` with async dispatch), Codex (`CODEX_HOME` / `~/.codex` supported hook events; requires interactive trust in Codex), and OpenCode (owned standalone plugin `~/.config/opencode/plugins/kagedesk-plugin.js` handling `tool.execute.before`/`after` and `event({ event })` strictly by `event.type`, leaving `opencode.json`/`opencode.jsonc` untouched) via lossless UTF-8 span splicing, exact-ownership matching, automatic timestamped `*.kagedesk.bak` conflict-recovery backups, `File.Replace` commits, and idempotent `--uninstall-hooks` cleanup. The companion `SessionLogActivityCollector` tracks only bounded path/offset/identity bookkeeping and reads at most `<= 8 KB` per poll into a reusable cleared byte buffer (`Utf8JsonReader`), deriving only canonical states/actions without retaining raw prompt text or secrets.
 - **Multi-Monitor Support & Per-Monitor Taskbar Docking**: Pick independent displays for Live Wallpaper and Taskbar Pet from System Tray → `Monitor`, drag the Taskbar Pet smoothly across monitors onto any monitor's taskbar edge (`Bottom`, `Top`, `Left`, `Right`) with per-monitor `WM_DPICHANGED` awareness, and recover cleanly on `DisplaySettingsChanged` if an external screen disconnects.
 - **Single-Instance Wake-Up UX**: Relaunching `KageDesk.exe` while already running signals the active instance over a current-user ACL-restricted Named Pipe to pulse/surface the Taskbar Pet (even in `auto-hide` mode) and display a helpful tray balloon without stealing window focus.
 - **Now-Playing Media Sync & Automatic Real-Time Day/Night Cycle**: `Weather & Time → Auto` shifts automatically across Dawn (`05:00`), Day (`09:00`), Dusk (`17:00`), and Night (`20:00`) with moon/stars and warm desk lamps. Native Core Audio peak detection (`< 0.1%` CPU, zero capture) drives pixel equalizer bars and subtle head-bob grooves on both Wallpaper and Taskbar Pet.
@@ -29,13 +29,13 @@ KageDesk v2.2.0 turns your Windows desktop and taskbar into an interactive pixel
 
 ## Real Measured Performance
 
-Measured on Windows 11 during sustained animated wallpaper + taskbar overlay soak benchmarks (`KageDesk.exe --benchmark`):
+Measured on Windows 11 during sustained animated wallpaper + taskbar overlay soak benchmarks (`KageDesk.exe --benchmark 10`):
 
 | Metric | Measured Result | Notes |
 | :--- | :--- | :--- |
-| **Private RAM** | **~16–22 MB** | Steady-state `< 35 MB` Private RAM; **0 Electron, 0 WebView2, 0 Chromium** |
-| **CPU Usage** | **~0.5% active** | **0.0% wallpaper CPU/GPU** when occluded by maximized or fullscreen apps |
-| **Frame Render Time** | **< 1.2 ms/frame** | Zero per-frame hot-path heap allocations (`0 B/frame` steady-state), fixed-size struct particle pools |
+| **Private RAM** | **~16–22 MB** | Measured `~18.2 MB` (`< 35 MB` budget); **0 Electron, 0 WebView2, 0 Chromium** |
+| **CPU Usage** | **~0.2–0.5% active** | Measured `~0.21%` in `--benchmark 10`; **0.0% wallpaper CPU/GPU** when occluded by maximized or fullscreen apps |
+| **Frame Render Time** | **~1.3 ms/frame** | Full `--benchmark 10` soak loop (`~0.5–1.0 ms` wallpaper / `~0.2–0.3 ms` pet hot-path); zero per-frame heap allocations (`0 B/frame` steady-state) |
 | **GDI Handle Delta** | **0** | Zero GDI/USER handle leaks across soak and rapid 1x/2x scale switches |
 
 ---
@@ -170,11 +170,11 @@ No manual configuration is required for Orca sessions.
 
 ### 2. 1-Click Hook Installer & Live Session Log Watcher
 Run `KageDesk.exe --setup-hooks` or use **Settings → Install CLI Hooks** in the tray menu:
-- **Claude Code** (`~/.claude/settings.json`): lossless, exact-ownership merge for `PreToolUse` (`tool_start`), `PostToolUse` (`tool_complete`), approval-scoped `Notification`, and `Stop` (`turn_done`) using non-blocking `async: true` hooks, timestamped `*.kagedesk.bak` backups, and atomic `File.Replace`. Refuses without modifying files with comments or unsupported layouts.
+- **Claude Code** (`~/.claude/settings.json`): lossless UTF-8 byte-span splicing with exact-ownership matching for `PreToolUse` (`tool_start`), `PostToolUse` (`tool_complete`), approval-scoped `Notification`, and `Stop` (`turn_done`) using non-blocking `async: true` hooks, pre-replace conflict checks, timestamped `*.kagedesk.bak` conflict-recovery backups, and `File.Replace` commits. Preserves unrelated formatting/escapes/BOM/EOL/EOF and pre-existing empty containers, and refuses without modifying files with comments or unsupported layouts.
 - **Codex** (`$CODEX_HOME/hooks.json`, fallback `~/.codex/hooks.json`): installs only Codex-supported hook events (`PreToolUse`, `PostToolUse`, `Stop`) and requires interactive trust in Codex for local hooks.
-- **OpenCode** (`~/.config/opencode/plugins/kagedesk-plugin.js`): installs an owned standalone local plugin file while leaving `opencode.json`/`opencode.jsonc` completely untouched.
+- **OpenCode** (`~/.config/opencode/plugins/kagedesk-plugin.js`): installs an owned standalone local plugin file handling `tool.execute.before`, `tool.execute.after`, and `event({ event })` strictly by `event.type` while leaving `opencode.json`/`opencode.jsonc` completely untouched.
 
-The built-in `SessionLogActivityCollector` watches local CLI transcript folders via a bounded serialized watcher, keeping only bounded path/offset/file-identity bookkeeping and parsing complete UTF-8 JSONL lines inside a reusable cleared `<= 8 KB` byte buffer (`Utf8JsonReader`) so raw prompt text and secrets are never retained.
+The built-in `SessionLogActivityCollector` watches local CLI transcript folders via a single serialized watcher/consumer loop with automatic dead-watcher recreation, keeping only bounded path/offset/file-identity bookkeeping and reading at most `<= 8 KB` total per poll into a reusable cleared byte buffer (`Utf8JsonReader`) so raw prompt text and secrets are never retained.
 
 ### 3. Local HTTP Event Bridge (`127.0.0.1:4319`)
 Any local agent, CLI runner, or CI hook can push real-time status updates to `http://127.0.0.1:4319/api/event`:

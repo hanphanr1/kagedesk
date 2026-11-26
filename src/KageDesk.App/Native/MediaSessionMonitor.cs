@@ -33,6 +33,9 @@ public sealed class MediaSessionMonitor : IDisposable
     private long _enableGeneration;
     private int _consecutiveSilentTicks;
     private MediaPlaybackSnapshot _current;
+    private volatile bool _effectiveIsPlaying;
+
+    internal Action<MediaPlaybackSnapshot>? BeforeInvokePlaybackChangedForTest { get; set; }
 
     public bool Enabled
     {
@@ -40,19 +43,23 @@ public sealed class MediaSessionMonitor : IDisposable
         set => SetEnabled(value);
     }
 
-    public bool IsPlaying
-    {
-        get { lock (_lock) return _current.IsPlaying; }
-    }
+    /// <summary>
+    /// Authoritative lock-updated effective playing state: guaranteed false whenever disabled, stopped, or disposed.
+    /// Consumers should read this property (not raw event snapshot payloads) so a late MTA callback can never
+    /// reinstate playing=true after disable.
+    /// </summary>
+    public bool IsMediaPlaying => _effectiveIsPlaying;
+
+    public bool IsPlaying => _effectiveIsPlaying;
 
     public string? CurrentSource
     {
-        get { lock (_lock) return _current.SourceApp; }
+        get { lock (_lock) return (!_disposed && _enabled) ? _current.SourceApp : null; }
     }
 
     public MediaPlaybackSnapshot Current
     {
-        get { lock (_lock) return _current; }
+        get { lock (_lock) return (!_disposed && _enabled) ? _current : default; }
     }
 
     public long EnableGeneration
@@ -74,6 +81,11 @@ public sealed class MediaSessionMonitor : IDisposable
         _enabled = enabled;
     }
 
+    private void UpdateEffectivePlayingLocked()
+    {
+        _effectiveIsPlaying = !_disposed && _enabled && _current.IsPlaying;
+    }
+
     public void Start()
     {
         lock (_lock)
@@ -91,6 +103,9 @@ public sealed class MediaSessionMonitor : IDisposable
         {
             _enableGeneration++;
             _running = false;
+            _current = default;
+            _consecutiveSilentTicks = 0;
+            _effectiveIsPlaying = false;
             threadToJoin = _mtaPollThread;
             _mtaPollThread = null;
             try { _wakeSignal.Set(); } catch (ObjectDisposedException) { }
@@ -125,6 +140,7 @@ public sealed class MediaSessionMonitor : IDisposable
                 EnsureMtaPollThreadLocked();
             }
 
+            UpdateEffectivePlayingLocked();
             try { _wakeSignal.Set(); } catch (ObjectDisposedException) { }
         }
 
@@ -163,6 +179,7 @@ public sealed class MediaSessionMonitor : IDisposable
             // Monotonic enableGeneration gate: discard stale sample if disabled, stopped, or toggled mid-probe
             if (_disposed || !_enabled || capturedGeneration != _enableGeneration)
             {
+                UpdateEffectivePlayingLocked();
                 return default;
             }
 
@@ -189,6 +206,7 @@ public sealed class MediaSessionMonitor : IDisposable
                 }
             }
 
+            UpdateEffectivePlayingLocked();
             effective = _current;
         }
 
@@ -203,6 +221,7 @@ public sealed class MediaSessionMonitor : IDisposable
 
             if (stillValid)
             {
+                BeforeInvokePlaybackChangedForTest?.Invoke(toEmit.Value);
                 PlaybackChanged?.Invoke(this, toEmit.Value);
             }
         }
@@ -291,6 +310,9 @@ public sealed class MediaSessionMonitor : IDisposable
             _disposed = true;
             _enabled = false;
             _running = false;
+            _current = default;
+            _consecutiveSilentTicks = 0;
+            _effectiveIsPlaying = false;
             _enableGeneration++;
             threadToJoin = _mtaPollThread;
             _mtaPollThread = null;

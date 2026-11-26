@@ -643,7 +643,7 @@ public class V22HooksAndSessionLogTests
             File.WriteAllText(overflowFile, "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"pytest\"}]}}\n");
             collector.SimulateWatcherOverflow();
             Assert.True(SpinWait.SpinUntil(
-                () => collector.GetCurrentSnapshots().Any(s => s.Id == "session:claude" && string.Equals(s.ToolName, "test", StringComparison.OrdinalIgnoreCase)),
+                () => collector.GetCurrentSnapshots().Any(s => s.Id.StartsWith("session:claude:", StringComparison.OrdinalIgnoreCase) && string.Equals(s.ToolName, "test", StringComparison.OrdinalIgnoreCase)),
                 TimeSpan.FromSeconds(3)), "Overflow reconciliation should pick up overflow.jsonl.");
 
             // Missing root created after startup attaches via bounded reconciliation
@@ -655,8 +655,8 @@ public class V22HooksAndSessionLogTests
             File.Delete(logPath);
             File.Delete(overflowFile);
             Assert.True(SpinWait.SpinUntil(
-                () => !collector.GetCurrentSnapshots().Any(s => s.Id == "session:claude"),
-                TimeSpan.FromSeconds(3)), "Deleting all tracked log files should clear session:claude snapshot.");
+                () => !collector.GetCurrentSnapshots().Any(s => s.Id.StartsWith("session:claude:", StringComparison.OrdinalIgnoreCase)),
+                TimeSpan.FromSeconds(3)), "Deleting all tracked log files should clear session:claude snapshots.");
         }
         finally
         {
@@ -729,7 +729,7 @@ public class V22HooksAndSessionLogTests
     }
 
     [Fact]
-    public void Aggregator_SessionLogOverridesSingleUnambiguousProcessWhilePreservingMetadata()
+    public void Aggregator_VerifiedSessionLogEnrichesProcessWhileUnverifiedEmitsSeparateTile()
     {
         var now = new DateTimeOffset(2026, 4, 10, 12, 0, 0, TimeSpan.Zero);
         var agg = new HqStateAggregator(timeProvider: () => now);
@@ -747,17 +747,37 @@ public class V22HooksAndSessionLogTests
         agg.UpdateProcessAgents(new[] { procAgent });
         Assert.Equal(AgentState.Idle, agg.CurrentState.Agents.Single().State);
 
-        var logAgent = new AgentSnapshot(
-            Id: "sessionlog-claude",
+        // Unverified log (no verified PID+StartTicks or workspace) MUST NOT mutate the lone live process;
+        // instead it emits one separate provider activity tile!
+        var unverifiedLog = new AgentSnapshot(
+            Id: "session:claude:unverified01",
+            Name: "Claude",
+            Role: AgentRole.External,
+            SpriteKey: "claude",
+            State: AgentState.Working,
+            ToolName: "CODE",
+            Source: "session-log",
+            UpdatedAt: now);
+
+        agg.UpdateSessionLogActivity(new[] { unverifiedLog });
+        Assert.Equal(2, agg.CurrentState.Agents.Count);
+        Assert.Equal(AgentState.Idle, agg.CurrentState.Agents.Single(a => a.Id == "proc-claude-4242").State);
+        Assert.Single(agg.CurrentState.Agents, a => a.Source == "session-log" && a.State == AgentState.Working);
+
+        // Verified (Provider + Pid + ProcessStartTicks) enriches the exact process while preserving metadata!
+        var verifiedLog = new AgentSnapshot(
+            Id: "session:claude:verified0001",
             Name: "Claude",
             Role: AgentRole.External,
             SpriteKey: "claude",
             State: AgentState.Working,
             ToolName: "TEST",
             Source: "session-log",
+            ProcessId: 4242,
+            ProcessStartTicks: 123456789L,
             UpdatedAt: now);
 
-        agg.UpdateSessionLogActivity(new[] { logAgent });
+        agg.UpdateSessionLogActivity(new[] { verifiedLog });
 
         var merged = Assert.Single(agg.CurrentState.Agents);
         Assert.Equal(AgentState.Working, merged.State);
@@ -783,8 +803,8 @@ public class V22HooksAndSessionLogTests
         var proc2 = new AgentSnapshot("proc-claude-2002", "Claude #2", AgentRole.External, "claude", AgentState.Idle, Source: "process", ProcessId: 2002, ProcessStartTicks: 222L);
         agg.UpdateProcessAgents(new[] { proc1, proc2 });
 
-        // 1. Uncorrelated session-log observation (no PID/Repo) MUST NOT clobber proc1 or proc2; displays separate tile instead
-        var uncorrelatedLog = new AgentSnapshot("sessionlog-claude", "Claude", AgentRole.External, "claude", AgentState.Working, ToolName: "CODE", Source: "session-log", UpdatedAt: now);
+        // 1. Uncorrelated session-log observation (no verified PID+StartTicks/Repo) MUST NOT clobber proc1 or proc2; displays separate tile instead
+        var uncorrelatedLog = new AgentSnapshot("session:claude:uncorr000001", "Claude", AgentRole.External, "claude", AgentState.Working, ToolName: "CODE", Source: "session-log", UpdatedAt: now);
         agg.UpdateSessionLogActivity(new[] { uncorrelatedLog });
 
         var agents1 = agg.CurrentState.Agents;
@@ -792,8 +812,17 @@ public class V22HooksAndSessionLogTests
         Assert.Equal(AgentState.Idle, agents1.Single(a => a.Id == "proc-claude-2002").State);
         Assert.Contains(agents1, a => a.Source == "session-log" && a.State == AgentState.Working);
 
-        // 2. Verified PID-correlated observation updates ONLY proc-claude-1001, leaving proc-claude-2002 Idle!
-        var correlatedLog = new AgentSnapshot("sessionlog-claude-1001", "Claude", AgentRole.External, "claude", AgentState.Working, ToolName: "TEST", Source: "session-log", ProcessId: 1001, UpdatedAt: now);
+        // 2. Bare PID without ProcessStartTicks OR mismatched/reused ProcessStartTicks MUST NOT correlate!
+        var barePidLog = new AgentSnapshot("session:claude:barepid00001", "Claude", AgentRole.External, "claude", AgentState.Working, ToolName: "TEST", Source: "session-log", ProcessId: 1001, ProcessStartTicks: null, UpdatedAt: now);
+        agg.UpdateSessionLogActivity(new[] { barePidLog });
+        Assert.Equal(AgentState.Idle, agg.CurrentState.Agents.Single(a => a.Id == "proc-claude-1001").State);
+
+        var reusedPidLog = new AgentSnapshot("session:claude:reused000001", "Claude", AgentRole.External, "claude", AgentState.Working, ToolName: "TEST", Source: "session-log", ProcessId: 1001, ProcessStartTicks: 999L, UpdatedAt: now);
+        agg.UpdateSessionLogActivity(new[] { reusedPidLog });
+        Assert.Equal(AgentState.Idle, agg.CurrentState.Agents.Single(a => a.Id == "proc-claude-1001").State);
+
+        // 3. Verified (Provider + PID + ProcessStartTicks) observation updates ONLY proc-claude-1001, leaving proc-claude-2002 Idle!
+        var correlatedLog = new AgentSnapshot("session:claude:corr00000001", "Claude", AgentRole.External, "claude", AgentState.Working, ToolName: "TEST", Source: "session-log", ProcessId: 1001, ProcessStartTicks: 111L, UpdatedAt: now);
         agg.UpdateSessionLogActivity(new[] { correlatedLog });
 
         var agents2 = agg.CurrentState.Agents;
@@ -813,7 +842,7 @@ public class V22HooksAndSessionLogTests
         agg.UpdateProcessAgents(new[] { procAgent });
 
         var obsTime = clock;
-        var logAgent = new AgentSnapshot("sessionlog-claude", "Claude", AgentRole.External, "claude", AgentState.Working, ToolName: "CODE", Source: "session-log", UpdatedAt: obsTime);
+        var logAgent = new AgentSnapshot("session:claude:fresh0000001", "Claude", AgentRole.External, "claude", AgentState.Working, ToolName: "CODE", Source: "session-log", ProcessId: 4242, ProcessStartTicks: 123L, UpdatedAt: obsTime);
         agg.UpdateSessionLogActivity(new[] { logAgent }, ttlSeconds: 20.0);
         Assert.Equal(AgentState.Working, agg.CurrentState.Agents.Single().State);
 
@@ -914,5 +943,357 @@ public class V22HooksAndSessionLogTests
         var demoCelebrate = await client.PostAsync($"http://127.0.0.1:{port}/api/demo/celebrate", null);
         Assert.Equal(HttpStatusCode.OK, demoCelebrate.StatusCode);
         Assert.Contains(agg.CurrentState.PendingVisualEvents, e => e.Type == "celebrate");
+    }
+
+    [Fact]
+    public void HookInstaller_LosslessSpanSplicing_PreservesFormattingEscapesBomEolEof_AndPreExistingEmptyContainer()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), $"kagedesk-lossless-{Guid.NewGuid():N}");
+        string fakeHome = Path.Combine(tempRoot, "home");
+        string fakeAppData = Path.Combine(tempRoot, "appdata");
+        string claudeDir = Path.Combine(fakeHome, ".claude");
+        string claudeSettings = Path.Combine(claudeDir, "settings.json");
+        Directory.CreateDirectory(claudeDir);
+
+        try
+        {
+            var installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319);
+
+            // Case 1: UTF-8 BOM + CRLF + unusual spacing/indentation + escaped unicode (\u0041) + no trailing newline
+            byte[] utf8Bom = { 0xEF, 0xBB, 0xBF };
+            string richJson = "{\r\n    \"zKey\"   :   \"\\u0041\\u0042\",\r\n    \"aKey\": [1,  2,  3],\r\n    \"hooks\" : {\r\n        \"PreToolUse\" : [\r\n            {\"matcher\":\"*\",   \"hooks\":[{\"type\":\"command\",\"command\":\"echo keep\\u0021\"}]}\r\n        ]\r\n    }\r\n}";
+            byte[] originalRichBytes = utf8Bom.Concat(Encoding.UTF8.GetBytes(richJson)).ToArray();
+            File.WriteAllBytes(claudeSettings, originalRichBytes);
+
+            var installRes = installer.InstallClaudeCode(installer.DefaultEmitterScriptPath);
+            Assert.Equal(HookActionStatus.Installed, installRes.Status);
+
+            byte[] installedBytes = File.ReadAllBytes(claudeSettings);
+            // BOM preserved, unrelated bytes (indentation, spacing, unicode escapes, key order) preserved byte-for-byte!
+            Assert.True(installedBytes.Take(3).SequenceEqual(utf8Bom));
+            string installedText = Encoding.UTF8.GetString(installedBytes, 3, installedBytes.Length - 3);
+            Assert.Contains("\"zKey\"   :   \"\\u0041\\u0042\"", installedText, StringComparison.Ordinal);
+            Assert.Contains("\"aKey\": [1,  2,  3]", installedText, StringComparison.Ordinal);
+            Assert.Contains("{\"matcher\":\"*\",   \"hooks\":[{\"type\":\"command\",\"command\":\"echo keep\\u0021\"}]}", installedText, StringComparison.Ordinal);
+            Assert.False(installedText.EndsWith("\n", StringComparison.Ordinal));
+
+            var uninstallRes = installer.UninstallClaudeCode();
+            Assert.Equal(HookActionStatus.Uninstalled, uninstallRes.Status);
+            byte[] actualRichBytes = File.ReadAllBytes(claudeSettings);
+            Assert.Equal(Encoding.UTF8.GetString(originalRichBytes), Encoding.UTF8.GetString(actualRichBytes));
+            Assert.Equal(originalRichBytes, actualRichBytes);
+
+            // Case 2: Starting from exact compact {"hooks":{"PreToolUse":[]}} -> install -> uninstall returns exact byte-identical {"hooks":{"PreToolUse":[]}}!
+            byte[] exactEmptyContainerBytes = Encoding.UTF8.GetBytes("""{"hooks":{"PreToolUse":[]}}""");
+            File.WriteAllBytes(claudeSettings, exactEmptyContainerBytes);
+
+            var install2 = installer.InstallClaudeCode(installer.DefaultEmitterScriptPath);
+            Assert.Equal(HookActionStatus.Installed, install2.Status);
+
+            var uninstall2 = installer.UninstallClaudeCode();
+            Assert.Equal(HookActionStatus.Uninstalled, uninstall2.Status);
+            byte[] actualEmptyBytes = File.ReadAllBytes(claudeSettings);
+            Assert.Equal(Encoding.UTF8.GetString(exactEmptyContainerBytes), Encoding.UTF8.GetString(actualEmptyBytes));
+            Assert.Equal(exactEmptyContainerBytes, actualEmptyBytes);
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void HookInstaller_OpenCodeEventHandler_AndLegacyHookUpgradeAndUninstall()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), $"kagedesk-opencode-legacy-{Guid.NewGuid():N}");
+        string fakeHome = Path.Combine(tempRoot, "home");
+        string fakeAppData = Path.Combine(tempRoot, "appdata");
+        string claudeDir = Path.Combine(fakeHome, ".claude");
+        string claudeSettings = Path.Combine(claudeDir, "settings.json");
+        string openCodeDir = Path.Combine(fakeHome, ".config", "opencode");
+        string openCodePlugin = Path.Combine(openCodeDir, "plugins", "kagedesk-plugin.js");
+        Directory.CreateDirectory(claudeDir);
+        Directory.CreateDirectory(openCodeDir);
+
+        try
+        {
+            var installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319);
+
+            // 1. OpenCode plugin exports tool.execute.before/after AND supported event({ event }) handler branching strictly on event.type
+            var ocInstall = installer.InstallOpenCode();
+            Assert.Equal(HookActionStatus.Installed, ocInstall.Status);
+            string pluginJs = File.ReadAllText(openCodePlugin);
+            Assert.Contains("\"tool.execute.before\"", pluginJs, StringComparison.Ordinal);
+            Assert.Contains("\"tool.execute.after\"", pluginJs, StringComparison.Ordinal);
+            Assert.Contains("event: async ({ event }) =>", pluginJs, StringComparison.Ordinal);
+            Assert.Contains("event.type", pluginJs, StringComparison.Ordinal);
+            Assert.Contains("\"permission.asked\"", pluginJs, StringComparison.Ordinal);
+            Assert.Contains("\"permission.updated\"", pluginJs, StringComparison.Ordinal);
+            Assert.Contains("\"session.idle\"", pluginJs, StringComparison.Ordinal);
+            Assert.Contains("\"session.error\"", pluginJs, StringComparison.Ordinal);
+            // Must NOT inspect or forward arbitrary event payloads
+            Assert.DoesNotContain("event.properties", pluginJs, StringComparison.Ordinal);
+            Assert.DoesNotContain("event.payload", pluginJs, StringComparison.Ordinal);
+            Assert.DoesNotContain("JSON.stringify(event)", pluginJs, StringComparison.Ordinal);
+
+            // 2. Seed Claude with exact legacy KageDesk fingerprints (tool_done, notification, idle) + unrelated user hook
+            string emitterEscaped = installer.DefaultEmitterScriptPath.Replace("\\", "\\\\");
+            string legacyDoc =
+                "{\n" +
+                "  \"customUserKey\": \"stay-intact\\u0021\",\n" +
+                "  \"hooks\": {\n" +
+                "    \"PostToolUse\": [\n" +
+                "      {\n" +
+                "        \"matcher\": \"*\",\n" +
+                "        \"hooks\": [\n" +
+                "          { \"type\": \"command\", \"command\": \"echo user-post-tool\" },\n" +
+                $"          {{ \"type\": \"command\", \"command\": \"powershell -NoProfile -ExecutionPolicy Bypass -File \\\"{emitterEscaped}\\\" -Type tool_done -AgentId claude -Message \\\"Tool execution completed\\\" -Port 4319\", \"async\": true }}\n" +
+                "        ]\n" +
+                "      }\n" +
+                "    ],\n" +
+                "    \"Notification\": [\n" +
+                "      {\n" +
+                "        \"hooks\": [\n" +
+                $"          {{ \"type\": \"command\", \"command\": \"powershell -NoProfile -ExecutionPolicy Bypass -File \\\"{emitterEscaped}\\\" -Type notification -AgentId claude -Message \\\"Notification received\\\" -Port 4319\" }}\n" +
+                "        ]\n" +
+                "      }\n" +
+                "    ],\n" +
+                "    \"Stop\": [\n" +
+                "      {\n" +
+                "        \"hooks\": [\n" +
+                $"          {{ \"type\": \"command\", \"command\": \"powershell -NoProfile -ExecutionPolicy Bypass -File \\\"{emitterEscaped}\\\" -Type idle -AgentId claude -Message \\\"Agent stopped\\\" -Port 4319\", \"async\": true }}\n" +
+                "        ]\n" +
+                "      }\n" +
+                "    ]\n" +
+                "  }\n" +
+                "}\n";
+            File.WriteAllText(claudeSettings, legacyDoc);
+
+            // Install upgrades/replaces legacy fingerprints with current schema while leaving unrelated user hook intact
+            var upgraded = installer.InstallClaudeCode(installer.DefaultEmitterScriptPath);
+            Assert.Equal(HookActionStatus.Installed, upgraded.Status);
+            string upgradedText = File.ReadAllText(claudeSettings);
+            Assert.DoesNotContain("-Type tool_done", upgradedText, StringComparison.Ordinal);
+            Assert.DoesNotContain("-Type notification", upgradedText, StringComparison.Ordinal);
+            Assert.DoesNotContain("-Type idle", upgradedText, StringComparison.Ordinal);
+            Assert.Contains("-Type tool_complete", upgradedText, StringComparison.Ordinal);
+            Assert.Contains("-Type approval", upgradedText, StringComparison.Ordinal);
+            Assert.Contains("-Type turn_done", upgradedText, StringComparison.Ordinal);
+            Assert.Contains("echo user-post-tool", upgradedText, StringComparison.Ordinal);
+            Assert.Contains("\"customUserKey\": \"stay-intact\\u0021\"", upgradedText, StringComparison.Ordinal);
+
+            // Now test direct uninstall from legacy-only config (without prior upgrade) cleans exact legacy fingerprints cleanly
+            File.WriteAllText(claudeSettings, legacyDoc);
+            var uninstalledLegacy = installer.UninstallClaudeCode();
+            Assert.Equal(HookActionStatus.Uninstalled, uninstalledLegacy.Status);
+            string afterUninstall = File.ReadAllText(claudeSettings);
+            Assert.DoesNotContain("kagedesk-emit.ps1", afterUninstall, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("echo user-post-tool", afterUninstall, StringComparison.Ordinal);
+            Assert.Contains("\"customUserKey\": \"stay-intact\\u0021\"", afterUninstall, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void HookInstaller_PostFlushConflict_AbortsDeletesTempFileAndLeavesConcurrentWriterIntact()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), $"kagedesk-postflush-{Guid.NewGuid():N}");
+        string fakeHome = Path.Combine(tempRoot, "home");
+        string fakeAppData = Path.Combine(tempRoot, "appdata");
+        string claudeDir = Path.Combine(fakeHome, ".claude");
+        string claudeSettings = Path.Combine(claudeDir, "settings.json");
+        Directory.CreateDirectory(claudeDir);
+
+        try
+        {
+            File.WriteAllText(claudeSettings, """{"theme":"initial"}""");
+            string externalWriterContent = """{"theme":"written-after-temp-flush"}""";
+            bool sawTempFileOnDisk = false;
+
+            var installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319)
+            {
+                BeforeCommitHookForTest = path =>
+                {
+                    // BeforeCommitHookForTest fires AFTER temp file write + Flush(true), right before final check & File.Replace
+                    sawTempFileOnDisk = Directory.GetFiles(claudeDir, "*.tmp").Length > 0;
+                    File.WriteAllText(path, externalWriterContent);
+                }
+            };
+
+            var res = installer.InstallClaudeCode(installer.DefaultEmitterScriptPath);
+            Assert.True(sawTempFileOnDisk, "Temp file must be staged and flushed BEFORE final conflict check.");
+            Assert.Equal(HookActionStatus.Failed, res.Status);
+            Assert.Equal(externalWriterContent, File.ReadAllText(claudeSettings));
+            Assert.Empty(Directory.GetFiles(claudeDir, "*.tmp"));
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void SessionLogActivityCollector_MaintenanceDuringAppend_NeverSwallowsFinalTurnEnd()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), $"kagedesk-maint-drain-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            string logPath = Path.Combine(tempDir, "session-turn.jsonl");
+            File.WriteAllText(logPath, "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Edit\"}]}}\n");
+
+            using var collector = new SessionLogActivityCollector(
+                watchRoots: new[] { new SessionWatchRoot("claude", "Claude", tempDir) },
+                debounceWindow: TimeSpan.FromMilliseconds(20),
+                maxCoalescingDelay: TimeSpan.FromMilliseconds(40));
+
+            collector.Start();
+            // Seed initial Working state
+            collector.ProcessFileDelta(logPath, "claude", "Claude");
+            Assert.Contains(collector.GetCurrentSnapshots(), s => s.State == AgentState.Working);
+
+            // Inject final turn-end append DETERMINISTICALLY while maintenance is executing inside the serial consumer!
+            int injected = 0;
+            collector.OnMaintenanceStepForTest = () =>
+            {
+                if (Interlocked.Exchange(ref injected, 1) == 0)
+                {
+                    File.AppendAllText(logPath, "{\"type\":\"assistant\",\"stop_reason\":\"end_turn\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n");
+                    // Enqueue the changed path while consumer is actively inside maintenance
+                    collector.EnqueuePathForTest(logPath);
+                }
+            };
+
+            collector.TriggerMaintenanceNowForTest();
+
+            // Consumer MUST re-check on exit and drain the turn-end append without swallowing it!
+            Assert.True(SpinWait.SpinUntil(
+                () => collector.GetCurrentSnapshots().Any(s => s.State == AgentState.Done),
+                TimeSpan.FromSeconds(3)), "Turn-end append queued during maintenance MUST be drained immediately.");
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void SessionLogActivityCollector_RootDeletedAndRecreated_RecoversDeadWatcherAndDetectsNewWrites()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), $"kagedesk-watcher-recover-{Guid.NewGuid():N}");
+        string watchedRoot = Path.Combine(tempRoot, "claude-projects");
+        Directory.CreateDirectory(watchedRoot);
+
+        try
+        {
+            using var collector = new SessionLogActivityCollector(
+                watchRoots: new[] { new SessionWatchRoot("claude", "Claude", watchedRoot) },
+                debounceWindow: TimeSpan.FromMilliseconds(25),
+                maxCoalescingDelay: TimeSpan.FromMilliseconds(60));
+
+            collector.Start();
+            Assert.Equal(1, collector.ActiveWatcherCount);
+
+            // Simulate dead/broken FileSystemWatcher.Error AND delete/recreate root directory
+            collector.SimulateWatcherErrorForTest(watchedRoot);
+            Assert.Equal(0, collector.ActiveWatcherCount);
+
+            Directory.Delete(watchedRoot, recursive: true);
+            Directory.CreateDirectory(watchedRoot);
+
+            // Reconciliation must recreate and re-attach a fresh watcher on the recreated root
+            collector.ReconcileMissingRootsNow();
+            Assert.Equal(1, collector.ActiveWatcherCount);
+
+            string freshLog = Path.Combine(watchedRoot, "recovered-session.jsonl");
+            File.WriteAllText(freshLog, "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"pytest\"}]}}\n");
+
+            Assert.True(SpinWait.SpinUntil(
+                () => collector.GetCurrentSnapshots().Any(s =>
+                    s.Id.StartsWith("session:claude:", StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(s.ToolName, "TEST", StringComparison.OrdinalIgnoreCase)),
+                TimeSpan.FromSeconds(3)), "Recreated watcher MUST detect writes in recreated root directory.");
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void SessionLogCollectorAndAggregator_EndToEnd_TwoConcurrentLogs_ReusedPidRejection_EventTimeOrder_And8KBReadCap()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), $"kagedesk-e2e-corr-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var baseTime = new DateTimeOffset(2026, 4, 10, 16, 0, 0, TimeSpan.Zero);
+            var agg = new HqStateAggregator(timeProvider: () => baseTime.AddSeconds(5));
+
+            var procA = new AgentSnapshot("proc-claude-1001", "Claude A", AgentRole.External, "claude", AgentState.Idle, Source: "process", ProcessId: 1001, ProcessStartTicks: 111000L);
+            var procB = new AgentSnapshot("proc-claude-2002", "Claude B", AgentRole.External, "claude", AgentState.Idle, Source: "process", ProcessId: 2002, ProcessStartTicks: 222000L);
+            agg.UpdateProcessAgents(new[] { procA, procB });
+
+            string logA = Path.Combine(tempDir, "session-a.jsonl");
+            string logB = Path.Combine(tempDir, "session-b.jsonl");
+            string logReusedPid = Path.Combine(tempDir, "session-reused.jsonl");
+
+            // Write >100 KB into logA so we also verify total file bytes read (including header probe) <= 8192 B (Item 8.3)!
+            var sbA = new StringBuilder(120_000);
+            for (int i = 0; i < 600; i++)
+            {
+                sbA.AppendLine($"{{\"timestamp\":\"2026-04-10T15:50:00Z\",\"type\":\"user\",\"content\":\"padding line {i} xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}");
+            }
+            sbA.AppendLine("{\"timestamp\":\"2026-04-10T16:00:02Z\",\"pid\":1001,\"process_start_ticks\":111000,\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"pytest\"}]}}");
+            File.WriteAllText(logA, sbA.ToString());
+
+            // Second concurrent log for procB (different tool: Edit -> CODE)
+            File.WriteAllText(logB, "{\"timestamp\":\"2026-04-10T16:00:03Z\",\"pid\":2002,\"process_start_ticks\":222000,\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Edit\"}]}}\n");
+
+            // Third log with REUSED PID 1001 but WRONG process_start_ticks (999999 != 111000) and OLDER event timestamp
+            File.WriteAllText(logReusedPid, "{\"timestamp\":\"2026-04-10T15:59:50Z\",\"pid\":1001,\"process_start_ticks\":999999,\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"AskUserQuestion\"}]}}\n");
+
+            using var collector = new SessionLogActivityCollector(
+                watchRoots: new[] { new SessionWatchRoot("claude", "Claude", tempDir) },
+                clock: () => baseTime.AddSeconds(5));
+
+            collector.ProcessFileDelta(logA, "claude", "Claude");
+            // Verify Item 8.3: total file bytes read (header probe + tail read) NEVER exceeds 8192 B!
+            Assert.True(collector.LastTotalFileBytesReadForTest <= SessionLogActivityCollector.MaxTailReadBytes,
+                $"Expected total read <= {SessionLogActivityCollector.MaxTailReadBytes}, got {collector.LastTotalFileBytesReadForTest}");
+
+            collector.ProcessFileDelta(logB, "claude", "Claude");
+            collector.ProcessFileDelta(logReusedPid, "claude", "Claude");
+
+            var snapshots = collector.GetCurrentSnapshots();
+            // Per-session snapshots (NOT collapsed into one session:claude)
+            Assert.Equal(3, snapshots.Count);
+            Assert.Equal(3, snapshots.Select(s => s.Id).Distinct(StringComparer.OrdinalIgnoreCase).Count());
+            // Event-time freshness ordering: logB (16:00:03) > logA (16:00:02) > logReusedPid (15:59:50)
+            Assert.Equal(new DateTimeOffset(2026, 4, 10, 16, 0, 3, TimeSpan.Zero), snapshots[0].UpdatedAt);
+            Assert.Equal(new DateTimeOffset(2026, 4, 10, 16, 0, 2, TimeSpan.Zero), snapshots[1].UpdatedAt);
+            Assert.Equal(new DateTimeOffset(2026, 4, 10, 15, 59, 50, TimeSpan.Zero), snapshots[2].UpdatedAt);
+
+            agg.UpdateSessionLogActivity(snapshots);
+
+            var mergedA = agg.CurrentState.Agents.Single(a => a.Id == "proc-claude-1001");
+            var mergedB = agg.CurrentState.Agents.Single(a => a.Id == "proc-claude-2002");
+            // Each concurrent process enriched independently, and reused PID did NOT misattribute NeedsApproval onto procA!
+            Assert.Equal(AgentState.Working, mergedA.State);
+            Assert.Equal("TEST", mergedA.ToolName, ignoreCase: true);
+            Assert.Equal(AgentState.Working, mergedB.State);
+            Assert.Equal("CODE", mergedB.ToolName, ignoreCase: true);
+            // Reused-PID log emitted as one separate provider activity tile instead of mutating procA
+            Assert.Single(agg.CurrentState.Agents, a => a.Source == "session-log" && a.State == AgentState.NeedsApproval);
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
     }
 }

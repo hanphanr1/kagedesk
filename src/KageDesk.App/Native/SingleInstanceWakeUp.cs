@@ -1,15 +1,19 @@
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 
 namespace KageDesk.App.Native;
 
 /// <summary>
 /// Authenticated, current-user-scoped Named Pipe IPC for Single-Instance Wake-Up UX.
-/// Restricts pipe ACL strictly to the current user's SID (PipeAccessRights.ReadWrite),
-/// validates a strict 8-byte wake opcode, and coalesces/rate-limits receiver callbacks.
+/// Restricts pipe ACL strictly to the current user's SID (PipeAccessRights.FullControl),
+/// enforces exact 8-byte wake opcode framing without trailing bytes before ACK,
+/// bounds all client connect/write/flush/read I/O within a single timeout budget,
+/// and coalesces/rate-limits receiver callbacks.
 /// </summary>
 public static class SingleInstanceWakeUp
 {
@@ -51,7 +55,9 @@ public static class SingleInstanceWakeUp
     /// <summary>
     /// Connects to the running instance's current-user Named Pipe server with bounded retry
     /// (up to 2.5 s by default) to tolerate startup races while the first instance initializes.
-    /// Returns true only if the 8-byte wake opcode was delivered and acknowledged.
+    /// All connect/write/flush/read operations share a single per-attempt timeout bounded by
+    /// the remaining retry budget so a stalled server cannot hang the caller indefinitely.
+    /// Returns true only if the exact 8-byte wake opcode was delivered and acknowledged.
     /// </summary>
     public static bool TrySignalRunningInstance(
         string? pipeName = null,
@@ -63,30 +69,36 @@ public static class SingleInstanceWakeUp
 
         long startTick = Environment.TickCount64;
         long deadlineTick = startTick + (long)budget.TotalMilliseconds;
+        byte[] ackBuf = new byte[1];
 
         while (true)
         {
             long remainingMs = Math.Max(1, deadlineTick - Environment.TickCount64);
-            int connectTimeoutMs = (int)Math.Min(250, remainingMs);
+            int attemptTimeoutMs = (int)Math.Min(500, remainingMs);
 
             try
             {
+                using var attemptCts = new CancellationTokenSource(attemptTimeoutMs);
                 using var client = new NamedPipeClientStream(
                     serverName: ".",
                     pipeName: targetPipe,
                     direction: PipeDirection.InOut,
-                    options: PipeOptions.CurrentUserOnly,
+                    options: PipeOptions.CurrentUserOnly | PipeOptions.Asynchronous,
                     impersonationLevel: TokenImpersonationLevel.None);
 
-                client.Connect(connectTimeoutMs);
-                client.Write(WakeOpcodeBytes, 0, WakeOpcodeBytes.Length);
-                client.Flush();
+                client.ConnectAsync(attemptCts.Token).GetAwaiter().GetResult();
+                client.WriteAsync(WakeOpcodeBytes, 0, WakeOpcodeBytes.Length, attemptCts.Token).GetAwaiter().GetResult();
+                client.FlushAsync(attemptCts.Token).GetAwaiter().GetResult();
 
-                int ack = client.ReadByte();
-                if (ack == AckByte)
+                int read = client.ReadAsync(ackBuf, 0, 1, attemptCts.Token).GetAwaiter().GetResult();
+                if (read == 1 && ackBuf[0] == AckByte)
                 {
                     return true;
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                // Attempt timed out (server starting or stalled); retry if budget remains
             }
             catch (TimeoutException)
             {
@@ -106,12 +118,13 @@ public static class SingleInstanceWakeUp
                 // Retry within budget
             }
 
-            if (Environment.TickCount64 >= deadlineTick)
+            long leftMs = deadlineTick - Environment.TickCount64;
+            if (leftMs <= 0)
             {
                 return false;
             }
 
-            Thread.Sleep(50);
+            Thread.Sleep((int)Math.Min(50, leftMs));
         }
     }
 }
@@ -125,9 +138,11 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
     private readonly TimeSpan _rateLimitWindow;
     private readonly Func<DateTimeOffset> _clock;
     private readonly CancellationTokenSource _cts = new();
+    private readonly object _lifecycleLock = new();
     private readonly object _rateLock = new();
 
     private Task? _listenTask;
+    private NamedPipeServerStream? _pendingServer;
     private DateTimeOffset _lastAcceptedWakeAt = DateTimeOffset.MinValue;
     private bool _started;
     private bool _disposed;
@@ -149,26 +164,45 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
 
     public void Start()
     {
-        if (_disposed || _started) return;
-        _started = true;
-
-        // Pre-create the first pipe instance synchronously so the kernel pipe endpoint
-        // exists immediately before Start() returns (zero ThreadPool startup race).
-        NamedPipeServerStream? initialServer = null;
-        try
+        lock (_lifecycleLock)
         {
-            initialServer = CreateServerInstance();
-        }
-        catch (Exception ex)
-        {
-            LastListenException = ex;
-        }
+            if (_disposed || _started) return;
+            _started = true;
 
-        _listenTask = Task.Factory.StartNew(
-            () => ListenLoopAsync(initialServer, _cts.Token),
-            _cts.Token,
-            TaskCreationOptions.LongRunning,
-            TaskScheduler.Default).Unwrap();
+            // Capture token before scheduling so Dispose() cannot cause ObjectDisposedException
+            // on _cts.Token before ListenLoopAsync enters its try/finally block.
+            CancellationToken ct = _cts.Token;
+
+            // Pre-create the first pipe instance synchronously so the kernel pipe endpoint
+            // exists immediately before Start() returns (zero ThreadPool startup race).
+            NamedPipeServerStream? initialServer = null;
+            try
+            {
+                initialServer = CreateServerInstance();
+            }
+            catch (Exception ex)
+            {
+                LastListenException = ex;
+            }
+
+            _pendingServer = initialServer;
+
+            try
+            {
+                // Pass CancellationToken.None so the listener body always runs its finally block.
+                // PipeOptions.Asynchronous uses IOCP so Task.Run does not block a thread or pay OS thread creation cost.
+                _listenTask = Task.Run(() => ListenLoopAsync(ct), CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                LastListenException = ex;
+                NamedPipeServerStream? leftover = Interlocked.Exchange(ref _pendingServer, null);
+                if (leftover != null)
+                {
+                    try { leftover.Dispose(); } catch { }
+                }
+            }
+        }
     }
 
     private NamedPipeServerStream CreateServerInstance()
@@ -178,60 +212,57 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
             pipeName: _pipeName,
             direction: PipeDirection.InOut,
             maxNumberOfServerInstances: 2,
-            transmissionMode: PipeTransmissionMode.Byte,
+            transmissionMode: PipeTransmissionMode.Message,
             options: PipeOptions.Asynchronous,
             inBufferSize: 64,
             outBufferSize: 64,
             pipeSecurity: security);
     }
 
-    private async Task ListenLoopAsync(NamedPipeServerStream? initialServer, CancellationToken ct)
+    private async Task ListenLoopAsync(CancellationToken ct)
     {
-        NamedPipeServerStream? pendingServer = initialServer;
-        while (!ct.IsCancellationRequested)
+        try
         {
-            NamedPipeServerStream? server = null;
-            try
+            while (!ct.IsCancellationRequested)
             {
-                if (pendingServer != null)
+                NamedPipeServerStream? server = null;
+                try
                 {
-                    server = pendingServer;
-                    pendingServer = null;
-                }
-                else
-                {
-                    server = CreateServerInstance();
-                }
+                    server = Interlocked.Exchange(ref _pendingServer, null) ?? CreateServerInstance();
 
-                await server.WaitForConnectionAsync(ct).ConfigureAwait(false);
-                await HandleClientAsync(server, ct).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (ObjectDisposedException)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                LastListenException = ex;
-                if (ct.IsCancellationRequested) break;
-                try { await Task.Delay(50, ct).ConfigureAwait(false); } catch { break; }
-            }
-            finally
-            {
-                if (server != null)
+                    await server.WaitForConnectionAsync(ct).ConfigureAwait(false);
+                    await HandleClientAsync(server, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
-                    try { server.Dispose(); } catch { }
+                    break;
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    LastListenException = ex;
+                    if (ct.IsCancellationRequested) break;
+                    try { await Task.Delay(50, ct).ConfigureAwait(false); } catch { break; }
+                }
+                finally
+                {
+                    if (server != null)
+                    {
+                        try { server.Dispose(); } catch { }
+                    }
                 }
             }
         }
-
-        if (pendingServer != null)
+        finally
         {
-            try { pendingServer.Dispose(); } catch { }
+            NamedPipeServerStream? leftover = Interlocked.Exchange(ref _pendingServer, null);
+            if (leftover != null)
+            {
+                try { leftover.Dispose(); } catch { }
+            }
         }
     }
 
@@ -240,18 +271,38 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
         using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         readCts.CancelAfter(TimeSpan.FromMilliseconds(500));
 
-        byte[] buf = new byte[SingleInstanceWakeUp.OpcodeLength];
+        // Read into an OpcodeLength + 1 buffer in message mode so any oversized message or
+        // trailing bytes are detected and rejected BEFORE sending ACK.
+        byte[] buf = new byte[SingleInstanceWakeUp.OpcodeLength + 1];
         int total = 0;
-        while (total < buf.Length)
+        bool messageComplete = false;
+        while (total <= SingleInstanceWakeUp.OpcodeLength)
         {
             int n = await server.ReadAsync(buf, total, buf.Length - total, readCts.Token).ConfigureAwait(false);
             if (n <= 0) return;
             total += n;
+            if (server.IsMessageComplete)
+            {
+                messageComplete = true;
+                break;
+            }
         }
 
-        if (!buf.AsSpan().SequenceEqual(SingleInstanceWakeUp.WakeOpcode))
+        if (!messageComplete || total != SingleInstanceWakeUp.OpcodeLength)
+        {
+            // Fragmented, truncated, or trailing bytes in wake message: reject BEFORE ACK.
+            return;
+        }
+
+        if (!buf.AsSpan(0, SingleInstanceWakeUp.OpcodeLength).SequenceEqual(SingleInstanceWakeUp.WakeOpcode))
         {
             // Invalid opcode: reject without waking UI
+            return;
+        }
+
+        // Also reject if any extra trailing bytes/messages are already buffered on the pipe BEFORE sending ACK.
+        if (HasPendingPipeBytes(server.SafePipeHandle))
+        {
             return;
         }
 
@@ -296,16 +347,62 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
         }
     }
 
+    private static bool HasPendingPipeBytes(SafePipeHandle pipeHandle)
+    {
+        if (pipeHandle.IsInvalid || pipeHandle.IsClosed)
+        {
+            return true;
+        }
+
+        if (!PeekNamedPipe(pipeHandle, IntPtr.Zero, 0, IntPtr.Zero, out uint totalBytesAvail, IntPtr.Zero))
+        {
+            return true;
+        }
+
+        return totalBytesAvail > 0;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PeekNamedPipe(
+        SafePipeHandle hNamedPipe,
+        IntPtr lpBuffer,
+        uint nBufferSize,
+        IntPtr lpBytesRead,
+        out uint lpTotalBytesAvail,
+        IntPtr lpBytesLeftThisMessage);
+
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        _cts.Cancel();
+        Task? listenTask;
+        NamedPipeServerStream? unclaimed;
+        lock (_lifecycleLock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _cts.Cancel();
+            unclaimed = Interlocked.Exchange(ref _pendingServer, null);
+            listenTask = _listenTask;
+        }
+
+        if (unclaimed != null)
+        {
+            try { unclaimed.Dispose(); } catch { }
+        }
+
+        bool completed = true;
         try
         {
-            _listenTask?.Wait(TimeSpan.FromSeconds(1));
+            if (listenTask != null)
+            {
+                completed = listenTask.Wait(TimeSpan.FromSeconds(2));
+            }
         }
         catch { }
-        _cts.Dispose();
+
+        if (completed)
+        {
+            _cts.Dispose();
+        }
     }
 }
