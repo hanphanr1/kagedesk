@@ -1,5 +1,7 @@
 using System.Drawing;
 using System.IO.Pipes;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Windows.Forms;
 using KageDesk.App;
@@ -731,5 +733,111 @@ public class V22MultiMonitorWakeUpMediaAndUiTests
             isWindow: _ => true,
             mapWindowPoints: (_, _) => (0, 0, new Win32Interop.RECT(0, 0, 1920, 1080))));
         Assert.Equal(new Rectangle(0, 0, 1920, 1080), mapped);
+    }
+
+    [Fact]
+    public async Task SingleInstanceWakeUp_CrossElevationSameUserAllowed_DifferentUserRejected_AndProtectedReadWriteDacl()
+    {
+        SecurityIdentifier currentUserSid = WindowsIdentity.GetCurrent().User!;
+        var adminsGroupSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+        var differentUserSid = new SecurityIdentifier("S-1-5-21-3623811015-3361044348-30300820-9999");
+
+        // 1. Protected per-user DACL: ReadWrite ONLY to current user, explicit Owner SID == current user
+        PipeSecurity sec = SingleInstanceWakeUp.CreateCurrentUserPipeSecurity();
+        Assert.True(sec.AreAccessRulesProtected);
+        Assert.Equal(currentUserSid, sec.GetOwner(typeof(SecurityIdentifier)));
+
+        var rules = sec.GetAccessRules(includeExplicit: true, includeInherited: false, typeof(SecurityIdentifier))
+            .Cast<PipeAccessRule>()
+            .ToList();
+        Assert.Single(rules);
+        Assert.Equal(currentUserSid, rules[0].IdentityReference);
+        Assert.Equal(AccessControlType.Allow, rules[0].AccessControlType);
+        Assert.True((rules[0].PipeAccessRights & PipeAccessRights.ReadWrite) == PipeAccessRights.ReadWrite);
+        Assert.Equal(0, (int)(rules[0].PipeAccessRights & PipeAccessRights.ChangePermissions));
+        Assert.Equal(0, (int)(rules[0].PipeAccessRights & PipeAccessRights.TakeOwnership));
+
+        // 2. Same-user mixed-elevation policy:
+        //    Standard user token (User=U1, DefaultOwner=U1) vs Elevated token (User=U1, DefaultOwner=BUILTIN\Administrators) -> ALLOWED!
+        var standardUserToken = new SingleInstanceWakeUp.PeerTokenIdentity(currentUserSid, currentUserSid);
+        var elevatedSameUserToken = new SingleInstanceWakeUp.PeerTokenIdentity(currentUserSid, adminsGroupSid);
+        var differentStandardUserToken = new SingleInstanceWakeUp.PeerTokenIdentity(differentUserSid, differentUserSid);
+        var differentElevatedUserToken = new SingleInstanceWakeUp.PeerTokenIdentity(differentUserSid, adminsGroupSid);
+
+        Assert.True(SingleInstanceWakeUp.IsAuthorizedCrossElevationPeer(standardUserToken, elevatedSameUserToken));
+        Assert.True(SingleInstanceWakeUp.IsAuthorizedCrossElevationPeer(elevatedSameUserToken, standardUserToken));
+        Assert.False(SingleInstanceWakeUp.IsAuthorizedCrossElevationPeer(standardUserToken, differentStandardUserToken));
+        Assert.False(SingleInstanceWakeUp.IsAuthorizedCrossElevationPeer(elevatedSameUserToken, differentElevatedUserToken));
+
+        // 3. Live Named Pipe server-side peer User SID verification:
+        //    3a. Same-user peer (simulating elevated client with identical User SID) -> ALLOWED & ACKed
+        string pipeAllow = $"KageDesk_TestElevAllow_{Guid.NewGuid():N}";
+        int allowCount = 0;
+        using var allowSignal = new ManualResetEventSlim(false);
+        using (var allowServer = new SingleInstanceWakeUpServer(
+            onWakeUp: () =>
+            {
+                Interlocked.Increment(ref allowCount);
+                allowSignal.Set();
+            },
+            pipeName: pipeAllow,
+            rateLimitWindow: TimeSpan.Zero,
+            clock: null,
+            expectedUserSid: currentUserSid,
+            resolvePeerUserSidOverride: _ => currentUserSid))
+        {
+            allowServer.Start();
+            var attempts = new List<string>();
+            bool ok = SingleInstanceWakeUp.TrySignalRunningInstanceCore(
+                pipeAllow,
+                maxRetryWindow: TimeSpan.FromMilliseconds(2500),
+                expectedUserSid: currentUserSid,
+                resolveServerOwnerSid: null,
+                onAttemptFailure: attempts.Add);
+            Assert.True(ok, $"Expected same-user wake to succeed. LastListenException={allowServer.LastListenException} Attempts=[{string.Join(" | ", attempts)}]");
+            Assert.True(allowSignal.Wait(TimeSpan.FromSeconds(2)));
+            Assert.Equal(1, Volatile.Read(ref allowCount));
+        }
+
+        //    3b. Different User SID connecting to server -> REJECTED before ACK, callback NEVER invoked!
+        string pipeRejectServer = $"KageDesk_TestElevRejectSrv_{Guid.NewGuid():N}";
+        int rejectServerCount = 0;
+        using (var rejectServer = new SingleInstanceWakeUpServer(
+            onWakeUp: () => Interlocked.Increment(ref rejectServerCount),
+            pipeName: pipeRejectServer,
+            rateLimitWindow: TimeSpan.Zero,
+            clock: null,
+            expectedUserSid: currentUserSid,
+            resolvePeerUserSidOverride: _ => differentUserSid))
+        {
+            rejectServer.Start();
+            bool ok = SingleInstanceWakeUp.TrySignalRunningInstanceCore(
+                pipeRejectServer,
+                maxRetryWindow: TimeSpan.FromMilliseconds(300),
+                expectedUserSid: currentUserSid,
+                resolveServerOwnerSid: null);
+            Assert.False(ok);
+            await Task.Delay(60);
+            Assert.Equal(0, Volatile.Read(ref rejectServerCount));
+        }
+
+        //    3c. Client connecting to pipe owned by a different User SID (e.g. Administrators or another user) -> REJECTED immediately!
+        string pipeRejectClient = $"KageDesk_TestElevRejectCli_{Guid.NewGuid():N}";
+        int rejectClientCount = 0;
+        using (var server = new SingleInstanceWakeUpServer(
+            onWakeUp: () => Interlocked.Increment(ref rejectClientCount),
+            pipeName: pipeRejectClient,
+            rateLimitWindow: TimeSpan.Zero))
+        {
+            server.Start();
+            bool ok = SingleInstanceWakeUp.TrySignalRunningInstanceCore(
+                pipeRejectClient,
+                maxRetryWindow: TimeSpan.FromMilliseconds(1000),
+                expectedUserSid: currentUserSid,
+                resolveServerOwnerSid: _ => differentUserSid);
+            Assert.False(ok);
+            await Task.Delay(60);
+            Assert.Equal(0, Volatile.Read(ref rejectClientCount));
+        }
     }
 }

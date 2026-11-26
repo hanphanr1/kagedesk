@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
@@ -20,9 +21,16 @@ public enum HookActionStatus
     Uninstalled,
     AlreadyRemoved,
     SkippedNotPresent,
+    Unsupported,
     UnsupportedLayout,
     MalformedConfig,
     Failed
+}
+
+public enum OpenCodePluginApiVersion
+{
+    V1 = 1,
+    V2 = 2
 }
 
 public sealed record HookTargetResult(
@@ -54,11 +62,16 @@ public sealed class HookInstaller
     private const string EmitterMarkerPs1 = "kagedesk-emit.ps1";
     private const string ProvenanceFileName = "provenance.json";
     private const string OpenCodePluginFileName = "kagedesk-plugin.js";
-    private const string OpenCodePluginOwnershipMarker = "// kagedesk-managed-opencode-plugin:v1";
+    private const string OpenCodePluginOwnershipMarkerV1 = "// kagedesk-managed-opencode-plugin:v1";
+    private const string OpenCodePluginOwnershipMarkerV2 = "// kagedesk-managed-opencode-plugin:v2";
     private const string ClaudeApprovalNotificationMatcher = "permission_prompt|elicitation_dialog";
     private const string CodexTrustNote = "Codex requires interactive trust approval for workspace/hooks before hooks execute.";
 
     private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan VersionProbeTimeout = TimeSpan.FromSeconds(2);
+    private static readonly Regex OpenCodeSemVerRegex = new(
+        @"(?:^|[^0-9.])v?(?<major>[0-9]+)\.(?<minor>[0-9]+)(?:\.(?<patch>[0-9]+))?",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     private static readonly char[] ForbiddenShellChars =
     {
@@ -73,6 +86,7 @@ public sealed class HookInstaller
     private readonly string? _codexHomeDir;
     private readonly int _bridgePort;
     private readonly Func<DateTimeOffset> _clock;
+    private readonly Func<string?> _openCodeVersionProbe;
 
     /// <summary>
     /// Internal test seam invoked after staging/flushing the temp file and immediately before
@@ -85,7 +99,8 @@ public sealed class HookInstaller
         string? appDataDir = null,
         int bridgePort = 4319,
         Func<DateTimeOffset>? clock = null,
-        string? codexHomeDir = null)
+        string? codexHomeDir = null,
+        Func<string?>? openCodeVersionProbe = null)
     {
         _userProfileDir = string.IsNullOrWhiteSpace(userProfileDir)
             ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
@@ -96,6 +111,7 @@ public sealed class HookInstaller
         _codexHomeDir = string.IsNullOrWhiteSpace(codexHomeDir) ? null : codexHomeDir;
         _bridgePort = bridgePort is >= 1 and <= 65535 ? bridgePort : 4319;
         _clock = clock ?? (() => DateTimeOffset.Now);
+        _openCodeVersionProbe = openCodeVersionProbe ?? ProbeInstalledOpenCodeVersion;
     }
 
     public string DefaultEmitterScriptPath => Path.Combine(_appDataDir, "hooks", EmitterMarkerPs1);
@@ -361,6 +377,16 @@ public sealed class HookInstaller
         try
         {
             ValidateSafePathSyntax(pluginPath, "OpenCode plugin path");
+
+            if (!TryResolveOpenCodePluginApiVersion(out OpenCodePluginApiVersion apiVersion, out string? unsupportedReason))
+            {
+                return new HookTargetResult(
+                    HookTargetKind.OpenCode,
+                    pluginPath,
+                    HookActionStatus.Unsupported,
+                    unsupportedReason!);
+            }
+
             EnsureDirectorySafe(pluginDir);
 
             return WithTargetLock(pluginPath, () =>
@@ -369,7 +395,7 @@ public sealed class HookInstaller
 
                 // Single read into before.OriginalBytes: validate ownership & equality from THAT EXACT buffer
                 FileSnapshot before = CaptureSnapshot(pluginPath);
-                string desiredContent = BuildOpenCodePluginSource(_bridgePort);
+                string desiredContent = BuildOpenCodePluginSource(_bridgePort, apiVersion);
                 byte[] desiredBytes = Utf8NoBom.GetBytes(desiredContent);
 
                 if (before.Exists)
@@ -391,7 +417,7 @@ public sealed class HookInstaller
                             HookTargetKind.OpenCode,
                             pluginPath,
                             HookActionStatus.AlreadyInstalled,
-                            "KageDesk OpenCode plugin already installed and up to date (opencode.json untouched).");
+                            $"KageDesk OpenCode {apiVersion} plugin already installed and up to date (opencode.json untouched).");
                     }
                 }
 
@@ -410,14 +436,109 @@ public sealed class HookInstaller
                     pluginPath,
                     HookActionStatus.Installed,
                     backupPath != null
-                        ? $"Installed standalone KageDesk OpenCode plugin (backup saved to {Path.GetFileName(backupPath)}; opencode.json untouched)."
-                        : "Installed standalone KageDesk OpenCode plugin (opencode.json untouched).",
+                        ? $"Installed standalone KageDesk OpenCode {apiVersion} plugin (backup saved to {Path.GetFileName(backupPath)}; opencode.json untouched)."
+                        : $"Installed standalone KageDesk OpenCode {apiVersion} plugin (opencode.json untouched).",
                     backupPath);
             });
         }
         catch (Exception ex)
         {
             return new HookTargetResult(HookTargetKind.OpenCode, pluginPath, HookActionStatus.Failed, $"Failed: {ex.Message}");
+        }
+    }
+
+    internal static bool TryParseOpenCodeMajorVersion(string? rawVersionOutput, out int majorVersion)
+    {
+        majorVersion = 0;
+        if (string.IsNullOrWhiteSpace(rawVersionOutput))
+            return false;
+
+        Match m = OpenCodeSemVerRegex.Match(rawVersionOutput);
+        if (!m.Success)
+            return false;
+
+        return int.TryParse(m.Groups["major"].Value, out majorVersion);
+    }
+
+    private bool TryResolveOpenCodePluginApiVersion(out OpenCodePluginApiVersion apiVersion, out string? unsupportedReason)
+    {
+        apiVersion = OpenCodePluginApiVersion.V1;
+        unsupportedReason = null;
+
+        string? rawVersion;
+        try
+        {
+            rawVersion = _openCodeVersionProbe();
+        }
+        catch
+        {
+            rawVersion = null;
+        }
+
+        // If the opencode binary is not on PATH (config-directory-only environment), fall back to V1 entrypoint.
+        if (rawVersion == null)
+        {
+            return true;
+        }
+
+        if (!TryParseOpenCodeMajorVersion(rawVersion, out int major))
+        {
+            unsupportedReason = $"Unable to determine supported OpenCode major version from '{rawVersion.Trim()}'; refused to install an unloadable plugin.";
+            return false;
+        }
+
+        if (major == 1)
+        {
+            apiVersion = OpenCodePluginApiVersion.V1;
+            return true;
+        }
+
+        if (major == 2)
+        {
+            apiVersion = OpenCodePluginApiVersion.V2;
+            return true;
+        }
+
+        unsupportedReason = $"OpenCode major version v{major}.x is unsupported (supported: v1.x and v2.x; detected '{rawVersion.Trim()}'); refused to write an unloadable plugin.";
+        return false;
+    }
+
+    private static string? ProbeInstalledOpenCodeVersion()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "opencode",
+                Arguments = "--version",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            using var proc = Process.Start(psi);
+            if (proc == null) return null;
+
+            string stdout = proc.StandardOutput.ReadToEnd();
+            string stderr = proc.StandardError.ReadToEnd();
+            if (!proc.WaitForExit((int)VersionProbeTimeout.TotalMilliseconds))
+            {
+                try { proc.Kill(entireProcessTree: true); } catch { }
+                return null;
+            }
+
+            if (proc.ExitCode != 0)
+            {
+                return null;
+            }
+
+            string combined = !string.IsNullOrWhiteSpace(stdout) ? stdout.Trim() : stderr.Trim();
+            return string.IsNullOrWhiteSpace(combined) ? null : combined;
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -562,7 +683,7 @@ public sealed class HookInstaller
 
             // Single read into before.OriginalBytes; compute hash AND parse from THAT EXACT buffer
             FileSnapshot before = CaptureSnapshot(configPath);
-            ContainerProvenance existingProv = LoadContainerProvenance(configPath);
+            ContainerProvenance existingProv = LoadContainerProvenance(configPath, before.Sha256);
 
             if (!before.Exists)
             {
@@ -578,7 +699,9 @@ public sealed class HookInstaller
 
                 var freshProv = new ContainerProvenance(
                     CreatedHooksObject: true,
-                    CreatedEventKeys: new HashSet<string>(specs.Select(s => s.EventKey), StringComparer.Ordinal));
+                    CreatedEventKeys: new HashSet<string>(specs.Select(s => s.EventKey), StringComparer.Ordinal),
+                    ExpectedSha256Hex: Convert.ToHexString(SHA256.HashData(freshBytes)),
+                    ContainerTrivia: new Dictionary<string, string>(StringComparer.Ordinal));
                 SaveContainerProvenance(configPath, freshProv);
 
                 string freshNote = extraNote == null ? "" : $" Note: {extraNote}";
@@ -675,6 +798,7 @@ public sealed class HookInstaller
             var edits = new List<ByteEdit>();
             bool createdHooksObjNow = hooksWasAbsent;
             var createdEventKeysNow = new HashSet<string>(existingProv.CreatedEventKeys, StringComparer.Ordinal);
+            var containerTriviaNow = new Dictionary<string, string>(existingProv.ContainerTrivia, StringComparer.Ordinal);
             bool effectiveCreatedHooksObj = existingProv.CreatedHooksObject || createdHooksObjNow;
 
             if (hooksWasAbsent)
@@ -682,6 +806,11 @@ public sealed class HookInstaller
                 foreach (var spec in specs)
                 {
                     createdEventKeysNow.Add(spec.EventKey);
+                }
+
+                if (root.Properties.Count == 0)
+                {
+                    CaptureEmptyContainerTrivia(containerTriviaNow, "root", body, root.Start + 1, root.CloseBraceIndex);
                 }
 
                 string rootChildIndent = GetChildIndentForObject(body, root, style);
@@ -693,6 +822,11 @@ public sealed class HookInstaller
             {
                 string hooksObjIndent = GetLineIndent(body, existingHooks!.Start);
                 string hooksChildIndent = GetChildIndentForObject(body, existingHooks, style);
+
+                if (existingHooks.Properties.Count == 0)
+                {
+                    CaptureEmptyContainerTrivia(containerTriviaNow, "hooks", body, existingHooks.Start + 1, existingHooks.CloseBraceIndex);
+                }
 
                 var specByKey = new Dictionary<string, HookEventSpec>(StringComparer.Ordinal);
                 foreach (var s in specs) specByKey[s.EventKey] = s;
@@ -707,12 +841,17 @@ public sealed class HookInstaller
                     if (specByKey.TryGetValue(prop.Name, out HookEventSpec? spec))
                     {
                         var eventArr = (JsonSpanArray)prop.Value;
+                        if (eventArr.Elements.Count == 0)
+                        {
+                            CaptureEmptyContainerTrivia(containerTriviaNow, GetEventTriviaKey(prop.Name), body, eventArr.Start + 1, eventArr.CloseBracketIndex);
+                        }
                         string desiredCmd = BuildHookCommand(emitterScriptPath, spec.EventType, agentId, spec.Message);
                         PlanUpsertEventArrayEdits(edits, body, eventArr, spec, agentId, emitterScriptPath, desiredCmd, style);
                     }
                     else if (IsLegacyOnlyEventKey(prop.Name, specByKey) && prop.Value is JsonSpanArray legacyArr)
                     {
                         // E.g. Codex previously installed Notification; clean legacy KageDesk entries on upgrade!
+                        existingProv.ContainerTrivia.TryGetValue(GetEventTriviaKey(prop.Name), out string? legacyEventTrivia);
                         bool removeKey = PlanRemoveEntriesFromEventArrayEdits(
                             edits,
                             body,
@@ -722,6 +861,7 @@ public sealed class HookInstaller
                             agentId,
                             emitterScriptPath,
                             canRemoveEmptyEventKey: existingProv.CreatedEventKeys.Contains(prop.Name),
+                            preservedEmptyTrivia: legacyEventTrivia,
                             out bool removedAny);
                         if (removedAny && removeKey)
                         {
@@ -748,7 +888,10 @@ public sealed class HookInstaller
                     // Remove deprecated legacy keys from hooksObj (only when they became empty AND provenance allows)
                     if (deprecatedLegacyKeysToRemove.Count == existingHooks.Properties.Count && newEventPropsToAppend.Count == 0)
                     {
-                        edits.Add(new ByteEdit(existingHooks.Start + 1, existingHooks.CloseBraceIndex, Array.Empty<byte>()));
+                        byte[] hooksEmptyBytes = containerTriviaNow.TryGetValue("hooks", out string? hooksTrivia)
+                            ? Utf8NoBom.GetBytes(hooksTrivia)
+                            : Array.Empty<byte>();
+                        edits.Add(new ByteEdit(existingHooks.Start + 1, existingHooks.CloseBraceIndex, hooksEmptyBytes));
                     }
                     else if (deprecatedLegacyKeysToRemove.Count < existingHooks.Properties.Count)
                     {
@@ -762,7 +905,7 @@ public sealed class HookInstaller
                         style.IsCompact ? "," : "," + style.NewLine + hooksChildIndent,
                         newEventPropsToAppend);
 
-                    if (deprecatedLegacyKeysToRemove.Count == existingHooks.Properties.Count)
+                    if (deprecatedLegacyKeysToRemove.Count > 0 && deprecatedLegacyKeysToRemove.Count == existingHooks.Properties.Count)
                     {
                         // Replacing all old deprecated keys with new ones
                         string replacement = style.IsCompact
@@ -772,7 +915,7 @@ public sealed class HookInstaller
                     }
                     else
                     {
-                        // Append after last property (if last property is being removed, insert after its FullEnd which is right after deletion range)
+                        // Append into empty or non-empty existingHooks (preserving empty interior whitespace via zero-width splice)
                         AddInsertPropertyIntoObjectEdit(edits, body, existingHooks, combined, style, hooksChildIndent, hooksObjIndent);
                     }
                 }
@@ -801,7 +944,14 @@ public sealed class HookInstaller
                     "Target config was modified concurrently; aborted to prevent clobbering changes.");
             }
 
-            SaveContainerProvenance(configPath, new ContainerProvenance(effectiveCreatedHooksObj, createdEventKeysNow));
+            string postInstallSha256Hex = Convert.ToHexString(SHA256.HashData(outBytes));
+            SaveContainerProvenance(
+                configPath,
+                new ContainerProvenance(
+                    effectiveCreatedHooksObj,
+                    createdEventKeysNow,
+                    postInstallSha256Hex,
+                    containerTriviaNow));
 
             string noteSuffix = extraNote == null ? "" : $" Note: {extraNote}";
             string installedMsg = $"Installed KageDesk hooks (backup saved to {Path.GetFileName(backupPath)}).{noteSuffix}";
@@ -904,7 +1054,8 @@ public sealed class HookInstaller
                 }
             }
 
-            ContainerProvenance prov = LoadContainerProvenance(configPath);
+            // Content-bound provenance: valid ONLY when current file SHA-256 matches recorded post-install hash!
+            ContainerProvenance prov = LoadContainerProvenance(configPath, before.Sha256);
             var remainingProvKeys = new HashSet<string>(prov.CreatedEventKeys, StringComparer.Ordinal);
             var innerEdits = new List<ByteEdit>();
             var eventPropIndicesToRemove = new HashSet<int>();
@@ -927,8 +1078,9 @@ public sealed class HookInstaller
                     continue;
                 }
 
-                // Never delete an empty managed event array unless KageDesk provably created it!
+                // Never delete an empty managed event array unless hash-bound provenance proves KageDesk created it!
                 bool canRemoveEmptyEventKey = prov.CreatedEventKeys.Contains(prop.Name);
+                prov.ContainerTrivia.TryGetValue(GetEventTriviaKey(prop.Name), out string? eventTrivia);
                 bool removeEventKey = PlanRemoveEntriesFromEventArrayEdits(
                     innerEdits,
                     body,
@@ -938,6 +1090,7 @@ public sealed class HookInstaller
                     agentId,
                     emitterScriptPath,
                     canRemoveEmptyEventKey,
+                    preservedEmptyTrivia: eventTrivia,
                     out bool removedAnyFromEvent);
 
                 if (removedAnyFromEvent)
@@ -970,7 +1123,7 @@ public sealed class HookInstaller
                 int hooksIndex = root.Properties.IndexOf(hooksProp);
                 if (root.Properties.Count == 1)
                 {
-                    finalEdits.Add(new ByteEdit(root.Start + 1, root.CloseBraceIndex, Array.Empty<byte>()));
+                    AddRestoreEmptyObjectEdit(finalEdits, body, root, prov.ContainerTrivia.TryGetValue("root", out string? rootTrivia) ? rootTrivia : null);
                 }
                 else
                 {
@@ -981,8 +1134,8 @@ public sealed class HookInstaller
             {
                 if (hooksBecomesEmpty)
                 {
-                    // Ownership of "hooks" is unproven: conservatively preserve empty "hooks": {}
-                    finalEdits.Add(new ByteEdit(hooksObj.Start + 1, hooksObj.CloseBraceIndex, Array.Empty<byte>()));
+                    // Ownership of "hooks" is unproven: conservatively preserve empty "hooks" object + interior trivia
+                    AddRestoreEmptyObjectEdit(finalEdits, body, hooksObj, prov.ContainerTrivia.TryGetValue("hooks", out string? hooksTrivia) ? hooksTrivia : null);
                 }
                 else
                 {
@@ -1024,13 +1177,20 @@ public sealed class HookInstaller
                     "Target config was modified concurrently; aborted uninstall to prevent clobbering changes.");
             }
 
-            if (removeHooksProp)
+            if (removeHooksProp || (!prov.CreatedHooksObject && remainingProvKeys.Count == 0))
             {
                 ClearContainerProvenance(configPath);
             }
-            else if (prov.CreatedHooksObject || prov.CreatedEventKeys.Count > 0)
+            else
             {
-                SaveContainerProvenance(configPath, new ContainerProvenance(prov.CreatedHooksObject, remainingProvKeys));
+                string postUninstallSha256Hex = Convert.ToHexString(SHA256.HashData(outBytes));
+                SaveContainerProvenance(
+                    configPath,
+                    new ContainerProvenance(
+                        prov.CreatedHooksObject,
+                        remainingProvKeys,
+                        postUninstallSha256Hex,
+                        prov.ContainerTrivia));
             }
 
             return new HookTargetResult(
@@ -1100,6 +1260,17 @@ public sealed class HookInstaller
         return false;
     }
 
+    private static bool GroupMatchesRequiredMatcher(JsonSpanObject groupObj, string? requiredMatcher)
+    {
+        if (string.IsNullOrEmpty(requiredMatcher))
+        {
+            return true;
+        }
+
+        return TryGetStringProperty(groupObj, "matcher", out string? existingMatcher) &&
+               string.Equals(existingMatcher, requiredMatcher, StringComparison.Ordinal);
+    }
+
     private static void PlanUpsertEventArrayEdits(
         List<ByteEdit> edits,
         ReadOnlySpan<byte> body,
@@ -1111,7 +1282,11 @@ public sealed class HookInstaller
         JsonDocStyle style)
     {
         // Search for existing current OR exact legacy KageDesk hook entries.
-        // If multiple owned entries exist (e.g. a legacy entry + a current entry), upgrade/keep the first and remove duplicates.
+        // If multiple owned entries exist (e.g. a legacy entry + a current entry), upgrade/keep the first
+        // matcher-compatible entry and remove duplicates.
+        // If an owned hook lives inside a shared/broad-matcher group that does NOT match spec.Matcher
+        // (e.g. legacy Claude Notification hook sharing a group with unrelated user hooks),
+        // remove ONLY KageDesk's hook from that shared group and insert a dedicated approval-scoped wrapper group.
         bool foundPrimary = false;
         var extraGroupIndicesToRemove = new HashSet<int>();
 
@@ -1128,6 +1303,10 @@ public sealed class HookInstaller
 
             var extraInnerIndicesToRemove = new HashSet<int>();
             bool matchedInThisGroup = false;
+            bool canRewriteStandaloneWrapper =
+                innerHooks.Elements.Count == 1 && IsKageDeskOwnedWrapperGroup(groupObj, spec.Matcher);
+            bool matcherCompatible =
+                GroupMatchesRequiredMatcher(groupObj, spec.Matcher) || canRewriteStandaloneWrapper;
 
             for (int hIdx = 0; hIdx < innerHooks.Elements.Count; hIdx++)
             {
@@ -1140,13 +1319,13 @@ public sealed class HookInstaller
                     continue;
 
                 matchedInThisGroup = true;
-                if (!foundPrimary)
+                if (!foundPrimary && matcherCompatible)
                 {
                     foundPrimary = true;
                     bool isUpToDate = isCurrent && IsHookEntryUpToDate(groupObj, innerHooks, hookObj, spec, desiredCommand);
                     if (!isUpToDate)
                     {
-                        if (innerHooks.Elements.Count == 1 && IsKageDeskOwnedWrapperGroup(groupObj, spec.Matcher))
+                        if (canRewriteStandaloneWrapper)
                         {
                             string groupIndent = GetLineIndent(body, groupObj.Start);
                             string newGroupJson = FormatWrapperGroup(spec, desiredCommand, style, groupIndent);
@@ -1178,6 +1357,21 @@ public sealed class HookInstaller
                     AddRemoveArrayElementsEdits(edits, innerHooks, extraInnerIndicesToRemove);
                 }
             }
+        }
+
+        if (!foundPrimary &&
+            extraGroupIndicesToRemove.Count > 0 &&
+            extraGroupIndicesToRemove.Count == eventArr.Elements.Count)
+        {
+            // All existing elements in eventArr were deprecated/duplicate KageDesk wrapper groups: replace cleanly in one edit
+            string arrIndent = GetLineIndent(body, eventArr.Start);
+            string elemIndent = GetChildIndentForArray(body, eventArr, style);
+            string newGroupJson = FormatWrapperGroup(spec, desiredCommand, style, elemIndent);
+            string replacement = style.IsCompact
+                ? newGroupJson
+                : style.NewLine + elemIndent + newGroupJson + style.NewLine + arrIndent;
+            edits.Add(new ByteEdit(eventArr.Start + 1, eventArr.CloseBracketIndex, Utf8NoBom.GetBytes(replacement)));
+            return;
         }
 
         if (extraGroupIndicesToRemove.Count > 0)
@@ -1215,13 +1409,9 @@ public sealed class HookInstaller
             }
         }
 
-        if (!string.IsNullOrEmpty(spec.Matcher) && innerHooks.Elements.Count == 1)
+        if (!string.IsNullOrEmpty(spec.Matcher) && !GroupMatchesRequiredMatcher(groupObj, spec.Matcher))
         {
-            if (!TryGetStringProperty(groupObj, "matcher", out string? existingMatcher) ||
-                !string.Equals(existingMatcher, spec.Matcher, StringComparison.Ordinal))
-            {
-                return false;
-            }
+            return false;
         }
 
         return true;
@@ -1236,6 +1426,7 @@ public sealed class HookInstaller
         string agentId,
         string emitterScriptPath,
         bool canRemoveEmptyEventKey,
+        string? preservedEmptyTrivia,
         out bool removedAny)
     {
         removedAny = false;
@@ -1281,7 +1472,7 @@ public sealed class HookInstaller
             else if (groupBecomesEmpty)
             {
                 // User's wrapper group (extra keys or non-matching matcher): preserve wrapper with empty hooks array
-                nestedEdits.Add(new ByteEdit(innerHooks.Start + 1, innerHooks.CloseBracketIndex, Array.Empty<byte>()));
+                AddRestoreEmptyArrayEdit(nestedEdits, body, innerHooks, preservedTrivia: null);
             }
             else
             {
@@ -1303,8 +1494,8 @@ public sealed class HookInstaller
 
         if (eventArrBecomesEmpty)
         {
-            // Pre-existing / unproven container: preserve empty array [] verbatim!
-            edits.Add(new ByteEdit(eventArr.Start + 1, eventArr.CloseBracketIndex, Array.Empty<byte>()));
+            // Pre-existing / unproven container: preserve empty array and exact original interior trivia verbatim!
+            AddRestoreEmptyArrayEdit(edits, body, eventArr, preservedEmptyTrivia);
             return false;
         }
 
@@ -1425,14 +1616,110 @@ public sealed class HookInstaller
     {
         if (string.IsNullOrEmpty(content)) return false;
         string trimmed = content.TrimStart('\uFEFF', ' ', '\t', '\r', '\n');
-        return trimmed.StartsWith(OpenCodePluginOwnershipMarker, StringComparison.Ordinal);
+        return StartsWithOwnershipLine(trimmed, OpenCodePluginOwnershipMarkerV1) ||
+               StartsWithOwnershipLine(trimmed, OpenCodePluginOwnershipMarkerV2);
+    }
+
+    private static bool StartsWithOwnershipLine(string trimmedContent, string marker)
+    {
+        if (!trimmedContent.StartsWith(marker, StringComparison.Ordinal))
+            return false;
+
+        return trimmedContent.Length == marker.Length ||
+               trimmedContent[marker.Length] is '\r' or '\n';
     }
 
     public static string BuildOpenCodePluginSource(int bridgePort)
+        => BuildOpenCodePluginSource(bridgePort, OpenCodePluginApiVersion.V1);
+
+    public static string BuildOpenCodePluginSource(int bridgePort, OpenCodePluginApiVersion apiVersion)
     {
         int port = bridgePort is >= 1 and <= 65535 ? bridgePort : 4319;
+        if (apiVersion == OpenCodePluginApiVersion.V2)
+        {
+            return $$"""
+{{OpenCodePluginOwnershipMarkerV2}}
+// Auto-generated by KageDesk for OpenCode V2. Safe to remove via `KageDesk.exe --uninstall-hooks`.
+import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+
+const BRIDGE_PORT = {{port}};
+
+function readBridgeToken() {
+  try {
+    const appData = process.env.APPDATA;
+    if (!appData) return "";
+    const tokenPath = join(appData, "KageDesk", "bridge.token");
+    if (!existsSync(tokenPath)) return "";
+    return readFileSync(tokenPath, "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+function emitEvent(type, message) {
+  try {
+    const headers = { "Content-Type": "application/json" };
+    const token = readBridgeToken();
+    if (token) headers["X-KageDesk-Token"] = token;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1000);
+    fetch(`http://127.0.0.1:${BRIDGE_PORT}/api/event`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ type, agentId: "opencode", message }),
+      signal: controller.signal
+    }).catch(() => {}).finally(() => clearTimeout(timer));
+  } catch {
+    // Non-blocking: never interfere with OpenCode execution.
+  }
+}
+
+function handleServerEvent(event) {
+  const eventType = event && typeof event.type === "string" ? event.type : "";
+  switch (eventType) {
+    case "permission.asked":
+    case "permission.updated":
+      emitEvent("approval", "Approval requested");
+      break;
+    case "session.idle":
+      emitEvent("turn_done", "Agent turn completed");
+      break;
+    case "session.error":
+      emitEvent("fail", "Session error");
+      break;
+    default:
+      break;
+  }
+}
+
+export default {
+  id: "kagedesk",
+  async setup(ctx) {
+    await ctx.tool.hook("execute.before", () => {
+      emitEvent("tool_start", "Tool execution started");
+    });
+    await ctx.tool.hook("execute.after", () => {
+      emitEvent("tool_complete", "Tool execution completed");
+    });
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          handleServerEvent(event);
+        }
+      } catch {
+        // Ignore abort / shutdown errors.
+      }
+    })();
+    return () => controller.abort();
+  }
+};
+""";
+        }
+
         return $$"""
-{{OpenCodePluginOwnershipMarker}}
+{{OpenCodePluginOwnershipMarkerV1}}
 // Auto-generated by KageDesk. Safe to remove via `KageDesk.exe --uninstall-hooks`.
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -1909,6 +2196,35 @@ export const KageDeskPlugin = async () => ({
         return true;
     }
 
+    private static string GetEventTriviaKey(string eventKey) => $"event:{eventKey}";
+
+    private static void CaptureEmptyContainerTrivia(
+        Dictionary<string, string> triviaMap,
+        string triviaKey,
+        ReadOnlySpan<byte> body,
+        int interiorStart,
+        int interiorEnd)
+    {
+        if (interiorEnd < interiorStart || interiorStart < 0 || interiorEnd > body.Length)
+            return;
+
+        ReadOnlySpan<byte> interior = body.Slice(interiorStart, interiorEnd - interiorStart);
+        if (!IsAsciiWhitespaceOnly(interior))
+            return;
+
+        triviaMap[triviaKey] = Encoding.ASCII.GetString(interior);
+    }
+
+    private static bool IsAsciiWhitespaceOnly(string value)
+    {
+        foreach (char c in value)
+        {
+            if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+                return false;
+        }
+        return true;
+    }
+
     private static void AddInsertPropertyIntoObjectEdit(
         List<ByteEdit> edits,
         ReadOnlySpan<byte> body,
@@ -1920,10 +2236,42 @@ export const KageDeskPlugin = async () => ({
     {
         if (obj.Properties.Count == 0)
         {
-            string replacement = style.IsCompact
-                ? formattedProps
-                : style.NewLine + childIndent + formattedProps + style.NewLine + objIndent;
-            edits.Add(new ByteEdit(obj.Start + 1, obj.CloseBraceIndex, Utf8NoBom.GetBytes(replacement)));
+            // Lossless zero-width insertion: never wipe existing interior whitespace bytes!
+            ReadOnlySpan<byte> interior = body.Slice(obj.Start + 1, obj.CloseBraceIndex - (obj.Start + 1));
+            if (style.IsCompact)
+            {
+                edits.Add(new ByteEdit(obj.Start + 1, obj.Start + 1, Utf8NoBom.GetBytes(formattedProps)));
+            }
+            else
+            {
+                int lastLf = interior.LastIndexOf((byte)'\n');
+                if (lastLf >= 0)
+                {
+                    int lastBreakStart = lastLf > 0 && interior[lastLf - 1] == (byte)'\r' ? lastLf - 1 : lastLf;
+                    if (lastBreakStart > 0)
+                    {
+                        // E.g. "{\n  \n}" -> zero-width insert before closing newline so original "\n  " and "\n" stay intact.
+                        int insertPos = obj.Start + 1 + lastBreakStart;
+                        edits.Add(new ByteEdit(insertPos, insertPos, Utf8NoBom.GetBytes(formattedProps)));
+                    }
+                    else
+                    {
+                        // E.g. "{\n}" or "{\n  }" -> zero-width insert before existing newline/indent.
+                        string inserted = style.NewLine + childIndent + formattedProps;
+                        edits.Add(new ByteEdit(obj.Start + 1, obj.Start + 1, Utf8NoBom.GetBytes(inserted)));
+                    }
+                }
+                else if (interior.Length > 0)
+                {
+                    // Inline whitespace-only empty container like "{  }" inside a multiline file: zero-width insert after '{'.
+                    edits.Add(new ByteEdit(obj.Start + 1, obj.Start + 1, Utf8NoBom.GetBytes(formattedProps)));
+                }
+                else
+                {
+                    string inserted = style.NewLine + childIndent + formattedProps + style.NewLine + objIndent;
+                    edits.Add(new ByteEdit(obj.Start + 1, obj.Start + 1, Utf8NoBom.GetBytes(inserted)));
+                }
+            }
         }
         else
         {
@@ -1944,10 +2292,39 @@ export const KageDeskPlugin = async () => ({
     {
         if (arr.Elements.Count == 0)
         {
-            string replacement = style.IsCompact
-                ? formattedElem
-                : style.NewLine + elemIndent + formattedElem + style.NewLine + arrIndent;
-            edits.Add(new ByteEdit(arr.Start + 1, arr.CloseBracketIndex, Utf8NoBom.GetBytes(replacement)));
+            // Lossless zero-width insertion: never wipe existing interior whitespace bytes!
+            ReadOnlySpan<byte> interior = body.Slice(arr.Start + 1, arr.CloseBracketIndex - (arr.Start + 1));
+            if (style.IsCompact)
+            {
+                edits.Add(new ByteEdit(arr.Start + 1, arr.Start + 1, Utf8NoBom.GetBytes(formattedElem)));
+            }
+            else
+            {
+                int lastLf = interior.LastIndexOf((byte)'\n');
+                if (lastLf >= 0)
+                {
+                    int lastBreakStart = lastLf > 0 && interior[lastLf - 1] == (byte)'\r' ? lastLf - 1 : lastLf;
+                    if (lastBreakStart > 0)
+                    {
+                        int insertPos = arr.Start + 1 + lastBreakStart;
+                        edits.Add(new ByteEdit(insertPos, insertPos, Utf8NoBom.GetBytes(formattedElem)));
+                    }
+                    else
+                    {
+                        string inserted = style.NewLine + elemIndent + formattedElem;
+                        edits.Add(new ByteEdit(arr.Start + 1, arr.Start + 1, Utf8NoBom.GetBytes(inserted)));
+                    }
+                }
+                else if (interior.Length > 0)
+                {
+                    edits.Add(new ByteEdit(arr.Start + 1, arr.Start + 1, Utf8NoBom.GetBytes(formattedElem)));
+                }
+                else
+                {
+                    string inserted = style.NewLine + elemIndent + formattedElem + style.NewLine + arrIndent;
+                    edits.Add(new ByteEdit(arr.Start + 1, arr.Start + 1, Utf8NoBom.GetBytes(inserted)));
+                }
+            }
         }
         else
         {
@@ -1955,6 +2332,60 @@ export const KageDeskPlugin = async () => ({
             string prefix = style.IsCompact ? "," : "," + style.NewLine + elemIndent;
             edits.Add(new ByteEdit(insertPos, insertPos, Utf8NoBom.GetBytes(prefix + formattedElem)));
         }
+    }
+
+    private static void AddRestoreEmptyObjectEdit(
+        List<ByteEdit> edits,
+        ReadOnlySpan<byte> body,
+        JsonSpanObject obj,
+        string? preservedTrivia)
+    {
+        if (preservedTrivia != null)
+        {
+            edits.Add(new ByteEdit(obj.Start + 1, obj.CloseBraceIndex, Utf8NoBom.GetBytes(preservedTrivia)));
+            return;
+        }
+
+        if (obj.Properties.Count > 0)
+        {
+            ReadOnlySpan<byte> beforeFirst = body.Slice(obj.Start + 1, obj.Properties[0].FullStart - (obj.Start + 1));
+            ReadOnlySpan<byte> afterLast = body.Slice(obj.Properties[^1].FullEnd, obj.CloseBraceIndex - obj.Properties[^1].FullEnd);
+            if (beforeFirst.IndexOf((byte)'\n') < 0 && afterLast.IndexOf((byte)'\n') < 0)
+            {
+                // Preserve compact interior whitespace around zero-width-inserted properties (e.g. "{  }").
+                edits.Add(new ByteEdit(obj.Properties[0].FullStart, obj.Properties[^1].FullEnd, Array.Empty<byte>()));
+                return;
+            }
+        }
+
+        edits.Add(new ByteEdit(obj.Start + 1, obj.CloseBraceIndex, Array.Empty<byte>()));
+    }
+
+    private static void AddRestoreEmptyArrayEdit(
+        List<ByteEdit> edits,
+        ReadOnlySpan<byte> body,
+        JsonSpanArray arr,
+        string? preservedTrivia)
+    {
+        if (preservedTrivia != null)
+        {
+            edits.Add(new ByteEdit(arr.Start + 1, arr.CloseBracketIndex, Utf8NoBom.GetBytes(preservedTrivia)));
+            return;
+        }
+
+        if (arr.Elements.Count > 0)
+        {
+            ReadOnlySpan<byte> beforeFirst = body.Slice(arr.Start + 1, arr.Elements[0].Start - (arr.Start + 1));
+            ReadOnlySpan<byte> afterLast = body.Slice(arr.Elements[^1].End, arr.CloseBracketIndex - arr.Elements[^1].End);
+            if (beforeFirst.IndexOf((byte)'\n') < 0 && afterLast.IndexOf((byte)'\n') < 0)
+            {
+                // Preserve compact interior whitespace around zero-width-inserted elements (e.g. "[  ]").
+                edits.Add(new ByteEdit(arr.Elements[0].Start, arr.Elements[^1].End, Array.Empty<byte>()));
+                return;
+            }
+        }
+
+        edits.Add(new ByteEdit(arr.Start + 1, arr.CloseBracketIndex, Array.Empty<byte>()));
     }
 
     private static void AddRemoveObjectPropertiesEdits(
@@ -2212,16 +2643,25 @@ export const KageDeskPlugin = async () => ({
 
     private sealed record ContainerProvenance(
         bool CreatedHooksObject,
-        HashSet<string> CreatedEventKeys
+        HashSet<string> CreatedEventKeys,
+        string? ExpectedSha256Hex,
+        Dictionary<string, string> ContainerTrivia
     )
     {
-        public static ContainerProvenance Unknown => new(false, new HashSet<string>(StringComparer.Ordinal));
+        public static ContainerProvenance Unknown => new(
+            CreatedHooksObject: false,
+            CreatedEventKeys: new HashSet<string>(StringComparer.Ordinal),
+            ExpectedSha256Hex: null,
+            ContainerTrivia: new Dictionary<string, string>(StringComparer.Ordinal));
     }
 
-    private ContainerProvenance LoadContainerProvenance(string targetConfigPath)
+    private ContainerProvenance LoadContainerProvenance(string targetConfigPath, byte[]? currentFileSha256)
     {
         try
         {
+            if (currentFileSha256 == null || currentFileSha256.Length == 0)
+                return ContainerProvenance.Unknown;
+
             string storePath = ProvenanceStorePath;
             if (!File.Exists(storePath))
                 return ContainerProvenance.Unknown;
@@ -2229,7 +2669,19 @@ export const KageDeskPlugin = async () => ({
             ValidateNoReparsePointsInPath(storePath);
             Dictionary<string, ContainerProvenance> map = ReadProvenanceMap(File.ReadAllBytes(storePath));
             string key = Path.GetFullPath(targetConfigPath).ToUpperInvariant();
-            return map.TryGetValue(key, out ContainerProvenance? found) ? found : ContainerProvenance.Unknown;
+            if (!map.TryGetValue(key, out ContainerProvenance? found))
+                return ContainerProvenance.Unknown;
+
+            // Content-bound provenance: if external edit/replacement modified the file after install,
+            // treat old provenance as unproven and do NOT delete empty containers!
+            if (string.IsNullOrEmpty(found.ExpectedSha256Hex))
+                return ContainerProvenance.Unknown;
+
+            string currentHex = Convert.ToHexString(currentFileSha256);
+            if (!string.Equals(found.ExpectedSha256Hex, currentHex, StringComparison.OrdinalIgnoreCase))
+                return ContainerProvenance.Unknown;
+
+            return found;
         }
         catch
         {
@@ -2318,6 +2770,17 @@ export const KageDeskPlugin = async () => ({
             bool createdHooks = prop.Value.TryGetProperty("createdHooksObject", out JsonElement chEl) &&
                                 chEl.ValueKind == JsonValueKind.True;
 
+            string? expectedSha256Hex = null;
+            if (prop.Value.TryGetProperty("sha256", out JsonElement shaEl) &&
+                shaEl.ValueKind == JsonValueKind.String)
+            {
+                string? hex = shaEl.GetString();
+                if (!string.IsNullOrWhiteSpace(hex) && hex.Length == 64)
+                {
+                    expectedSha256Hex = hex;
+                }
+            }
+
             var keys = new HashSet<string>(StringComparer.Ordinal);
             if (prop.Value.TryGetProperty("createdEventKeys", out JsonElement keysEl) &&
                 keysEl.ValueKind == JsonValueKind.Array)
@@ -2335,7 +2798,24 @@ export const KageDeskPlugin = async () => ({
                 }
             }
 
-            map[prop.Name] = new ContainerProvenance(createdHooks, keys);
+            var trivia = new Dictionary<string, string>(StringComparer.Ordinal);
+            if (prop.Value.TryGetProperty("containerTrivia", out JsonElement triviaEl) &&
+                triviaEl.ValueKind == JsonValueKind.Object)
+            {
+                foreach (JsonProperty tp in triviaEl.EnumerateObject())
+                {
+                    if (tp.Value.ValueKind == JsonValueKind.String)
+                    {
+                        string? t = tp.Value.GetString();
+                        if (t != null && IsAsciiWhitespaceOnly(t))
+                        {
+                            trivia[tp.Name] = t;
+                        }
+                    }
+                }
+            }
+
+            map[prop.Name] = new ContainerProvenance(createdHooks, keys, expectedSha256Hex, trivia);
         }
 
         return map;
@@ -2352,6 +2832,10 @@ export const KageDeskPlugin = async () => ({
                 writer.WritePropertyName(kvp.Key);
                 writer.WriteStartObject();
                 writer.WriteBoolean("createdHooksObject", kvp.Value.CreatedHooksObject);
+                if (!string.IsNullOrEmpty(kvp.Value.ExpectedSha256Hex))
+                {
+                    writer.WriteString("sha256", kvp.Value.ExpectedSha256Hex);
+                }
                 writer.WritePropertyName("createdEventKeys");
                 writer.WriteStartArray();
                 foreach (string k in kvp.Value.CreatedEventKeys.OrderBy(x => x, StringComparer.Ordinal))
@@ -2359,6 +2843,19 @@ export const KageDeskPlugin = async () => ({
                     writer.WriteStringValue(k);
                 }
                 writer.WriteEndArray();
+                if (kvp.Value.ContainerTrivia.Count > 0)
+                {
+                    writer.WritePropertyName("containerTrivia");
+                    writer.WriteStartObject();
+                    foreach (KeyValuePair<string, string> tk in kvp.Value.ContainerTrivia.OrderBy(x => x.Key, StringComparer.Ordinal))
+                    {
+                        if (IsAsciiWhitespaceOnly(tk.Value))
+                        {
+                            writer.WriteString(tk.Key, tk.Value);
+                        }
+                    }
+                    writer.WriteEndObject();
+                }
                 writer.WriteEndObject();
             }
             writer.WriteEndObject();

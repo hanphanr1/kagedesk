@@ -100,8 +100,11 @@ public sealed class SessionLogActivityCollector : IDisposable
     private bool _started;
     private bool _disposed;
 
+    internal delegate int LowLevelFileReadDelegate(SafeFileHandle handle, Span<byte> destination, long fileOffset);
+
     internal Action? OnMaintenanceStepForTest { get; set; }
     internal int LastTotalFileBytesReadForTest { get; private set; }
+    internal LowLevelFileReadDelegate? LowLevelReadOverrideForTest { get; set; }
 
     public event EventHandler<IReadOnlyList<AgentSnapshot>>? ActivityChanged;
 
@@ -277,10 +280,11 @@ public sealed class SessionLogActivityCollector : IDisposable
             ? displayName
             : FormatProviderDisplay(provider);
 
-        DerivedSessionActivity? derived = ReadAndParseFileDeltaInPlace(filePath, provider, resolvedDisplay, now);
-        if (derived == null)
+        ParsedDeltaBatch parsedBatch = ReadAndParseFileDeltaInPlace(filePath, provider, resolvedDisplay, now);
+        if (parsedBatch.Activity == null && !parsedBatch.HasVerifiedIdentity)
             return null;
 
+        DerivedSessionActivity? derived = parsedBatch.Activity;
         IReadOnlyList<AgentSnapshot>? snapshots = null;
         lock (_stateLock)
         {
@@ -291,10 +295,13 @@ public sealed class SessionLogActivityCollector : IDisposable
 
             if (_fileStates.TryGetValue(filePath, out var st))
             {
-                derived = ApplyTrackedSessionMetadataLocked(st, filePath, provider, derived);
+                derived = ApplyTrackedSessionMetadataLocked(st, filePath, provider, parsedBatch);
             }
 
-            snapshots = BuildCurrentSnapshotsLocked(now);
+            if (derived != null)
+            {
+                snapshots = BuildCurrentSnapshotsLocked(now);
+            }
         }
 
         if (snapshots != null && generation == Volatile.Read(ref _stopGeneration) && !_disposed)
@@ -428,11 +435,28 @@ public sealed class SessionLogActivityCollector : IDisposable
         return $"session:{normProvider}:{shortHash}";
     }
 
-    private static DerivedSessionActivity ApplyTrackedSessionMetadataLocked(
+    private readonly record struct ParsedLineResult(
+        DerivedSessionActivity? Activity,
+        int? VerifiedProcessId,
+        long? VerifiedProcessStartTicks
+    );
+
+    private readonly record struct ParsedDeltaBatch(
+        DerivedSessionActivity? Activity,
+        int? VerifiedProcessId,
+        long? VerifiedProcessStartTicks
+    )
+    {
+        public bool HasVerifiedIdentity =>
+            VerifiedProcessId.HasValue && VerifiedProcessId.Value > 0 &&
+            VerifiedProcessStartTicks.HasValue && VerifiedProcessStartTicks.Value > 0;
+    }
+
+    private static DerivedSessionActivity? ApplyTrackedSessionMetadataLocked(
         TrackedFileState st,
         string filePath,
         string provider,
-        DerivedSessionActivity derived)
+        ParsedDeltaBatch batch)
     {
         st.Provider = provider;
         if (string.IsNullOrEmpty(st.SessionId))
@@ -440,26 +464,58 @@ public sealed class SessionLogActivityCollector : IDisposable
             st.SessionId = ComputeSessionId(provider, filePath);
         }
 
-        if (derived.CorrelatedProcessId.HasValue && derived.CorrelatedProcessId.Value > 0 &&
-            derived.CorrelatedProcessStartTicks.HasValue && derived.CorrelatedProcessStartTicks.Value > 0)
+        // Accumulate verified (pid, process_start_ticks) independently from activity selection!
+        if (batch.HasVerifiedIdentity)
         {
-            st.VerifiedProcessId = derived.CorrelatedProcessId;
-            st.VerifiedProcessStartTicks = derived.CorrelatedProcessStartTicks;
+            st.VerifiedProcessId = batch.VerifiedProcessId;
+            st.VerifiedProcessStartTicks = batch.VerifiedProcessStartTicks;
         }
-        else if (st.VerifiedProcessId.HasValue && st.VerifiedProcessStartTicks.HasValue)
+        else if (batch.Activity != null &&
+                 batch.Activity.CorrelatedProcessId.HasValue && batch.Activity.CorrelatedProcessId.Value > 0 &&
+                 batch.Activity.CorrelatedProcessStartTicks.HasValue && batch.Activity.CorrelatedProcessStartTicks.Value > 0)
         {
-            derived = derived with
+            st.VerifiedProcessId = batch.Activity.CorrelatedProcessId;
+            st.VerifiedProcessStartTicks = batch.Activity.CorrelatedProcessStartTicks;
+        }
+
+        DerivedSessionActivity? candidate = batch.Activity;
+        if (candidate != null)
+        {
+            if ((!candidate.CorrelatedProcessId.HasValue || !candidate.CorrelatedProcessStartTicks.HasValue) &&
+                st.VerifiedProcessId.HasValue && st.VerifiedProcessId.Value > 0 &&
+                st.VerifiedProcessStartTicks.HasValue && st.VerifiedProcessStartTicks.Value > 0)
+            {
+                candidate = candidate with
+                {
+                    CorrelatedProcessId = st.VerifiedProcessId,
+                    CorrelatedProcessStartTicks = st.VerifiedProcessStartTicks
+                };
+            }
+
+            // Never let a strictly older event timestamp overwrite a fresher tracked activity.
+            if (st.LatestActivity == null || candidate.ObservedAt >= st.LatestActivity.ObservedAt)
+            {
+                st.LatestActivity = candidate;
+            }
+        }
+
+        // If an identity-only batch arrived for an already-tracked activity, enrich the stored activity too.
+        if (st.LatestActivity != null &&
+            (!st.LatestActivity.CorrelatedProcessId.HasValue || !st.LatestActivity.CorrelatedProcessStartTicks.HasValue) &&
+            st.VerifiedProcessId.HasValue && st.VerifiedProcessId.Value > 0 &&
+            st.VerifiedProcessStartTicks.HasValue && st.VerifiedProcessStartTicks.Value > 0)
+        {
+            st.LatestActivity = st.LatestActivity with
             {
                 CorrelatedProcessId = st.VerifiedProcessId,
                 CorrelatedProcessStartTicks = st.VerifiedProcessStartTicks
             };
         }
 
-        st.LatestActivity = derived;
-        return derived;
+        return st.LatestActivity;
     }
 
-    private DerivedSessionActivity? ReadAndParseFileDeltaInPlace(
+    private ParsedDeltaBatch ReadAndParseFileDeltaInPlace(
         string filePath,
         string provider,
         string displayName,
@@ -470,14 +526,14 @@ public sealed class SessionLogActivityCollector : IDisposable
             try
             {
                 int count = ReadCompleteRecordsIntoBufferLocked(filePath, out int sliceStart, out DateTime fileLastWriteUtc);
-                if (count <= 0) return null;
+                if (count <= 0) return default;
 
                 // Use the file's own last-write timestamp (not batch scan time) as fallback when a JSON line has no explicit timestamp
                 DateTimeOffset fallbackTimestamp = fileLastWriteUtc != DateTime.MinValue
                     ? new DateTimeOffset(fileLastWriteUtc, TimeSpan.Zero)
                     : now;
 
-                return ParseDerivedActivityFromTail(
+                return ParseBatchFromTail(
                     provider,
                     displayName,
                     new ReadOnlySpan<byte>(_readBuffer, sliceStart, count),
@@ -485,11 +541,22 @@ public sealed class SessionLogActivityCollector : IDisposable
             }
             finally
             {
-                // Always clear raw transcript bytes from reusable buffer immediately after parsing
+                // Always clear raw transcript bytes from reusable buffers immediately after parsing
                 Array.Clear(_readBuffer, 0, _readBuffer.Length);
                 Array.Clear(_headerProbeBuffer, 0, _headerProbeBuffer.Length);
             }
         }
+    }
+
+    private int ReadDirectFromHandle(SafeFileHandle handle, Span<byte> destination, long fileOffset)
+    {
+        if (destination.IsEmpty)
+            return 0;
+
+        var testOverride = LowLevelReadOverrideForTest;
+        return testOverride != null
+            ? testOverride(handle, destination, fileOffset)
+            : RandomAccess.Read(handle, destination, fileOffset);
     }
 
     private int ReadCompleteRecordsIntoBufferLocked(string filePath, out int sliceStart, out DateTime fileLastWriteUtc)
@@ -497,22 +564,34 @@ public sealed class SessionLogActivityCollector : IDisposable
         sliceStart = 0;
         fileLastWriteUtc = DateTime.MinValue;
         long removalEpochBeforeRead = Volatile.Read(ref _removalEpoch);
-        int totalBytesReadFromStream = 0;
+        int totalBytesReadFromDisk = 0;
         try
         {
-            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            long length = fs.Length;
-            if (length <= 0) return 0;
+            // Direct unbuffered SafeFileHandle + RandomAccess.Read into reusable cleared buffers:
+            // eliminates FileStream's hidden 4 KiB BufferedFileStreamStrategy prefetch completely!
+            using SafeFileHandle handle = File.OpenHandle(
+                filePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                FileOptions.None);
 
-            FileIdentity identity = ReadFileIdentity(fs, length);
+            long length = RandomAccess.GetLength(handle);
+            if (length <= 0)
+            {
+                LastTotalFileBytesReadForTest = 0;
+                return 0;
+            }
+
+            FileIdentity identity = ReadFileIdentity(handle, length);
             fileLastWriteUtc = identity.LastWriteTimeUtc;
             int probeLen = identity.HeaderFingerprintLength;
-            totalBytesReadFromStream += probeLen;
+            totalBytesReadFromDisk += probeLen;
 
             long startOffset;
             bool atRecordBoundary;
             bool wasRotated = false;
-            int tailBudgetFromDisk = Math.Max(1, MaxTailReadBytes - probeLen);
+            int tailBudgetFromDisk = Math.Max(0, MaxTailReadBytes - totalBytesReadFromDisk);
 
             lock (_stateLock)
             {
@@ -521,7 +600,7 @@ public sealed class SessionLogActivityCollector : IDisposable
                 {
                     if (prev.LastCompleteRecordOffset == length)
                     {
-                        LastTotalFileBytesReadForTest = totalBytesReadFromStream;
+                        LastTotalFileBytesReadForTest = totalBytesReadFromDisk;
                         return 0;
                     }
 
@@ -552,14 +631,14 @@ public sealed class SessionLogActivityCollector : IDisposable
                     }
                     else
                     {
-                        // Fold the 64-byte header probe into the 8 KiB total I/O budget
+                        // Fold the 64-byte header probe into the 8 KiB total OS read budget
                         startOffset = length - tailBudgetFromDisk;
                         atRecordBoundary = false;
                     }
                 }
             }
 
-            // Strictly bound total bytes read from FileStream to <= MaxTailReadBytes (8192 B),
+            // Strictly bound combined underlying OS reads (header probe + tail read) to <= MaxTailReadBytes (8192 B),
             // reusing the already-probed [0..probeLen) header prefix whenever startOffset < probeLen.
             int totalRead = 0;
             int maxChunkBytes;
@@ -573,47 +652,50 @@ public sealed class SessionLogActivityCollector : IDisposable
                 }
 
                 long diskStart = startOffset + totalRead;
-                int remainingToRead = (int)Math.Min(MaxTailReadBytes - probeLen, Math.Max(0L, length - diskStart));
+                int remainingBudget = Math.Max(0, MaxTailReadBytes - totalBytesReadFromDisk);
+                int remainingToRead = (int)Math.Min(remainingBudget, Math.Max(0L, length - diskStart));
                 maxChunkBytes = totalRead + remainingToRead;
 
                 if (remainingToRead > 0)
                 {
-                    if (fs.Position != diskStart)
-                    {
-                        fs.Seek(diskStart, SeekOrigin.Begin);
-                    }
                     int diskRead = 0;
                     while (diskRead < remainingToRead)
                     {
-                        int read = fs.Read(_readBuffer, totalRead + diskRead, remainingToRead - diskRead);
+                        int read = ReadDirectFromHandle(
+                            handle,
+                            _readBuffer.AsSpan(totalRead + diskRead, remainingToRead - diskRead),
+                            diskStart + diskRead);
                         if (read <= 0) break;
                         diskRead += read;
                     }
                     totalRead += diskRead;
-                    totalBytesReadFromStream += diskRead;
+                    totalBytesReadFromDisk += diskRead;
                 }
             }
             else
             {
-                int toRead = (int)Math.Min(tailBudgetFromDisk, length - startOffset);
-                maxChunkBytes = tailBudgetFromDisk;
+                int remainingBudget = Math.Max(0, MaxTailReadBytes - totalBytesReadFromDisk);
+                int toRead = (int)Math.Min(remainingBudget, length - startOffset);
+                maxChunkBytes = toRead;
                 if (toRead <= 0)
                 {
-                    LastTotalFileBytesReadForTest = totalBytesReadFromStream;
+                    LastTotalFileBytesReadForTest = totalBytesReadFromDisk;
                     return 0;
                 }
 
-                fs.Seek(startOffset, SeekOrigin.Begin);
                 while (totalRead < toRead)
                 {
-                    int read = fs.Read(_readBuffer, totalRead, toRead - totalRead);
+                    int read = ReadDirectFromHandle(
+                        handle,
+                        _readBuffer.AsSpan(totalRead, toRead - totalRead),
+                        startOffset + totalRead);
                     if (read <= 0) break;
                     totalRead += read;
                 }
-                totalBytesReadFromStream += totalRead;
+                totalBytesReadFromDisk += totalRead;
             }
 
-            LastTotalFileBytesReadForTest = totalBytesReadFromStream;
+            LastTotalFileBytesReadForTest = totalBytesReadFromDisk;
             if (totalRead <= 0) return 0;
 
             int parseStart = 0;
@@ -695,7 +777,7 @@ public sealed class SessionLogActivityCollector : IDisposable
         int HeaderFingerprintLength
     );
 
-    private FileIdentity ReadFileIdentity(FileStream fs, long length)
+    private FileIdentity ReadFileIdentity(SafeFileHandle handle, long length)
     {
         DateTime creationUtc = DateTime.MinValue;
         DateTime lastWriteUtc = DateTime.MinValue;
@@ -704,7 +786,7 @@ public sealed class SessionLogActivityCollector : IDisposable
 
         if (OperatingSystem.IsWindows())
         {
-            if (GetFileInformationByHandle(fs.SafeFileHandle, out var info))
+            if (GetFileInformationByHandle(handle, out var info))
             {
                 long cft = ((long)info.CreationTimeHigh << 32) | info.CreationTimeLow;
                 if (cft > 0)
@@ -722,11 +804,10 @@ public sealed class SessionLogActivityCollector : IDisposable
         }
 
         int probeLen = (int)Math.Min(HeaderFingerprintBytes, length);
-        fs.Seek(0, SeekOrigin.Begin);
         int read = 0;
         while (read < probeLen)
         {
-            int n = fs.Read(_headerProbeBuffer, read, probeLen - read);
+            int n = ReadDirectFromHandle(handle, _headerProbeBuffer.AsSpan(read, probeLen - read), read);
             if (n <= 0) break;
             read += n;
         }
@@ -830,6 +911,8 @@ public sealed class SessionLogActivityCollector : IDisposable
     /// <summary>
     /// Parses only non-sensitive derived state and canonical action token from complete UTF-8 JSONL bytes
     /// using Utf8JsonReader directly over ReadOnlySpan&lt;byte&gt; (zero raw-text string materialization).
+    /// Accumulates verified (pid, process_start_ticks) identity independently across the batch and selects
+    /// the freshest applicable activity by event timestamp.
     /// </summary>
     public static DerivedSessionActivity? ParseDerivedActivityFromTail(
         string provider,
@@ -837,10 +920,21 @@ public sealed class SessionLogActivityCollector : IDisposable
         ReadOnlySpan<byte> tailBytes,
         DateTimeOffset observedAt)
     {
-        if (tailBytes.IsEmpty)
-            return null;
+        return ParseBatchFromTail(provider, displayName, tailBytes, observedAt).Activity;
+    }
 
-        DerivedSessionActivity? latest = null;
+    private static ParsedDeltaBatch ParseBatchFromTail(
+        string provider,
+        string displayName,
+        ReadOnlySpan<byte> tailBytes,
+        DateTimeOffset observedAt)
+    {
+        if (tailBytes.IsEmpty)
+            return default;
+
+        DerivedSessionActivity? freshest = null;
+        int? batchVerifiedPid = null;
+        long? batchVerifiedStartTicks = null;
         int pos = 0;
 
         while (pos < tailBytes.Length)
@@ -862,14 +956,39 @@ public sealed class SessionLogActivityCollector : IDisposable
             if (line.Length < 2 || line[0] != (byte)'{' || line[^1] != (byte)'}')
                 continue;
 
-            var parsed = TryParseSingleJsonLineUtf8(provider, displayName, line, observedAt);
-            if (parsed != null)
+            ParsedLineResult parsed = TryParseSingleJsonLineUtf8(provider, displayName, line, observedAt);
+
+            // Accumulate verified (pid, process_start_ticks) independently from activity selection
+            // so record 1 carrying identity + record 2 carrying activity still correlates cleanly!
+            if (parsed.VerifiedProcessId.HasValue && parsed.VerifiedProcessId.Value > 0 &&
+                parsed.VerifiedProcessStartTicks.HasValue && parsed.VerifiedProcessStartTicks.Value > 0)
             {
-                latest = parsed;
+                batchVerifiedPid = parsed.VerifiedProcessId;
+                batchVerifiedStartTicks = parsed.VerifiedProcessStartTicks;
+            }
+
+            if (parsed.Activity != null)
+            {
+                // Select freshest applicable activity by event timestamp; ties keep later physical order.
+                if (freshest == null || parsed.Activity.ObservedAt >= freshest.ObservedAt)
+                {
+                    freshest = parsed.Activity;
+                }
             }
         }
 
-        return latest;
+        if (freshest != null &&
+            (!freshest.CorrelatedProcessId.HasValue || !freshest.CorrelatedProcessStartTicks.HasValue) &&
+            batchVerifiedPid.HasValue && batchVerifiedStartTicks.HasValue)
+        {
+            freshest = freshest with
+            {
+                CorrelatedProcessId = batchVerifiedPid,
+                CorrelatedProcessStartTicks = batchVerifiedStartTicks
+            };
+        }
+
+        return new ParsedDeltaBatch(freshest, batchVerifiedPid, batchVerifiedStartTicks);
     }
 
     private static ReadOnlySpan<byte> TrimAsciiWhitespace(ReadOnlySpan<byte> span)
@@ -892,7 +1011,7 @@ public sealed class SessionLogActivityCollector : IDisposable
         ExplicitIdle
     }
 
-    private static DerivedSessionActivity? TryParseSingleJsonLineUtf8(
+    private static ParsedLineResult TryParseSingleJsonLineUtf8(
         string provider,
         string displayName,
         ReadOnlySpan<byte> utf8Line,
@@ -908,7 +1027,7 @@ public sealed class SessionLogActivityCollector : IDisposable
             });
 
             if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
-                return null;
+                return default;
 
             bool isApproval = false;
             bool isCompletion = false;
@@ -1029,7 +1148,7 @@ public sealed class SessionLogActivityCollector : IDisposable
                 {
                     if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
                     {
-                        ParsePayloadObjectUtf8(ref reader, ref isApproval, ref isCompletion, ref isExplicitIdle, ref isWorkingSignal, ref canonicalToolToken);
+                        ParsePayloadObjectUtf8(ref reader, ref isApproval, ref isCompletion, ref isExplicitIdle, ref isWorkingSignal, ref canonicalToolToken, ref parsedPid, ref parsedStartTicks);
                     }
                     else
                     {
@@ -1048,36 +1167,33 @@ public sealed class SessionLogActivityCollector : IDisposable
             long? verifiedStartTicks = (parsedPid.HasValue && parsedStartTicks.HasValue) ? parsedStartTicks : null;
             DateTimeOffset eventTime = parsedTimestamp ?? observedAt;
 
+            DerivedSessionActivity? activity = null;
             if (isApproval)
             {
-                return new DerivedSessionActivity(provider, displayName, AgentState.NeedsApproval, "approve", eventTime, IsExplicitIdle: false, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
+                activity = new DerivedSessionActivity(provider, displayName, AgentState.NeedsApproval, "approve", eventTime, IsExplicitIdle: false, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
             }
-
-            if (canonicalToolToken != null)
+            else if (canonicalToolToken != null)
             {
-                return new DerivedSessionActivity(provider, displayName, AgentState.Working, canonicalToolToken, eventTime, IsExplicitIdle: false, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
+                activity = new DerivedSessionActivity(provider, displayName, AgentState.Working, canonicalToolToken, eventTime, IsExplicitIdle: false, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
             }
-
-            if (isCompletion)
+            else if (isCompletion)
             {
-                return new DerivedSessionActivity(provider, displayName, AgentState.Done, null, eventTime, IsExplicitIdle: false, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
+                activity = new DerivedSessionActivity(provider, displayName, AgentState.Done, null, eventTime, IsExplicitIdle: false, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
             }
-
-            if (isExplicitIdle)
+            else if (isExplicitIdle)
             {
-                return new DerivedSessionActivity(provider, displayName, AgentState.Idle, null, eventTime, IsExplicitIdle: true, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
+                activity = new DerivedSessionActivity(provider, displayName, AgentState.Idle, null, eventTime, IsExplicitIdle: true, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
             }
-
-            if (isWorkingSignal)
+            else if (isWorkingSignal)
             {
-                return new DerivedSessionActivity(provider, displayName, AgentState.Working, "think", eventTime, IsExplicitIdle: false, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
+                activity = new DerivedSessionActivity(provider, displayName, AgentState.Working, "think", eventTime, IsExplicitIdle: false, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
             }
 
-            return null;
+            return new ParsedLineResult(activity, verifiedPid, verifiedStartTicks);
         }
         catch (JsonException)
         {
-            return null;
+            return default;
         }
     }
 
@@ -1245,7 +1361,9 @@ public sealed class SessionLogActivityCollector : IDisposable
         ref bool isCompletion,
         ref bool isExplicitIdle,
         ref bool isWorkingSignal,
-        ref string? canonicalToolToken)
+        ref string? canonicalToolToken,
+        ref int? parsedPid,
+        ref long? parsedStartTicks)
     {
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
@@ -1281,6 +1399,31 @@ public sealed class SessionLogActivityCollector : IDisposable
                 if (reader.Read() && reader.TokenType == JsonTokenType.String)
                 {
                     ClassifyToolNameSpan(ref reader, ref isApproval, ref canonicalToolToken);
+                }
+                else
+                {
+                    SkipIfStructured(ref reader);
+                }
+            }
+            else if (reader.ValueTextEquals("pid"u8) || reader.ValueTextEquals("process_id"u8) || reader.ValueTextEquals("processId"u8))
+            {
+                if (reader.Read() && reader.TokenType == JsonTokenType.Number && reader.TryGetInt32(out int pid) && pid > 0)
+                {
+                    parsedPid = pid;
+                }
+                else
+                {
+                    SkipIfStructured(ref reader);
+                }
+            }
+            else if (reader.ValueTextEquals("process_start_ticks"u8) ||
+                     reader.ValueTextEquals("processStartTicks"u8) ||
+                     reader.ValueTextEquals("start_time_ticks"u8) ||
+                     reader.ValueTextEquals("startTimeTicks"u8))
+            {
+                if (reader.Read() && reader.TokenType == JsonTokenType.Number && reader.TryGetInt64(out long ticks) && ticks > 0)
+                {
+                    parsedStartTicks = ticks;
                 }
                 else
                 {
@@ -1905,8 +2048,8 @@ public sealed class SessionLogActivityCollector : IDisposable
                     continue;
                 }
 
-                var derived = ReadAndParseFileDeltaInPlace(path, provider, FormatProviderDisplay(provider), now);
-                if (derived != null)
+                ParsedDeltaBatch parsedBatch = ReadAndParseFileDeltaInPlace(path, provider, FormatProviderDisplay(provider), now);
+                if (parsedBatch.Activity != null || parsedBatch.HasVerifiedIdentity)
                 {
                     lock (_stateLock)
                     {
@@ -1915,9 +2058,12 @@ public sealed class SessionLogActivityCollector : IDisposable
 
                         if (_fileStates.TryGetValue(path, out var st))
                         {
-                            ApplyTrackedSessionMetadataLocked(st, path, provider, derived);
+                            var updated = ApplyTrackedSessionMetadataLocked(st, path, provider, parsedBatch);
+                            if (updated != null)
+                            {
+                                anyUpdated = true;
+                            }
                         }
-                        anyUpdated = true;
                     }
                 }
             }
@@ -2077,6 +2223,12 @@ public sealed class SessionLogActivityCollector : IDisposable
                 ? st.SessionId
                 : ComputeSessionId(act.Provider, filePath);
 
+            int? verifiedPid = (act.CorrelatedProcessId.HasValue && act.CorrelatedProcessId.Value > 0 &&
+                                act.CorrelatedProcessStartTicks.HasValue && act.CorrelatedProcessStartTicks.Value > 0)
+                ? act.CorrelatedProcessId
+                : null;
+            long? verifiedStartTicks = verifiedPid.HasValue ? act.CorrelatedProcessStartTicks : null;
+
             result.Add(new AgentSnapshot(
                 Id: sessionId,
                 Name: act.DisplayName,
@@ -2087,8 +2239,8 @@ public sealed class SessionLogActivityCollector : IDisposable
                 LastActivityAt: act.ObservedAt,
                 UpdatedAt: act.ObservedAt,
                 Source: "session-log",
-                ProcessId: act.CorrelatedProcessId,
-                ProcessStartTicks: act.CorrelatedProcessStartTicks
+                ProcessId: verifiedPid,
+                ProcessStartTicks: verifiedStartTicks
             ));
         }
 

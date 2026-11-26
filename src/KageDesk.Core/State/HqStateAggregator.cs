@@ -843,8 +843,9 @@ public class HqStateAggregator
                 }
             }
 
-            // Correlate ONLY when BOTH provider AND verified process identity (Pid + StartTimeTicks
-            // or verified session-workspace match) agree. NEVER overwrite an unrelated lone process!
+            // Correlate ONLY when provider AND verified (ProcessId, ProcessStartTicks) process identity agree
+            // (production SessionLogActivityCollector never emits workspace/repo paths for privacy).
+            // NEVER overwrite an unrelated live process!
             if (verifiedMatch != null)
             {
                 if (!processOverrides.ContainsKey(verifiedMatch.Id))
@@ -1224,21 +1225,20 @@ public class HqStateAggregator
         bool candidateHasPid = candidate.ProcessId.HasValue && candidate.ProcessId.Value > 0;
         bool candidateHasStartTicks = candidate.ProcessStartTicks.HasValue && candidate.ProcessStartTicks.Value > 0;
 
-        // Verified PID + StartTimeTicks identity check (NEVER match a bare PID without verifying start generation!)
-        if (sessionHasPid && sessionHasStartTicks && candidateHasPid && candidateHasStartTicks)
+        // Verified (Provider, ProcessId, ProcessStartTicks) tuple check.
+        // Whenever sessionAgent carries a PID, require verified start-generation ticks on both sides
+        // (NEVER guess by bare PID or fall through to weaker fields).
+        if (sessionHasPid)
         {
-            return sessionAgent.ProcessId!.Value == candidate.ProcessId!.Value &&
+            return sessionHasStartTicks &&
+                   candidateHasPid &&
+                   candidateHasStartTicks &&
+                   sessionAgent.ProcessId!.Value == candidate.ProcessId!.Value &&
                    sessionAgent.ProcessStartTicks!.Value == candidate.ProcessStartTicks!.Value;
         }
 
-        // If session carried an explicit PID that contradicts the candidate's PID (or lacks verified start ticks when PIDs match),
-        // refuse to guess by bare PID.
-        if (sessionHasPid && candidateHasPid && sessionAgent.ProcessId!.Value != candidate.ProcessId!.Value)
-        {
-            return false;
-        }
-
-        // Verified session-workspace / repo match (when provider matches and process identity did not contradict)
+        // Production SessionLogActivityCollector never emits WorktreeId or Repo (privacy: zero paths).
+        // Only caller-injected snapshots without a PID that explicitly provide matching WorktreeId/Repo can match here.
         if (!string.IsNullOrWhiteSpace(sessionAgent.WorktreeId) &&
             !string.IsNullOrWhiteSpace(candidate.WorktreeId) &&
             string.Equals(sessionAgent.WorktreeId, candidate.WorktreeId, StringComparison.OrdinalIgnoreCase))

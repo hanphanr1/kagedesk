@@ -1296,4 +1296,553 @@ public class V22HooksAndSessionLogTests
             try { Directory.Delete(tempDir, recursive: true); } catch { }
         }
     }
+
+    [Fact]
+    public void HookInstaller_EmptyContainerWhitespaceTrivia_ByteIdenticalRoundTrip_CompactAndMultilineRoot()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), $"kagedesk-hooks-trivia-{Guid.NewGuid():N}");
+        string fakeHome = Path.Combine(tempRoot, "home");
+        string fakeAppData = Path.Combine(tempRoot, "appdata");
+        string claudeDir = Path.Combine(fakeHome, ".claude");
+        string claudeSettings = Path.Combine(claudeDir, "settings.json");
+        Directory.CreateDirectory(claudeDir);
+
+        try
+        {
+            var installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319);
+
+            // Case 1: Compact empty array with interior spaces {"hooks":{"PreToolUse":[  ]}}
+            byte[] compactOriginal = Encoding.UTF8.GetBytes("""{"hooks":{"PreToolUse":[  ]}}""");
+            File.WriteAllBytes(claudeSettings, compactOriginal);
+
+            var inst1 = installer.InstallClaudeCode(installer.DefaultEmitterScriptPath);
+            Assert.Equal(HookActionStatus.Installed, inst1.Status);
+
+            string installedCompact = File.ReadAllText(claudeSettings);
+            // Zero-width insertion keeps original interior spaces intact while remaining valid JSON
+            using (JsonDocument.Parse(installedCompact)) { }
+            Assert.Contains("  ]", installedCompact, StringComparison.Ordinal);
+
+            var uninst1 = installer.UninstallClaudeCode();
+            Assert.Equal(HookActionStatus.Uninstalled, uninst1.Status);
+            Assert.Equal(compactOriginal, File.ReadAllBytes(claudeSettings));
+
+            // Case 2: Multiline empty root "{\n  \n}"
+            byte[] multilineLfOriginal = Encoding.UTF8.GetBytes("{\n  \n}");
+            File.WriteAllBytes(claudeSettings, multilineLfOriginal);
+
+            var inst2 = installer.InstallClaudeCode(installer.DefaultEmitterScriptPath);
+            Assert.Equal(HookActionStatus.Installed, inst2.Status);
+            using (JsonDocument.Parse(File.ReadAllBytes(claudeSettings))) { }
+
+            var uninst2 = installer.UninstallClaudeCode();
+            Assert.Equal(HookActionStatus.Uninstalled, uninst2.Status);
+            Assert.Equal(multilineLfOriginal, File.ReadAllBytes(claudeSettings));
+
+            // Case 3: CRLF multiline empty root "{\r\n  \r\n}"
+            byte[] multilineCrLfOriginal = Encoding.UTF8.GetBytes("{\r\n  \r\n}");
+            File.WriteAllBytes(claudeSettings, multilineCrLfOriginal);
+
+            var inst3 = installer.InstallClaudeCode(installer.DefaultEmitterScriptPath);
+            Assert.Equal(HookActionStatus.Installed, inst3.Status);
+            using (JsonDocument.Parse(File.ReadAllBytes(claudeSettings))) { }
+
+            var uninst3 = installer.UninstallClaudeCode();
+            Assert.Equal(HookActionStatus.Uninstalled, uninst3.Status);
+            Assert.Equal(multilineCrLfOriginal, File.ReadAllBytes(claudeSettings));
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void HookInstaller_ExternalReplacementAfterInstall_InvalidatesHashBoundProvenanceAndKeepsEmptyContainers()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), $"kagedesk-hooks-prov-{Guid.NewGuid():N}");
+        string fakeHome = Path.Combine(tempRoot, "home");
+        string fakeAppData = Path.Combine(tempRoot, "appdata");
+        string claudeDir = Path.Combine(fakeHome, ".claude");
+        string claudeSettings = Path.Combine(claudeDir, "settings.json");
+        Directory.CreateDirectory(claudeDir);
+
+        try
+        {
+            // Initially no "hooks" object -> install creates "hooks" + all 4 event keys and binds provenance to post-install SHA-256
+            File.WriteAllText(claudeSettings, """
+            {
+              "theme": "dark"
+            }
+            """);
+
+            var installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319);
+            var installRes = installer.InstallClaudeCode(installer.DefaultEmitterScriptPath);
+            Assert.Equal(HookActionStatus.Installed, installRes.Status);
+
+            // External edit changes the file content after install -> invalidates hash-bound provenance!
+            string externallyEdited = File.ReadAllText(claudeSettings).Replace("\"dark\"", "\"light\"", StringComparison.Ordinal);
+            File.WriteAllText(claudeSettings, externallyEdited);
+
+            // Uninstall must remove ONLY KageDesk hook entries and MUST NOT delete empty "hooks" or empty event arrays!
+            var uninstallRes = installer.UninstallClaudeCode();
+            Assert.Equal(HookActionStatus.Uninstalled, uninstallRes.Status);
+
+            string afterText = File.ReadAllText(claudeSettings);
+            Assert.DoesNotContain("kagedesk-emit.ps1", afterText, StringComparison.OrdinalIgnoreCase);
+
+            var root = JsonNode.Parse(afterText)!.AsObject();
+            Assert.Equal("light", root["theme"]!.GetValue<string>());
+            Assert.True(root.ContainsKey("hooks"), "External edit invalidated SHA-256 provenance; empty 'hooks' must NOT be deleted.");
+            var hooksObj = root["hooks"]!.AsObject();
+            Assert.True(hooksObj.ContainsKey("PreToolUse"));
+            Assert.True(hooksObj.ContainsKey("PostToolUse"));
+            Assert.True(hooksObj.ContainsKey("Notification"));
+            Assert.True(hooksObj.ContainsKey("Stop"));
+            Assert.Empty(hooksObj["PreToolUse"]!.AsArray());
+            Assert.Empty(hooksObj["PostToolUse"]!.AsArray());
+            Assert.Empty(hooksObj["Notification"]!.AsArray());
+            Assert.Empty(hooksObj["Stop"]!.AsArray());
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void HookInstaller_LegacyClaudeNotificationSharedGroup_SeparatesUpgradedHookIntoDedicatedApprovalWrapper()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), $"kagedesk-hooks-notif-{Guid.NewGuid():N}");
+        string fakeHome = Path.Combine(tempRoot, "home");
+        string fakeAppData = Path.Combine(tempRoot, "appdata");
+        string claudeDir = Path.Combine(fakeHome, ".claude");
+        string claudeSettings = Path.Combine(claudeDir, "settings.json");
+        Directory.CreateDirectory(claudeDir);
+
+        try
+        {
+            var installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319);
+            string emitterPath = installer.DefaultEmitterScriptPath;
+            string legacyCmd = installer.BuildHookCommand(emitterPath, "notification", "claude", "Notification received");
+            string encodedLegacyCmd = JsonSerializer.Serialize(legacyCmd);
+
+            // Shared Notification groups (both broad matcher "*" and omitted matcher) containing
+            // BOTH a user hook AND a legacy KageDesk hook
+            File.WriteAllText(claudeSettings, $$"""
+            {
+              "hooks": {
+                "Notification": [
+                  {
+                    "matcher": "*",
+                    "hooks": [
+                      {
+                        "type": "command",
+                        "command": "echo keep-user-notification-hook"
+                      },
+                      {
+                        "type": "command",
+                        "command": {{encodedLegacyCmd}}
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+            """);
+
+            var installRes = installer.InstallClaudeCode(emitterPath);
+            Assert.Equal(HookActionStatus.Installed, installRes.Status);
+
+            var root = JsonNode.Parse(File.ReadAllText(claudeSettings))!.AsObject();
+            var notifArr = root["hooks"]!["Notification"]!.AsArray();
+            Assert.Equal(2, notifArr.Count);
+
+            // Group 0: original user group keeps broad matcher "*" and ONLY the user hook (legacy KageDesk hook removed!)
+            var userGroup = notifArr[0]!.AsObject();
+            Assert.Equal("*", userGroup["matcher"]!.GetValue<string>());
+            var userGroupHooks = userGroup["hooks"]!.AsArray();
+            Assert.Single(userGroupHooks);
+            Assert.Equal("echo keep-user-notification-hook", userGroupHooks[0]!["command"]!.GetValue<string>());
+
+            // Group 1: dedicated KageDesk approval-scoped wrapper group with approval matcher and async:true
+            var kageGroup = notifArr[1]!.AsObject();
+            Assert.Equal("permission_prompt|elicitation_dialog", kageGroup["matcher"]!.GetValue<string>());
+            var kageGroupHooks = kageGroup["hooks"]!.AsArray();
+            Assert.Single(kageGroupHooks);
+            Assert.Contains("-Type approval", kageGroupHooks[0]!["command"]!.GetValue<string>(), StringComparison.Ordinal);
+            Assert.True(kageGroupHooks[0]!["async"]!.GetValue<bool>());
+
+            // Second install is strictly idempotent
+            byte[] afterInstall = File.ReadAllBytes(claudeSettings);
+            var install2 = installer.InstallClaudeCode(emitterPath);
+            Assert.Equal(HookActionStatus.AlreadyInstalled, install2.Status);
+            Assert.Equal(afterInstall, File.ReadAllBytes(claudeSettings));
+
+            // Uninstall removes ONLY KageDesk's dedicated wrapper and keeps user's hook + "*" matcher intact
+            var uninstallRes = installer.UninstallClaudeCode();
+            Assert.Equal(HookActionStatus.Uninstalled, uninstallRes.Status);
+            var afterRoot = JsonNode.Parse(File.ReadAllText(claudeSettings))!.AsObject();
+            var afterNotif = afterRoot["hooks"]!["Notification"]!.AsArray();
+            Assert.Single(afterNotif);
+            Assert.Equal("*", afterNotif[0]!["matcher"]!.GetValue<string>());
+            Assert.Equal("echo keep-user-notification-hook", afterNotif[0]!["hooks"]![0]!["command"]!.GetValue<string>());
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task HookInstaller_OpenCodeVersionDetection_V1V2AndUnsupportedMajor_WithIsolatedNodeExecution()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), $"kagedesk-oc-ver-{Guid.NewGuid():N}");
+        string fakeHome = Path.Combine(tempRoot, "home");
+        string fakeAppData = Path.Combine(tempRoot, "appdata");
+        string openCodeDir = Path.Combine(fakeHome, ".config", "opencode");
+        string pluginPath = Path.Combine(openCodeDir, "plugins", "kagedesk-plugin.js");
+        Directory.CreateDirectory(openCodeDir);
+
+        try
+        {
+            // 1. Unsupported major versions (v3+, v0.x, unparseable) MUST return Unsupported without writing a plugin!
+            foreach (string badVersion in new[] { "opencode 3.0.0", "0.9.4", "unknown-build" })
+            {
+                var unsupportedInstaller = new HookInstaller(
+                    fakeHome,
+                    fakeAppData,
+                    bridgePort: 4319,
+                    openCodeVersionProbe: () => badVersion);
+
+                var res = unsupportedInstaller.InstallOpenCode();
+                Assert.Equal(HookActionStatus.Unsupported, res.Status);
+                Assert.False(File.Exists(pluginPath), $"Unsupported OpenCode version '{badVersion}' must NOT write a plugin file.");
+            }
+
+            // 2. Spin up a real local loopback HTTP listener to verify real ESM plugin execution for V1 and V2!
+            int port = GetAvailablePort();
+            var receivedTypes = new System.Collections.Concurrent.ConcurrentQueue<(string Type, string AgentId)>();
+            using var listener = new HttpListener();
+            listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+            listener.Start();
+
+            using var serverCts = new CancellationTokenSource();
+            Task serverTask = Task.Run(async () =>
+            {
+                while (!serverCts.IsCancellationRequested)
+                {
+                    HttpListenerContext ctx;
+                    try
+                    {
+                        ctx = await listener.GetContextAsync().WaitAsync(serverCts.Token);
+                    }
+                    catch
+                    {
+                        break;
+                    }
+
+                    using var sr = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
+                    string body = await sr.ReadToEndAsync(serverCts.Token);
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(body);
+                        string t = doc.RootElement.GetProperty("type").GetString() ?? "";
+                        string a = doc.RootElement.GetProperty("agentId").GetString() ?? "";
+                        receivedTypes.Enqueue((t, a));
+                    }
+                    catch { }
+
+                    ctx.Response.StatusCode = 200;
+                    ctx.Response.Close();
+                }
+            });
+
+            // 2a. OpenCode V1 install & real Node.js ESM execution test
+            var v1Installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: port, openCodeVersionProbe: () => "opencode 1.18.29");
+            var v1Install = v1Installer.InstallOpenCode();
+            Assert.Equal(HookActionStatus.Installed, v1Install.Status);
+            Assert.True(File.Exists(pluginPath));
+            string v1Source = File.ReadAllText(pluginPath);
+            Assert.Contains("// kagedesk-managed-opencode-plugin:v1", v1Source, StringComparison.Ordinal);
+            Assert.Contains("export const KageDeskPlugin", v1Source, StringComparison.Ordinal);
+
+            string v1Harness = Path.Combine(tempRoot, "run-v1.mjs");
+            File.WriteAllText(v1Harness, """
+            import { pathToFileURL } from "node:url";
+            const origFetch = globalThis.fetch;
+            const pending = [];
+            globalThis.fetch = (...args) => {
+              const p = origFetch(...args);
+              pending.push(p);
+              return p;
+            };
+            const mod = await import(pathToFileURL(process.argv[2]).href);
+            if (typeof mod.KageDeskPlugin !== "function") throw new Error("Missing V1 KageDeskPlugin export");
+            const hooks = await mod.KageDeskPlugin({});
+            await hooks["tool.execute.before"]();
+            await hooks["tool.execute.after"]();
+            await hooks.event({ event: { type: "session.idle" } });
+            await hooks.event({ event: { type: "permission.asked" } });
+            await hooks.event({ event: { type: "session.error" } });
+            await Promise.all(pending);
+            """);
+
+            RunNodeScriptOrFail(v1Harness, pluginPath);
+            var v1Events = DrainQueue(receivedTypes);
+            Assert.Equal(5, v1Events.Count);
+            Assert.Contains(("tool_start", "opencode"), v1Events);
+            Assert.Contains(("tool_complete", "opencode"), v1Events);
+            Assert.Contains(("turn_done", "opencode"), v1Events);
+            Assert.Contains(("approval", "opencode"), v1Events);
+            Assert.Contains(("fail", "opencode"), v1Events);
+
+            // 2b. OpenCode V2 upgrade & real Node.js ESM execution test (default export + setup(ctx) + cleanup abort)
+            var v2Installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: port, openCodeVersionProbe: () => "opencode 2.1.0");
+            var v2Install = v2Installer.InstallOpenCode();
+            Assert.Equal(HookActionStatus.Installed, v2Install.Status);
+            string v2Source = File.ReadAllText(pluginPath);
+            Assert.Contains("// kagedesk-managed-opencode-plugin:v2", v2Source, StringComparison.Ordinal);
+            Assert.Contains("export default", v2Source, StringComparison.Ordinal);
+            Assert.Contains("ctx.tool.hook", v2Source, StringComparison.Ordinal);
+            Assert.Contains("ctx.event.subscribe", v2Source, StringComparison.Ordinal);
+
+            // V2 second install is strictly idempotent
+            Assert.Equal(HookActionStatus.AlreadyInstalled, v2Installer.InstallOpenCode().Status);
+
+            string v2Harness = Path.Combine(tempRoot, "run-v2.mjs");
+            File.WriteAllText(v2Harness, """
+            import { pathToFileURL } from "node:url";
+            const origFetch = globalThis.fetch;
+            const pending = [];
+            globalThis.fetch = (...args) => {
+              const p = origFetch(...args);
+              pending.push(p);
+              return p;
+            };
+            const mod = await import(pathToFileURL(process.argv[2]).href);
+            const plugin = mod.default;
+            if (!plugin || plugin.id !== "kagedesk" || typeof plugin.setup !== "function") {
+              throw new Error("Invalid V2 default plugin contract");
+            }
+            const toolHooks = new Map();
+            let subSignal = null;
+            let resolveEventsDone;
+            const eventsDone = new Promise(r => { resolveEventsDone = r; });
+            const ctx = {
+              tool: {
+                async hook(name, fn) { toolHooks.set(name, fn); }
+              },
+              event: {
+                async *subscribe({ signal }) {
+                  subSignal = signal;
+                  yield { type: "session.idle" };
+                  yield { type: "permission.asked" };
+                  yield { type: "session.error" };
+                  resolveEventsDone();
+                }
+              }
+            };
+            const cleanup = await plugin.setup(ctx);
+            await toolHooks.get("execute.before")({}, {});
+            await toolHooks.get("execute.after")({}, {});
+            await eventsDone;
+            await new Promise(r => setTimeout(r, 20));
+            await Promise.all(pending);
+            if (typeof cleanup !== "function") throw new Error("V2 setup must return cleanup function");
+            cleanup();
+            if (!subSignal || !subSignal.aborted) throw new Error("V2 cleanup must abort event subscription signal");
+            """);
+
+            RunNodeScriptOrFail(v2Harness, pluginPath);
+            var v2Events = DrainQueue(receivedTypes);
+            Assert.Equal(5, v2Events.Count);
+            Assert.Contains(("tool_start", "opencode"), v2Events);
+            Assert.Contains(("tool_complete", "opencode"), v2Events);
+            Assert.Contains(("turn_done", "opencode"), v2Events);
+            Assert.Contains(("approval", "opencode"), v2Events);
+            Assert.Contains(("fail", "opencode"), v2Events);
+
+            // Uninstall removes V2 plugin cleanly
+            Assert.Equal(HookActionStatus.Uninstalled, v2Installer.UninstallOpenCode().Status);
+            Assert.False(File.Exists(pluginPath));
+
+            serverCts.Cancel();
+            listener.Stop();
+            try { await serverTask; } catch { }
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
+        }
+    }
+
+    private static void RunNodeScriptOrFail(string scriptPath, string pluginArg)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "node",
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        psi.ArgumentList.Add(scriptPath);
+        psi.ArgumentList.Add(pluginArg);
+
+        using var proc = System.Diagnostics.Process.Start(psi);
+        Assert.NotNull(proc);
+        string stdout = proc!.StandardOutput.ReadToEnd();
+        string stderr = proc.StandardError.ReadToEnd();
+        Assert.True(proc.WaitForExit(10_000), $"Node harness timed out. stdout={stdout} stderr={stderr}");
+        Assert.True(proc.ExitCode == 0, $"Node harness failed (exit={proc.ExitCode}): stdout={stdout} stderr={stderr}");
+    }
+
+    private static List<(string Type, string AgentId)> DrainQueue(
+        System.Collections.Concurrent.ConcurrentQueue<(string Type, string AgentId)> queue)
+    {
+        var list = new List<(string Type, string AgentId)>();
+        while (queue.TryDequeue(out var item))
+        {
+            list.Add(item);
+        }
+        return list;
+    }
+
+    [Fact]
+    public void SessionLogActivityCollector_CoalescedBatch_AccumulatesIdentityIndependentlyAndSelectsFreshestTimestamp()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), $"kagedesk-coalesced-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var baseTime = new DateTimeOffset(2026, 4, 10, 16, 10, 0, TimeSpan.Zero);
+
+            // (a) Single coalesced delta: record 1 carries ONLY verified (pid, process_start_ticks),
+            //     record 2 carries activity with NO identity fields -> MUST correlate cleanly!
+            string logIdentityBatch = Path.Combine(tempDir, "coalesced-identity.jsonl");
+            File.WriteAllText(logIdentityBatch,
+                "{\"type\":\"session_meta\",\"pid\":4242,\"process_start_ticks\":777888999}\n" +
+                "{\"timestamp\":\"2026-04-10T16:10:02Z\",\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Edit\"}]}}\n");
+
+            using var collector = new SessionLogActivityCollector(
+                watchRoots: new[] { new SessionWatchRoot("claude", "Claude", tempDir) },
+                clock: () => baseTime.AddSeconds(5));
+
+            var derivedA = collector.ProcessFileDelta(logIdentityBatch, "claude", "Claude");
+            Assert.NotNull(derivedA);
+            Assert.Equal(AgentState.Working, derivedA!.State);
+            Assert.Equal("CODE", derivedA.DerivedActionToken, ignoreCase: true);
+            Assert.Equal(4242, derivedA.CorrelatedProcessId);
+            Assert.Equal(777888999L, derivedA.CorrelatedProcessStartTicks);
+
+            // Verify end-to-end correlation in HqStateAggregator
+            var agg = new HqStateAggregator(timeProvider: () => baseTime.AddSeconds(5));
+            var proc = new AgentSnapshot("proc-claude-4242", "Claude", AgentRole.External, "claude", AgentState.Idle, Source: "process", ProcessId: 4242, ProcessStartTicks: 777888999L);
+            agg.UpdateProcessAgents(new[] { proc });
+            agg.UpdateSessionLogActivity(collector.GetCurrentSnapshots());
+
+            var merged = agg.CurrentState.Agents.Single(a => a.Id == "proc-claude-4242");
+            Assert.Equal(AgentState.Working, merged.State);
+            Assert.Equal("CODE", merged.ToolName, ignoreCase: true);
+
+            // (b) Reversed physical order: record 1 has NEWER timestamp (16:10:30Z, Edit -> CODE),
+            //     record 2 physically AFTER record 1 has OLDER timestamp (16:10:10Z, Read -> READ) -> MUST pick newer!
+            string logReversed = Path.Combine(tempDir, "reversed-timestamps.jsonl");
+            File.WriteAllText(logReversed,
+                "{\"timestamp\":\"2026-04-10T16:10:30Z\",\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Edit\"}]}}\n" +
+                "{\"timestamp\":\"2026-04-10T16:10:10Z\",\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\"}]}}\n");
+
+            var derivedB = collector.ProcessFileDelta(logReversed, "claude", "Claude");
+            Assert.NotNull(derivedB);
+            Assert.Equal(new DateTimeOffset(2026, 4, 10, 16, 10, 30, TimeSpan.Zero), derivedB!.ObservedAt);
+            Assert.Equal("CODE", derivedB.DerivedActionToken, ignoreCase: true);
+
+            // Subsequent delta carrying an even older explicit timestamp must NOT overwrite the fresher stored activity
+            File.AppendAllText(logReversed,
+                "{\"timestamp\":\"2026-04-10T16:10:05Z\",\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"AskUserQuestion\"}]}}\n");
+            var derivedB2 = collector.ProcessFileDelta(logReversed, "claude", "Claude");
+            Assert.NotNull(derivedB2);
+            Assert.Equal(new DateTimeOffset(2026, 4, 10, 16, 10, 30, TimeSpan.Zero), derivedB2!.ObservedAt);
+            Assert.Equal(AgentState.Working, derivedB2.State);
+            Assert.Equal("CODE", derivedB2.DerivedActionToken, ignoreCase: true);
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void SessionLogActivityCollector_DirectRandomAccessRead_NeverExceeds8192BytesAndZeroHiddenPrefetch()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), $"kagedesk-direct-read-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            string logPath = Path.Combine(tempDir, "large-session.jsonl");
+            var sb = new StringBuilder(130_000);
+            for (int i = 0; i < 650; i++)
+            {
+                sb.AppendLine($"{{\"timestamp\":\"2026-04-10T16:00:00Z\",\"type\":\"user\",\"content\":\"padding record {i} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}");
+            }
+            sb.AppendLine("{\"timestamp\":\"2026-04-10T16:05:00Z\",\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Edit\"}]}}");
+            File.WriteAllText(logPath, sb.ToString());
+
+            var recordedReads = new List<(long Offset, int RequestedBytes, int ActualBytes)>();
+            var now = new DateTimeOffset(2026, 4, 10, 16, 5, 5, TimeSpan.Zero);
+
+            using var collector = new SessionLogActivityCollector(
+                watchRoots: new[] { new SessionWatchRoot("claude", "Claude", tempDir) },
+                clock: () => now)
+            {
+                LowLevelReadOverrideForTest = (handle, destination, fileOffset) =>
+                {
+                    int actual = RandomAccess.Read(handle, destination, fileOffset);
+                    recordedReads.Add((fileOffset, destination.Length, actual));
+                    return actual;
+                }
+            };
+
+            // Poll 1: large >120 KB file -> 64 B header probe + <= 8128 B tail read (ZERO 4 KiB FileStream prefetch!)
+            var obs1 = collector.ProcessFileDelta(logPath, "claude", "Claude");
+            Assert.NotNull(obs1);
+            Assert.Equal("CODE", obs1!.DerivedActionToken, ignoreCase: true);
+
+            Assert.Equal(2, recordedReads.Count);
+            Assert.Equal(0L, recordedReads[0].Offset);
+            Assert.Equal(64, recordedReads[0].RequestedBytes);
+            Assert.Equal(64, recordedReads[0].ActualBytes);
+
+            int totalRequested1 = recordedReads.Sum(r => r.RequestedBytes);
+            int totalActual1 = recordedReads.Sum(r => r.ActualBytes);
+            Assert.True(totalRequested1 <= SessionLogActivityCollector.MaxTailReadBytes,
+                $"Underlying requested bytes ({totalRequested1}) exceeded {SessionLogActivityCollector.MaxTailReadBytes}.");
+            Assert.True(totalActual1 <= SessionLogActivityCollector.MaxTailReadBytes,
+                $"Underlying actual bytes read ({totalActual1}) exceeded {SessionLogActivityCollector.MaxTailReadBytes}.");
+            Assert.Equal(totalActual1, collector.LastTotalFileBytesReadForTest);
+
+            // Poll 2: small 95-byte append -> 64 B header probe + exact delta bytes (ZERO extra prefetch!)
+            recordedReads.Clear();
+            string smallAppend = "{\"timestamp\":\"2026-04-10T16:05:06Z\",\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"pytest\"}]}}\n";
+            int appendLen = Encoding.UTF8.GetByteCount(smallAppend);
+            File.AppendAllText(logPath, smallAppend);
+
+            var obs2 = collector.ProcessFileDelta(logPath, "claude", "Claude");
+            Assert.NotNull(obs2);
+            Assert.Equal("TEST", obs2!.DerivedActionToken, ignoreCase: true);
+
+            Assert.Equal(2, recordedReads.Count);
+            Assert.Equal(64, recordedReads[0].RequestedBytes);
+            Assert.Equal(appendLen, recordedReads[1].RequestedBytes);
+            Assert.Equal(64 + appendLen, recordedReads.Sum(r => r.ActualBytes));
+            Assert.True(recordedReads.Sum(r => r.RequestedBytes) <= SessionLogActivityCollector.MaxTailReadBytes);
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
+    }
 }
