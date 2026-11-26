@@ -85,7 +85,7 @@ public class V22HooksAndSessionLogTests
             byte[] originalOpenCodeBytes = File.ReadAllBytes(openCodeConfig);
 
             var fixedTime = new DateTimeOffset(2026, 4, 10, 14, 30, 0, TimeSpan.Zero);
-            var installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319, clock: () => fixedTime, codexHomeDir: codexDir);
+            var installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319, clock: () => fixedTime, codexHomeDir: codexDir, openCodeVersionProbe: () => "opencode 1.18.29");
 
             // 1. First install
             HookOperationSummary install1 = installer.InstallAll();
@@ -310,7 +310,7 @@ public class V22HooksAndSessionLogTests
             byte[] customPluginBytes = Encoding.UTF8.GetBytes("// user custom plugin\nexport default () => ({});\n");
             File.WriteAllBytes(pluginPath, customPluginBytes);
 
-            var installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319);
+            var installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319, openCodeVersionProbe: () => "opencode 1.18.29");
             var installRes = installer.InstallOpenCode();
             Assert.Equal(HookActionStatus.UnsupportedLayout, installRes.Status);
             Assert.Equal(customPluginBytes, File.ReadAllBytes(pluginPath));
@@ -1017,7 +1017,7 @@ public class V22HooksAndSessionLogTests
 
         try
         {
-            var installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319);
+            var installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319, openCodeVersionProbe: () => "opencode 1.18.29");
 
             // 1. OpenCode plugin exports tool.execute.before/after AND supported event({ event }) handler branching strictly on event.type
             var ocInstall = installer.InstallOpenCode();
@@ -1839,6 +1839,260 @@ public class V22HooksAndSessionLogTests
             Assert.Equal(appendLen, recordedReads[1].RequestedBytes);
             Assert.Equal(64 + appendLen, recordedReads.Sum(r => r.ActualBytes));
             Assert.True(recordedReads.Sum(r => r.RequestedBytes) <= SessionLogActivityCollector.MaxTailReadBytes);
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task HookInstaller_OpenCodeProbe_FailClosedOnNullEmptyNonzeroTimeoutAndDrainsConcurrentStderr()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), $"kagedesk-oc-failclosed-{Guid.NewGuid():N}");
+        string fakeHome = Path.Combine(tempRoot, "home");
+        string fakeAppData = Path.Combine(tempRoot, "appdata");
+        string openCodeDir = Path.Combine(fakeHome, ".config", "opencode");
+        string pluginDir = Path.Combine(openCodeDir, "plugins");
+        string pluginPath = Path.Combine(pluginDir, "kagedesk-plugin.js");
+        Directory.CreateDirectory(openCodeDir);
+
+        try
+        {
+            // 1. Custom probe returning null, empty, whitespace, throwing, or unparseable -> MUST fail-closed (never V1 fallback, never write plugin!)
+            Func<string?>[] failingProbes =
+            {
+                () => null,
+                () => "",
+                () => "   \r\n\t  ",
+                () => throw new InvalidOperationException("simulated probe error"),
+                () => "opencode dev-snapshot"
+            };
+
+            foreach (var probe in failingProbes)
+            {
+                var installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319, openCodeVersionProbe: probe);
+                var res = installer.InstallOpenCode();
+                Assert.Equal(HookActionStatus.Unsupported, res.Status);
+                Assert.NotEqual(HookActionStatus.Installed, res.Status);
+                Assert.False(File.Exists(pluginPath), "Failed/unknown OpenCode probe must NOT write kagedesk-plugin.js.");
+                Assert.False(Directory.Exists(pluginDir), "Failed/unknown OpenCode probe must NOT create plugins directory.");
+            }
+
+            // 2. Real child process probe: missing CLI -> ProbeFailedOrUnavailable
+            var missingRes = await HookInstaller.ProbeOpenCodeExecutableVersionAsync(
+                "kagedesk_nonexistent_opencode_binary_xyz",
+                new[] { "--version" },
+                TimeSpan.FromMilliseconds(500));
+            Assert.Equal(OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable, missingRes.Outcome);
+
+            // 3. Real child process probe: nonzero exit code even with v1-looking stdout -> ProbeFailedOrUnavailable!
+            var nonzeroRes = await HookInstaller.ProbeOpenCodeExecutableVersionAsync(
+                "node",
+                new[] { "-e", "process.stdout.write('opencode 1.18.29\\n'); process.exit(1);" },
+                TimeSpan.FromSeconds(5));
+            Assert.Equal(OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable, nonzeroRes.Outcome);
+
+            // 4. Real child process probe: empty output with exit 0 -> ProbeFailedOrUnavailable!
+            var emptyRes = await HookInstaller.ProbeOpenCodeExecutableVersionAsync(
+                "node",
+                new[] { "-e", "" },
+                TimeSpan.FromSeconds(5));
+            Assert.Equal(OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable, emptyRes.Outcome);
+
+            // 5. Real child process probe: heavy >128KB stderr BEFORE writing v2 stdout -> concurrent drain avoids deadlock and detects V2!
+            var heavyStderrRes = await HookInstaller.ProbeOpenCodeExecutableVersionAsync(
+                "node",
+                new[] { "-e", "process.stderr.write('W'.repeat(131072)); process.stdout.write('opencode 2.1.0\\n');" },
+                TimeSpan.FromSeconds(5));
+            Assert.Equal(OpenCodeVersionProbeOutcome.DetectedV2, heavyStderrRes.Outcome);
+            Assert.Equal(OpenCodePluginApiVersion.V2, heavyStderrRes.ApiVersion);
+
+            // 6. Real stalled child process (writes >128KB stderr and sleeps 10s) -> aborts cleanly within single deadline without hanging!
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var timeoutRes = await HookInstaller.ProbeOpenCodeExecutableVersionAsync(
+                "node",
+                new[] { "-e", "process.stderr.write('E'.repeat(131072)); setTimeout(() => {}, 10000);" },
+                TimeSpan.FromMilliseconds(300));
+            sw.Stop();
+
+            Assert.Equal(OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable, timeoutRes.Outcome);
+            Assert.Contains("timed out", timeoutRes.Reason ?? "", StringComparison.OrdinalIgnoreCase);
+            Assert.True(sw.ElapsedMilliseconds < 2000, $"Expected stalled OpenCode probe to abort promptly near 300ms deadline, took {sw.ElapsedMilliseconds}ms.");
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void HookInstaller_UnprovenMultilineEmptyContainer_UninstallPreservesOriginalCrlfInteriorWhitespace()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), $"kagedesk-unproven-multiline-{Guid.NewGuid():N}");
+        string fakeHome = Path.Combine(tempRoot, "home");
+        string fakeAppData = Path.Combine(tempRoot, "appdata");
+        string claudeDir = Path.Combine(fakeHome, ".claude");
+        string claudeSettings = Path.Combine(claudeDir, "settings.json");
+        Directory.CreateDirectory(claudeDir);
+
+        try
+        {
+            var installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319);
+
+            // Case 1: Originally empty CRLF multiline PreToolUse array + unrelated key "other": 1
+            const string originalSingleEvent = "{\r\n  \"other\": 1,\r\n  \"hooks\": {\r\n    \"PreToolUse\": [\r\n      \r\n    ]\r\n  }\r\n}";
+            File.WriteAllBytes(claudeSettings, Encoding.UTF8.GetBytes(originalSingleEvent));
+
+            var inst1 = installer.InstallClaudeCode(installer.DefaultEmitterScriptPath);
+            Assert.Equal(HookActionStatus.Installed, inst1.Status);
+
+            // Externally edit "other": 1 -> "other": 2, invalidating whole-file SHA-256 provenance!
+            string edited1 = File.ReadAllText(claudeSettings, Encoding.UTF8)
+                .Replace("\"other\": 1", "\"other\": 2", StringComparison.Ordinal);
+            File.WriteAllBytes(claudeSettings, Encoding.UTF8.GetBytes(edited1));
+
+            var uninst1 = installer.UninstallClaudeCode();
+            Assert.Equal(HookActionStatus.Uninstalled, uninst1.Status);
+
+            byte[] afterBytes1 = File.ReadAllBytes(claudeSettings);
+            string afterText1 = Encoding.UTF8.GetString(afterBytes1);
+            using (JsonDocument.Parse(afterBytes1)) { }
+            Assert.DoesNotContain("kagedesk-emit.ps1", afterText1, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("\"other\": 2", afterText1, StringComparison.Ordinal);
+            // Exact byte-for-byte survival of original CRLF interior whitespace inside PreToolUse!
+            Assert.Contains("\"PreToolUse\": [\r\n      \r\n    ]", afterText1, StringComparison.Ordinal);
+
+            // Case 2: All 4 managed arrays pre-exist as empty CRLF multiline containers + unrelated key edited
+            const string originalAllEvents =
+                "{\r\n" +
+                "  \"other\": 1,\r\n" +
+                "  \"hooks\": {\r\n" +
+                "    \"PreToolUse\": [\r\n      \r\n    ],\r\n" +
+                "    \"PostToolUse\": [\r\n      \r\n    ],\r\n" +
+                "    \"Notification\": [\r\n      \r\n    ],\r\n" +
+                "    \"Stop\": [\r\n      \r\n    ]\r\n" +
+                "  }\r\n" +
+                "}";
+            byte[] expectedAfterAllEvents = Encoding.UTF8.GetBytes(originalAllEvents.Replace("\"other\": 1", "\"other\": 2", StringComparison.Ordinal));
+            File.WriteAllBytes(claudeSettings, Encoding.UTF8.GetBytes(originalAllEvents));
+
+            var inst2 = installer.InstallClaudeCode(installer.DefaultEmitterScriptPath);
+            Assert.Equal(HookActionStatus.Installed, inst2.Status);
+
+            string edited2 = File.ReadAllText(claudeSettings, Encoding.UTF8)
+                .Replace("\"other\": 1", "\"other\": 2", StringComparison.Ordinal);
+            File.WriteAllBytes(claudeSettings, Encoding.UTF8.GetBytes(edited2));
+
+            var uninst2 = installer.UninstallClaudeCode();
+            Assert.Equal(HookActionStatus.Uninstalled, uninst2.Status);
+
+            byte[] actualAfterAllEvents = File.ReadAllBytes(claudeSettings);
+            Assert.Equal(Encoding.UTF8.GetString(expectedAfterAllEvents), Encoding.UTF8.GetString(actualAfterAllEvents));
+            Assert.Equal(expectedAfterAllEvents, actualAfterAllEvents);
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void SessionLogActivityCollector_CompetingIdentityTuples_RejectsAmbiguityAndPreservesOwnActivityTuple()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), $"kagedesk-competing-tuples-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var baseTime = new DateTimeOffset(2026, 4, 10, 16, 20, 0, TimeSpan.Zero);
+
+            // (a) Freshest activity WITHOUT its own tuple + two competing (pid, start_ticks) tuples in same batch
+            //     (newer generation + delayed older metadata record) -> declines correlation (ambiguous, neither hijacked)!
+            string ambiguousLog = Path.Combine(tempDir, "ambiguous-batch.jsonl");
+            File.WriteAllText(ambiguousLog,
+                "{\"timestamp\":\"2026-04-10T16:20:20Z\",\"type\":\"session_meta\",\"pid\":2002,\"process_start_ticks\":222000}\n" +
+                "{\"timestamp\":\"2026-04-10T16:20:25Z\",\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Edit\"}]}}\n" +
+                "{\"timestamp\":\"2026-04-10T16:20:05Z\",\"type\":\"session_meta\",\"pid\":1001,\"process_start_ticks\":111000}\n");
+
+            using var collectorA = new SessionLogActivityCollector(
+                watchRoots: new[] { new SessionWatchRoot("claude", "Claude", tempDir) },
+                clock: () => baseTime.AddSeconds(30));
+
+            var derivedAmbiguous = collectorA.ProcessFileDelta(ambiguousLog, "claude", "Claude");
+            Assert.NotNull(derivedAmbiguous);
+            Assert.Equal(AgentState.Working, derivedAmbiguous!.State);
+            Assert.Equal("CODE", derivedAmbiguous.DerivedActionToken, ignoreCase: true);
+            Assert.Null(derivedAmbiguous.CorrelatedProcessId);
+            Assert.Null(derivedAmbiguous.CorrelatedProcessStartTicks);
+
+            // End-to-end with HqStateAggregator: NEITHER proc1 nor proc2 is falsely hijacked!
+            var aggA = new HqStateAggregator(timeProvider: () => baseTime.AddSeconds(30));
+            var procOld = new AgentSnapshot("proc-claude-1001", "Claude Old", AgentRole.External, "claude", AgentState.Idle, Source: "process", ProcessId: 1001, ProcessStartTicks: 111000L);
+            var procNew = new AgentSnapshot("proc-claude-2002", "Claude New", AgentRole.External, "claude", AgentState.Idle, Source: "process", ProcessId: 2002, ProcessStartTicks: 222000L);
+            aggA.UpdateProcessAgents(new[] { procOld, procNew });
+            aggA.UpdateSessionLogActivity(collectorA.GetCurrentSnapshots());
+
+            Assert.Equal(AgentState.Idle, aggA.CurrentState.Agents.Single(a => a.Id == "proc-claude-1001").State);
+            Assert.Equal(AgentState.Idle, aggA.CurrentState.Agents.Single(a => a.Id == "proc-claude-2002").State);
+            Assert.Single(aggA.CurrentState.Agents, a => a.Source == "session-log" && a.State == AgentState.Working);
+
+            // (b) Freshest activity CARRYING its own (pid_new, start_new) tuple + later physical line carrying
+            //     older (pid_old, start_old) metadata -> activity KEEPS (pid_new, start_new)!
+            string ownTupleLog = Path.Combine(tempDir, "own-tuple-precedence.jsonl");
+            File.WriteAllText(ownTupleLog,
+                "{\"timestamp\":\"2026-04-10T16:20:30Z\",\"pid\":2002,\"process_start_ticks\":222000,\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"pytest\"}]}}\n" +
+                "{\"timestamp\":\"2026-04-10T16:20:05Z\",\"type\":\"session_meta\",\"pid\":1001,\"process_start_ticks\":111000}\n");
+
+            using var collectorB = new SessionLogActivityCollector(
+                watchRoots: new[] { new SessionWatchRoot("claude", "Claude", tempDir) },
+                clock: () => baseTime.AddSeconds(35));
+
+            var derivedOwn = collectorB.ProcessFileDelta(ownTupleLog, "claude", "Claude");
+            Assert.NotNull(derivedOwn);
+            Assert.Equal(AgentState.Working, derivedOwn!.State);
+            Assert.Equal("TEST", derivedOwn.DerivedActionToken, ignoreCase: true);
+            Assert.Equal(2002, derivedOwn.CorrelatedProcessId);
+            Assert.Equal(222000L, derivedOwn.CorrelatedProcessStartTicks);
+
+            // Even a subsequent delayed older metadata delta MUST NOT overwrite or clear the activity's own tuple!
+            File.AppendAllText(ownTupleLog,
+                "{\"timestamp\":\"2026-04-10T16:20:01Z\",\"type\":\"session_meta\",\"pid\":1001,\"process_start_ticks\":111000}\n");
+            var derivedOwnAfterDelayed = collectorB.ProcessFileDelta(ownTupleLog, "claude", "Claude");
+            Assert.NotNull(derivedOwnAfterDelayed);
+            Assert.Equal(2002, derivedOwnAfterDelayed!.CorrelatedProcessId);
+            Assert.Equal(222000L, derivedOwnAfterDelayed.CorrelatedProcessStartTicks);
+
+            var aggB = new HqStateAggregator(timeProvider: () => baseTime.AddSeconds(35));
+            aggB.UpdateProcessAgents(new[] { procOld, procNew });
+            aggB.UpdateSessionLogActivity(collectorB.GetCurrentSnapshots());
+
+            Assert.Equal(AgentState.Idle, aggB.CurrentState.Agents.Single(a => a.Id == "proc-claude-1001").State);
+            var enrichedNew = aggB.CurrentState.Agents.Single(a => a.Id == "proc-claude-2002");
+            Assert.Equal(AgentState.Working, enrichedNew.State);
+            Assert.Equal("TEST", enrichedNew.ToolName, ignoreCase: true);
+
+            // (c) Cross-delta ambiguity: Delta 1 correlates inherited identity -> Delta 2 introduces conflicting tuple -> clears inherited correlation!
+            string crossDeltaLog = Path.Combine(tempDir, "cross-delta-ambiguous.jsonl");
+            File.WriteAllText(crossDeltaLog,
+                "{\"timestamp\":\"2026-04-10T16:20:20Z\",\"type\":\"session_meta\",\"pid\":2002,\"process_start_ticks\":222000}\n" +
+                "{\"timestamp\":\"2026-04-10T16:20:22Z\",\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Edit\"}]}}\n");
+
+            using var collectorC = new SessionLogActivityCollector(
+                watchRoots: new[] { new SessionWatchRoot("claude", "Claude", tempDir) },
+                clock: () => baseTime.AddSeconds(35));
+
+            var delta1 = collectorC.ProcessFileDelta(crossDeltaLog, "claude", "Claude");
+            Assert.NotNull(delta1);
+            Assert.Equal(2002, delta1!.CorrelatedProcessId);
+            Assert.Equal(222000L, delta1.CorrelatedProcessStartTicks);
+
+            File.AppendAllText(crossDeltaLog,
+                "{\"timestamp\":\"2026-04-10T16:20:05Z\",\"type\":\"session_meta\",\"pid\":1001,\"process_start_ticks\":111000}\n");
+            var delta2 = collectorC.ProcessFileDelta(crossDeltaLog, "claude", "Claude");
+            Assert.NotNull(delta2);
+            Assert.Null(delta2!.CorrelatedProcessId);
+            Assert.Null(delta2.CorrelatedProcessStartTicks);
         }
         finally
         {

@@ -108,6 +108,23 @@ public static class SingleInstanceWakeUp
         Func<NamedPipeClientStream, SecurityIdentifier?>? resolveServerOwnerSid,
         Action<string>? onAttemptFailure = null)
     {
+        return TrySignalRunningInstanceCoreAsync(
+                pipeName,
+                maxRetryWindow,
+                expectedUserSid,
+                resolveServerOwnerSid,
+                onAttemptFailure)
+            .GetAwaiter()
+            .GetResult();
+    }
+
+    internal static async Task<bool> TrySignalRunningInstanceCoreAsync(
+        string? pipeName,
+        TimeSpan? maxRetryWindow,
+        SecurityIdentifier? expectedUserSid,
+        Func<NamedPipeClientStream, SecurityIdentifier?>? resolveServerOwnerSid,
+        Action<string>? onAttemptFailure = null)
+    {
         SecurityIdentifier? localUserSid = expectedUserSid ?? WindowsIdentity.GetCurrent().User;
         if (localUserSid == null)
         {
@@ -117,34 +134,38 @@ public static class SingleInstanceWakeUp
 
         string targetPipe = string.IsNullOrWhiteSpace(pipeName) ? DefaultPipeName : pipeName;
         TimeSpan budget = maxRetryWindow ?? DefaultClientRetryWindow;
-        if (budget < TimeSpan.Zero) budget = TimeSpan.Zero;
+        if (budget <= TimeSpan.Zero)
+        {
+            return false;
+        }
 
         long startTick = Environment.TickCount64;
-        long deadlineTick = startTick + (long)budget.TotalMilliseconds;
         byte[] ackBuf = new byte[1];
 
-        while (true)
+        // ONE single absolute deadline governs the ENTIRE client retry + connect + write + flush + read-ACK exchange.
+        using var deadlineCts = new CancellationTokenSource(budget);
+        CancellationToken ct = deadlineCts.Token;
+
+        while (!ct.IsCancellationRequested)
         {
-            long remainingMs = Math.Max(1, deadlineTick - Environment.TickCount64);
-            int attemptTimeoutMs = (int)Math.Min(500, remainingMs);
             string stage = "init";
 
             try
             {
                 // Do NOT set PipeOptions.CurrentUserOnly (dotnet/runtime#123903 breaks same-user
-                // elevated <-> unelevated pipes). Use PipeOptions.None + CancelIoEx so normal
-                // handshakes execute directly via kernel Named Pipe I/O with zero ThreadPool
-                // dependency, while TokenImpersonationLevel.Identification lets the server verify
-                // our exact User SID via RunAsClient.
-                using var client = new NamedPipeClientStream(
+                // elevated <-> unelevated pipes). Use PipeOptions.Asynchronous for true overlapped
+                // kernel I/O cancellation bound directly to the single absolute deadline token,
+                // while TokenImpersonationLevel.Identification lets the server verify our User SID via RunAsClient.
+                await using var client = new NamedPipeClientStream(
                     serverName: ".",
                     pipeName: targetPipe,
                     direction: PipeDirection.InOut,
-                    options: PipeOptions.None,
+                    options: PipeOptions.Asynchronous,
                     impersonationLevel: TokenImpersonationLevel.Identification);
 
                 stage = "connect";
-                client.Connect(attemptTimeoutMs);
+                await client.ConnectAsync(ct).ConfigureAwait(false);
+                ct.ThrowIfCancellationRequested();
 
                 // Verify server pipe Owner SID == current user's User SID BEFORE writing opcode
                 stage = "owner";
@@ -157,22 +178,24 @@ public static class SingleInstanceWakeUp
                     return false;
                 }
 
-                int ioTimeoutMs = Math.Max(100, (int)Math.Min(500, budget.TotalMilliseconds));
-                using var ioCts = new CancellationTokenSource(ioTimeoutMs);
-                using var ioCancelReg = ioCts.Token.Register(() => TryCancelPipeIo(client));
-
                 stage = "write";
-                client.Write(WakeOpcodeBytes, 0, WakeOpcodeBytes.Length);
+                await client.WriteAsync(WakeOpcodeBytes, ct).ConfigureAwait(false);
                 stage = "flush";
-                client.Flush();
+                await client.FlushAsync(ct).ConfigureAwait(false);
 
                 stage = "read";
-                int read = client.Read(ackBuf, 0, 1);
+                int read = await client.ReadAsync(ackBuf, ct).ConfigureAwait(false);
                 if (read == 1 && ackBuf[0] == AckByte)
                 {
                     return true;
                 }
+
                 onAttemptFailure?.Invoke($"t={Environment.TickCount64 - startTick}ms bad-ack read={read} byte={ackBuf[0]}");
+            }
+            catch (OperationCanceledException ex) when (ct.IsCancellationRequested)
+            {
+                onAttemptFailure?.Invoke($"t={Environment.TickCount64 - startTick}ms @{stage} DeadlineExceeded: {ex.Message}");
+                return false;
             }
             catch (OperationCanceledException ex)
             {
@@ -196,45 +219,23 @@ public static class SingleInstanceWakeUp
                 onAttemptFailure?.Invoke($"t={Environment.TickCount64 - startTick}ms @{stage} {ex.GetType().Name}: {ex.Message}");
             }
 
-            long leftMs = deadlineTick - Environment.TickCount64;
-            if (leftMs <= 0)
+            if (ct.IsCancellationRequested)
             {
                 return false;
             }
 
-            Thread.Sleep((int)Math.Min(50, leftMs));
-        }
-    }
-
-    internal static void TryCancelPipeIo(PipeStream? stream)
-    {
-        if (stream == null) return;
-        bool addedRef = false;
-        SafePipeHandle? handle = null;
-        try
-        {
-            handle = stream.SafePipeHandle;
-            if (handle.IsInvalid || handle.IsClosed) return;
-            handle.DangerousAddRef(ref addedRef);
-            if (!handle.IsInvalid && !handle.IsClosed)
+            try
             {
-                CancelIoEx(handle, IntPtr.Zero);
+                await Task.Delay(50, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
             }
         }
-        catch (ObjectDisposedException) { }
-        catch (InvalidOperationException) { }
-        finally
-        {
-            if (addedRef && handle != null)
-            {
-                handle.DangerousRelease();
-            }
-        }
-    }
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool CancelIoEx(SafePipeHandle hFile, IntPtr lpOverlapped);
+        return false;
+    }
 
     private static SecurityIdentifier? GetServerPipeOwnerSid(NamedPipeClientStream client)
     {
@@ -257,9 +258,8 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
     private readonly object _lifecycleLock = new();
     private readonly object _rateLock = new();
 
-    private Thread? _listenThread;
+    private Task? _listenTask;
     private NamedPipeServerStream? _pendingServer;
-    private NamedPipeServerStream? _activeServer;
     private DateTimeOffset _lastAcceptedWakeAt = DateTimeOffset.MinValue;
     private bool _started;
     private bool _disposed;
@@ -301,7 +301,7 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
             if (_disposed || _started) return;
             _started = true;
 
-            // Capture token before starting listener thread so Dispose() cannot race on _cts.Token.
+            // Capture token before starting listener task so Dispose() cannot race on _cts.Token.
             CancellationToken ct = _cts.Token;
 
             // Pre-create the first pipe instance synchronously so the kernel pipe endpoint
@@ -320,21 +320,12 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
 
             try
             {
-                // Run the Named Pipe server on a dedicated background thread using synchronous
-                // PipeOptions.None I/O + CancelIoEx so wake-up handshakes complete directly in
-                // kernel I/O with zero .NET ThreadPool dependency even under heavy load.
-                var thread = new Thread(() => ListenLoop(ct))
-                {
-                    IsBackground = true,
-                    Name = "KageDesk.WakeUpServer"
-                };
-                _listenThread = thread;
-                thread.Start();
+                _listenTask = Task.Run(() => ListenLoopAsync(ct));
             }
             catch (Exception ex)
             {
                 LastListenException = ex;
-                _listenThread = null;
+                _listenTask = null;
                 NamedPipeServerStream? leftover = Interlocked.Exchange(ref _pendingServer, null);
                 if (leftover != null)
                 {
@@ -352,13 +343,13 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
             direction: PipeDirection.InOut,
             maxNumberOfServerInstances: 2,
             transmissionMode: PipeTransmissionMode.Message,
-            options: PipeOptions.None,
+            options: PipeOptions.Asynchronous,
             inBufferSize: 64,
             outBufferSize: 64,
             pipeSecurity: security);
     }
 
-    private void ListenLoop(CancellationToken ct)
+    private async Task ListenLoopAsync(CancellationToken ct)
     {
         try
         {
@@ -368,13 +359,12 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
                 try
                 {
                     server = Interlocked.Exchange(ref _pendingServer, null) ?? CreateServerInstance();
-                    Volatile.Write(ref _activeServer, server);
                     if (ct.IsCancellationRequested) break;
 
-                    server.WaitForConnection();
+                    await server.WaitForConnectionAsync(ct).ConfigureAwait(false);
                     if (ct.IsCancellationRequested) break;
 
-                    HandleClient(server, ct);
+                    await HandleClientAsync(server, ct).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
@@ -394,9 +384,9 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
                     if (ct.IsCancellationRequested) break;
                     try
                     {
-                        if (ct.WaitHandle.WaitOne(50)) break;
+                        await Task.Delay(50, ct).ConfigureAwait(false);
                     }
-                    catch
+                    catch (OperationCanceledException)
                     {
                         break;
                     }
@@ -405,7 +395,6 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
                 {
                     if (server != null)
                     {
-                        Interlocked.CompareExchange(ref _activeServer, null, server);
                         try { server.Dispose(); } catch { }
                     }
                 }
@@ -421,11 +410,11 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
         }
     }
 
-    private void HandleClient(NamedPipeServerStream server, CancellationToken ct)
+    private async Task HandleClientAsync(NamedPipeServerStream server, CancellationToken ct)
     {
-        using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        readCts.CancelAfter(TimeSpan.FromMilliseconds(1500));
-        using var readCancelReg = readCts.Token.Register(() => SingleInstanceWakeUp.TryCancelPipeIo(server));
+        using var exchangeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        exchangeCts.CancelAfter(TimeSpan.FromMilliseconds(1500));
+        CancellationToken exchangeCt = exchangeCts.Token;
 
         // Read into an OpcodeLength + 1 buffer in message mode so any oversized message or
         // trailing bytes are detected and rejected BEFORE sending ACK.
@@ -434,7 +423,7 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
         bool messageComplete = false;
         while (total <= SingleInstanceWakeUp.OpcodeLength)
         {
-            int n = server.Read(buf, total, buf.Length - total);
+            int n = await server.ReadAsync(buf.AsMemory(total, buf.Length - total), exchangeCt).ConfigureAwait(false);
             if (n <= 0) return;
             total += n;
             if (server.IsMessageComplete)
@@ -496,16 +485,15 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
         // Acknowledge valid opcode and wait briefly for client EOF so the client reads ACK before close.
         try
         {
-            server.Write(AckBytes, 0, AckBytes.Length);
-            server.Flush();
+            await server.WriteAsync(AckBytes, exchangeCt).ConfigureAwait(false);
+            await server.FlushAsync(exchangeCt).ConfigureAwait(false);
 
             using var drainCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             drainCts.CancelAfter(TimeSpan.FromMilliseconds(100));
-            using var drainCancelReg = drainCts.Token.Register(() => SingleInstanceWakeUp.TryCancelPipeIo(server));
             byte[] eofProbe = new byte[1];
             try
             {
-                _ = server.Read(eofProbe, 0, eofProbe.Length);
+                _ = await server.ReadAsync(eofProbe, drainCts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) { }
             catch (IOException) { }
@@ -562,7 +550,7 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
 
     public void Dispose()
     {
-        Thread? listenThread;
+        Task? listenTask;
         NamedPipeServerStream? unclaimed;
         lock (_lifecycleLock)
         {
@@ -570,7 +558,7 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
             _disposed = true;
             _cts.Cancel();
             unclaimed = Interlocked.Exchange(ref _pendingServer, null);
-            listenThread = _listenThread;
+            listenTask = _listenTask;
         }
 
         if (unclaimed != null)
@@ -578,31 +566,18 @@ public sealed class SingleInstanceWakeUpServer : IDisposable
             try { unclaimed.Dispose(); } catch { }
         }
 
-        SingleInstanceWakeUp.TryCancelPipeIo(Volatile.Read(ref _activeServer));
-
         bool completed = true;
-        try
+        if (listenTask != null)
         {
-            if (listenThread != null && listenThread != Thread.CurrentThread)
+            try
             {
-                long deadline = Environment.TickCount64 + 2000;
-                completed = false;
-                while (true)
-                {
-                    if (listenThread.Join(25))
-                    {
-                        completed = true;
-                        break;
-                    }
-                    SingleInstanceWakeUp.TryCancelPipeIo(Volatile.Read(ref _activeServer));
-                    if (Environment.TickCount64 >= deadline)
-                    {
-                        break;
-                    }
-                }
+                completed = listenTask.Wait(TimeSpan.FromSeconds(2));
+            }
+            catch
+            {
+                completed = listenTask.IsCompleted;
             }
         }
-        catch { }
 
         if (completed)
         {

@@ -44,6 +44,8 @@ public class KageDeskRuntime : IDisposable
     private long _lastProcessedAudioRevision;
     private int _gifExportInProgress;
     private Task? _gifExportTask;
+    private int _hookOpInProgress;
+    private Task? _hookOpTask;
 
     private readonly object _effectsLock = new();
     private readonly object _mediaSyncLock = new();
@@ -614,50 +616,8 @@ public class KageDeskRuntime : IDisposable
             },
             OnMediaSyncToggled = SetMediaSyncEnabledInternal,
             OnSoundToggled = enabled => UpdateConfig(c => c.SoundEnabled = enabled),
-            OnInstallHooks = () =>
-            {
-                try
-                {
-                    var installer = new HookInstaller(bridgePort: _config.LocalBridgePort);
-                    var summary = installer.InstallAll();
-                    string details = string.Join(", ", summary.Results.Select(r => $"{r.Target}: {r.Status}"));
-                    _trayController?.ShowBalloon(
-                        "KageDesk CLI Hooks",
-                        summary.AllSucceeded ? $"Hooks configured ({details})." : $"Hooks need attention ({details}).",
-                        summary.AllSucceeded ? ToolTipIcon.Info : ToolTipIcon.Warning,
-                        4500);
-                }
-                catch (Exception ex)
-                {
-                    _trayController?.ShowBalloon(
-                        "KageDesk CLI Hooks Error",
-                        $"Hook install failed: {ex.Message}",
-                        ToolTipIcon.Error,
-                        4500);
-                }
-            },
-            OnUninstallHooks = () =>
-            {
-                try
-                {
-                    var installer = new HookInstaller(bridgePort: _config.LocalBridgePort);
-                    var summary = installer.UninstallAll();
-                    string details = string.Join(", ", summary.Results.Select(r => $"{r.Target}: {r.Status}"));
-                    _trayController?.ShowBalloon(
-                        "KageDesk CLI Hooks",
-                        summary.AllSucceeded ? $"Hooks removed ({details})." : $"Hooks need attention ({details}).",
-                        summary.AllSucceeded ? ToolTipIcon.Info : ToolTipIcon.Warning,
-                        4500);
-                }
-                catch (Exception ex)
-                {
-                    _trayController?.ShowBalloon(
-                        "KageDesk CLI Hooks Error",
-                        $"Hook uninstall failed: {ex.Message}",
-                        ToolTipIcon.Error,
-                        4500);
-                }
-            },
+            OnInstallHooks = () => RunHookOperationAsync(install: true),
+            OnUninstallHooks = () => RunHookOperationAsync(install: false),
             OnDemoTrigger = scenario => _aggregator.SetDemoScenario(scenario),
             OnExportGif = () =>
             {
@@ -1236,6 +1196,64 @@ public class KageDeskRuntime : IDisposable
         return AppDomain.CurrentDomain.BaseDirectory;
     }
 
+    private void RunHookOperationAsync(bool install)
+    {
+        if (_stopping || _disposed) return;
+        if (Interlocked.CompareExchange(ref _hookOpInProgress, 1, 0) != 0)
+        {
+            return;
+        }
+
+        int bridgePort;
+        lock (_configLock)
+        {
+            bridgePort = _config.LocalBridgePort;
+        }
+
+        _hookOpTask = Task.Run(() =>
+        {
+            string title = "KageDesk CLI Hooks";
+            string message;
+            ToolTipIcon icon;
+
+            try
+            {
+                var installer = new HookInstaller(bridgePort: bridgePort);
+                HookOperationSummary summary = install ? installer.InstallAll() : installer.UninstallAll();
+                string details = string.Join(", ", summary.Results.Select(r => $"{r.Target}: {r.Status}"));
+                message = summary.AllSucceeded
+                    ? (install ? $"Hooks configured ({details})." : $"Hooks removed ({details}).")
+                    : $"Hooks need attention ({details}).";
+                icon = summary.AllSucceeded ? ToolTipIcon.Info : ToolTipIcon.Warning;
+            }
+            catch (Exception ex)
+            {
+                title = "KageDesk CLI Hooks Error";
+                message = install ? $"Hook install failed: {ex.Message}" : $"Hook uninstall failed: {ex.Message}";
+                icon = ToolTipIcon.Error;
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _hookOpInProgress, 0);
+            }
+
+            if (!_stopping && !_disposed && _dispatcherForm.IsHandleCreated)
+            {
+                try
+                {
+                    _dispatcherForm.BeginInvoke(new Action(() =>
+                    {
+                        if (!_stopping && !_disposed)
+                        {
+                            _trayController?.ShowBalloon(title, message, icon, 4500);
+                        }
+                    }));
+                }
+                catch { }
+            }
+        });
+    }
+
     private void ExitApplication()
     {
         Dispose();
@@ -1290,6 +1308,17 @@ public class KageDeskRuntime : IDisposable
             try
             {
                 _gifExportTask.Wait(TimeSpan.FromSeconds(5));
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        if (_hookOpTask != null)
+        {
+            try
+            {
+                _hookOpTask.Wait(TimeSpan.FromSeconds(3));
             }
             catch (Exception)
             {

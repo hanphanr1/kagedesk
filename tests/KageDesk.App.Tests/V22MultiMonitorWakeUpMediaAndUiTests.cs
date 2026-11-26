@@ -659,7 +659,10 @@ public class V22MultiMonitorWakeUpMediaAndUiTests
             Assert.Equal(0, Volatile.Read(ref wakeCount));
         }
 
-        // 2. Stalled server (accepts pipe connection and never replies) MUST NOT hang TrySignalRunningInstance past retry budget!
+        // 2. Stalled server (accepts pipe connection and never replies) MUST honor ONE single 350ms absolute deadline end-to-end!
+        // Warm up the async client path once so cold JIT does not skew the tight deadline check.
+        _ = SingleInstanceWakeUp.TrySignalRunningInstance($"KageDesk_TestWarm_{Guid.NewGuid():N}", maxRetryWindow: TimeSpan.FromMilliseconds(1));
+
         string stalledPipe = $"KageDesk_TestStall_{Guid.NewGuid():N}";
         using (var stalledServer = NamedPipeServerStreamAcl.Create(
             stalledPipe,
@@ -682,7 +685,8 @@ public class V22MultiMonitorWakeUpMediaAndUiTests
             try { await acceptTask; } catch { }
 
             Assert.False(signaled);
-            Assert.True(sw.ElapsedMilliseconds < 2000, $"Expected stalled pipe signal to abort promptly within retry budget, took {sw.ElapsedMilliseconds}ms.");
+            Assert.True(sw.ElapsedMilliseconds >= 250 && sw.ElapsedMilliseconds <= 700,
+                $"Expected single 350ms absolute deadline to abort stalled pipe promptly (~350-700ms), took {sw.ElapsedMilliseconds}ms.");
         }
 
         // 3. Immediate Start() + Dispose() rapid cycle MUST NOT leak pipe handles and allows immediate reuse

@@ -43,6 +43,16 @@ public sealed class SessionLogActivityCollector : IDisposable
     private const int MaxReconcileFilesPerRoot = 32;
     private const int HeaderFingerprintBytes = 64;
 
+    private readonly record struct VerifiedProcessIdentity(int ProcessId, long ProcessStartTicks)
+    {
+        public bool IsValid => ProcessId > 0 && ProcessStartTicks > 0;
+    }
+
+    private readonly record struct ObservedProcessIdentity(
+        VerifiedProcessIdentity Identity,
+        DateTimeOffset ObservedAt
+    );
+
     private sealed class TrackedFileState
     {
         public string SessionId = string.Empty;
@@ -55,8 +65,9 @@ public sealed class SessionLogActivityCollector : IDisposable
         public int HeaderFingerprintLength;
         public DateTime LastSeenUtc;
         public string Provider = string.Empty;
-        public int? VerifiedProcessId;
-        public long? VerifiedProcessStartTicks;
+        public ObservedProcessIdentity? VerifiedIdentity;
+        public bool IdentityAmbiguous;
+        public bool LatestActivityHasOwnIdentity;
         public DerivedSessionActivity? LatestActivity;
     }
 
@@ -281,7 +292,7 @@ public sealed class SessionLogActivityCollector : IDisposable
             : FormatProviderDisplay(provider);
 
         ParsedDeltaBatch parsedBatch = ReadAndParseFileDeltaInPlace(filePath, provider, resolvedDisplay, now);
-        if (parsedBatch.Activity == null && !parsedBatch.HasVerifiedIdentity)
+        if (parsedBatch.Activity == null && !parsedBatch.HasIdentityObservation)
             return null;
 
         DerivedSessionActivity? derived = parsedBatch.Activity;
@@ -437,19 +448,19 @@ public sealed class SessionLogActivityCollector : IDisposable
 
     private readonly record struct ParsedLineResult(
         DerivedSessionActivity? Activity,
-        int? VerifiedProcessId,
-        long? VerifiedProcessStartTicks
+        VerifiedProcessIdentity? VerifiedIdentity,
+        DateTimeOffset? EventTimestamp
     );
 
     private readonly record struct ParsedDeltaBatch(
         DerivedSessionActivity? Activity,
-        int? VerifiedProcessId,
-        long? VerifiedProcessStartTicks
+        bool ActivityHasOwnIdentity,
+        ObservedProcessIdentity? UnambiguousIdentity,
+        bool HasConflictingIdentities
     )
     {
-        public bool HasVerifiedIdentity =>
-            VerifiedProcessId.HasValue && VerifiedProcessId.Value > 0 &&
-            VerifiedProcessStartTicks.HasValue && VerifiedProcessStartTicks.Value > 0;
+        public bool HasIdentityObservation =>
+            HasConflictingIdentities || (UnambiguousIdentity is { Identity.IsValid: true });
     }
 
     private static DerivedSessionActivity? ApplyTrackedSessionMetadataLocked(
@@ -464,52 +475,94 @@ public sealed class SessionLogActivityCollector : IDisposable
             st.SessionId = ComputeSessionId(provider, filePath);
         }
 
-        // Accumulate verified (pid, process_start_ticks) independently from activity selection!
-        if (batch.HasVerifiedIdentity)
+        // Accumulate verified (pid, process_start_ticks) tuples with their event timestamps,
+        // marking the file's session-level identity ambiguous if competing tuples are observed.
+        if (batch.HasConflictingIdentities)
         {
-            st.VerifiedProcessId = batch.VerifiedProcessId;
-            st.VerifiedProcessStartTicks = batch.VerifiedProcessStartTicks;
+            st.IdentityAmbiguous = true;
+            st.VerifiedIdentity = null;
         }
-        else if (batch.Activity != null &&
-                 batch.Activity.CorrelatedProcessId.HasValue && batch.Activity.CorrelatedProcessId.Value > 0 &&
-                 batch.Activity.CorrelatedProcessStartTicks.HasValue && batch.Activity.CorrelatedProcessStartTicks.Value > 0)
+        else if (batch.UnambiguousIdentity is { Identity.IsValid: true } batchId)
         {
-            st.VerifiedProcessId = batch.Activity.CorrelatedProcessId;
-            st.VerifiedProcessStartTicks = batch.Activity.CorrelatedProcessStartTicks;
+            if (!st.IdentityAmbiguous)
+            {
+                if (st.VerifiedIdentity == null)
+                {
+                    st.VerifiedIdentity = batchId;
+                }
+                else if (st.VerifiedIdentity.Value.Identity == batchId.Identity)
+                {
+                    if (batchId.ObservedAt > st.VerifiedIdentity.Value.ObservedAt)
+                    {
+                        st.VerifiedIdentity = batchId;
+                    }
+                }
+                else
+                {
+                    // Multiple conflicting (pid, process_start_ticks) tuples observed across deltas for this file.
+                    st.IdentityAmbiguous = true;
+                    st.VerifiedIdentity = null;
+                }
+            }
         }
 
         DerivedSessionActivity? candidate = batch.Activity;
         if (candidate != null)
         {
-            if ((!candidate.CorrelatedProcessId.HasValue || !candidate.CorrelatedProcessStartTicks.HasValue) &&
-                st.VerifiedProcessId.HasValue && st.VerifiedProcessId.Value > 0 &&
-                st.VerifiedProcessStartTicks.HasValue && st.VerifiedProcessStartTicks.Value > 0)
+            // Precedence:
+            // 1. If the selected freshest activity carries its own verified (pid, process_start_ticks), ALWAYS keep it!
+            // 2. Otherwise, attach the file's single unambiguous verified tuple, or decline correlation if ambiguous.
+            if (!batch.ActivityHasOwnIdentity)
             {
-                candidate = candidate with
+                if (!st.IdentityAmbiguous && st.VerifiedIdentity is { Identity.IsValid: true } unambiguous)
                 {
-                    CorrelatedProcessId = st.VerifiedProcessId,
-                    CorrelatedProcessStartTicks = st.VerifiedProcessStartTicks
-                };
+                    candidate = candidate with
+                    {
+                        CorrelatedProcessId = unambiguous.Identity.ProcessId,
+                        CorrelatedProcessStartTicks = unambiguous.Identity.ProcessStartTicks
+                    };
+                }
+                else if (candidate.CorrelatedProcessId.HasValue || candidate.CorrelatedProcessStartTicks.HasValue)
+                {
+                    candidate = candidate with
+                    {
+                        CorrelatedProcessId = null,
+                        CorrelatedProcessStartTicks = null
+                    };
+                }
             }
 
             // Never let a strictly older event timestamp overwrite a fresher tracked activity.
             if (st.LatestActivity == null || candidate.ObservedAt >= st.LatestActivity.ObservedAt)
             {
                 st.LatestActivity = candidate;
+                st.LatestActivityHasOwnIdentity = batch.ActivityHasOwnIdentity;
             }
         }
 
-        // If an identity-only batch arrived for an already-tracked activity, enrich the stored activity too.
-        if (st.LatestActivity != null &&
-            (!st.LatestActivity.CorrelatedProcessId.HasValue || !st.LatestActivity.CorrelatedProcessStartTicks.HasValue) &&
-            st.VerifiedProcessId.HasValue && st.VerifiedProcessId.Value > 0 &&
-            st.VerifiedProcessStartTicks.HasValue && st.VerifiedProcessStartTicks.Value > 0)
+        // Reconcile stored activity when identity-only records arrive for an activity that lacked its own tuple.
+        if (st.LatestActivity != null && !st.LatestActivityHasOwnIdentity)
         {
-            st.LatestActivity = st.LatestActivity with
+            if (st.IdentityAmbiguous)
             {
-                CorrelatedProcessId = st.VerifiedProcessId,
-                CorrelatedProcessStartTicks = st.VerifiedProcessStartTicks
-            };
+                if (st.LatestActivity.CorrelatedProcessId.HasValue || st.LatestActivity.CorrelatedProcessStartTicks.HasValue)
+                {
+                    st.LatestActivity = st.LatestActivity with
+                    {
+                        CorrelatedProcessId = null,
+                        CorrelatedProcessStartTicks = null
+                    };
+                }
+            }
+            else if (st.VerifiedIdentity is { Identity.IsValid: true } unambiguous &&
+                     (!st.LatestActivity.CorrelatedProcessId.HasValue || !st.LatestActivity.CorrelatedProcessStartTicks.HasValue))
+            {
+                st.LatestActivity = st.LatestActivity with
+                {
+                    CorrelatedProcessId = unambiguous.Identity.ProcessId,
+                    CorrelatedProcessStartTicks = unambiguous.Identity.ProcessStartTicks
+                };
+            }
         }
 
         return st.LatestActivity;
@@ -872,9 +925,10 @@ public sealed class SessionLogActivityCollector : IDisposable
             }
             else if (wasRotated)
             {
-                // Clear stale identity and activity on file rotation/replacement
-                st.VerifiedProcessId = null;
-                st.VerifiedProcessStartTicks = null;
+                // Clear stale identity, ambiguity state, and activity on file rotation/replacement
+                st.VerifiedIdentity = null;
+                st.IdentityAmbiguous = false;
+                st.LatestActivityHasOwnIdentity = false;
                 st.LatestActivity = null;
             }
 
@@ -911,8 +965,8 @@ public sealed class SessionLogActivityCollector : IDisposable
     /// <summary>
     /// Parses only non-sensitive derived state and canonical action token from complete UTF-8 JSONL bytes
     /// using Utf8JsonReader directly over ReadOnlySpan&lt;byte&gt; (zero raw-text string materialization).
-    /// Accumulates verified (pid, process_start_ticks) identity independently across the batch and selects
-    /// the freshest applicable activity by event timestamp.
+    /// Tracks verified (pid, process_start_ticks) tuples with event timestamps across the batch,
+    /// preserves the freshest activity's own tuple when present, and declines correlation on competing tuples.
     /// </summary>
     public static DerivedSessionActivity? ParseDerivedActivityFromTail(
         string provider,
@@ -933,8 +987,8 @@ public sealed class SessionLogActivityCollector : IDisposable
             return default;
 
         DerivedSessionActivity? freshest = null;
-        int? batchVerifiedPid = null;
-        long? batchVerifiedStartTicks = null;
+        ObservedProcessIdentity? unambiguousBatchIdentity = null;
+        bool hasConflictingIdentities = false;
         int pos = 0;
 
         while (pos < tailBytes.Length)
@@ -958,13 +1012,30 @@ public sealed class SessionLogActivityCollector : IDisposable
 
             ParsedLineResult parsed = TryParseSingleJsonLineUtf8(provider, displayName, line, observedAt);
 
-            // Accumulate verified (pid, process_start_ticks) independently from activity selection
-            // so record 1 carrying identity + record 2 carrying activity still correlates cleanly!
-            if (parsed.VerifiedProcessId.HasValue && parsed.VerifiedProcessId.Value > 0 &&
-                parsed.VerifiedProcessStartTicks.HasValue && parsed.VerifiedProcessStartTicks.Value > 0)
+            // Track observed verified (pid, process_start_ticks) tuples together with event timestamp.
+            // If multiple distinct tuples appear in the same batch, mark batch identity ambiguous.
+            if (parsed.VerifiedIdentity is { IsValid: true } lineId)
             {
-                batchVerifiedPid = parsed.VerifiedProcessId;
-                batchVerifiedStartTicks = parsed.VerifiedProcessStartTicks;
+                DateTimeOffset idTime = parsed.EventTimestamp ?? observedAt;
+                if (!hasConflictingIdentities)
+                {
+                    if (unambiguousBatchIdentity == null)
+                    {
+                        unambiguousBatchIdentity = new ObservedProcessIdentity(lineId, idTime);
+                    }
+                    else if (unambiguousBatchIdentity.Value.Identity == lineId)
+                    {
+                        if (idTime > unambiguousBatchIdentity.Value.ObservedAt)
+                        {
+                            unambiguousBatchIdentity = new ObservedProcessIdentity(lineId, idTime);
+                        }
+                    }
+                    else
+                    {
+                        hasConflictingIdentities = true;
+                        unambiguousBatchIdentity = null;
+                    }
+                }
             }
 
             if (parsed.Activity != null)
@@ -977,18 +1048,29 @@ public sealed class SessionLogActivityCollector : IDisposable
             }
         }
 
-        if (freshest != null &&
-            (!freshest.CorrelatedProcessId.HasValue || !freshest.CorrelatedProcessStartTicks.HasValue) &&
-            batchVerifiedPid.HasValue && batchVerifiedStartTicks.HasValue)
+        // Resolution precedence:
+        // 1. If the selected freshest activity carries its own verified (pid, process_start_ticks), ALWAYS keep it!
+        // 2. Otherwise, attach the single unambiguous verified tuple if present; decline correlation if conflicting.
+        bool freshestHasOwnIdentity = freshest != null &&
+            freshest.CorrelatedProcessId.HasValue && freshest.CorrelatedProcessId.Value > 0 &&
+            freshest.CorrelatedProcessStartTicks.HasValue && freshest.CorrelatedProcessStartTicks.Value > 0;
+
+        if (freshest != null && !freshestHasOwnIdentity &&
+            !hasConflictingIdentities &&
+            unambiguousBatchIdentity is { Identity.IsValid: true } unambiguous)
         {
             freshest = freshest with
             {
-                CorrelatedProcessId = batchVerifiedPid,
-                CorrelatedProcessStartTicks = batchVerifiedStartTicks
+                CorrelatedProcessId = unambiguous.Identity.ProcessId,
+                CorrelatedProcessStartTicks = unambiguous.Identity.ProcessStartTicks
             };
         }
 
-        return new ParsedDeltaBatch(freshest, batchVerifiedPid, batchVerifiedStartTicks);
+        return new ParsedDeltaBatch(
+            freshest,
+            freshestHasOwnIdentity,
+            unambiguousBatchIdentity,
+            hasConflictingIdentities);
     }
 
     private static ReadOnlySpan<byte> TrimAsciiWhitespace(ReadOnlySpan<byte> span)
@@ -1163,8 +1245,11 @@ public sealed class SessionLogActivityCollector : IDisposable
             }
 
             // NEVER emit a bare JSON pid without verified start generation ticks!
-            int? verifiedPid = (parsedPid.HasValue && parsedStartTicks.HasValue) ? parsedPid : null;
-            long? verifiedStartTicks = (parsedPid.HasValue && parsedStartTicks.HasValue) ? parsedStartTicks : null;
+            VerifiedProcessIdentity? verifiedIdentity = (parsedPid.HasValue && parsedStartTicks.HasValue)
+                ? new VerifiedProcessIdentity(parsedPid.Value, parsedStartTicks.Value)
+                : null;
+            int? verifiedPid = verifiedIdentity?.ProcessId;
+            long? verifiedStartTicks = verifiedIdentity?.ProcessStartTicks;
             DateTimeOffset eventTime = parsedTimestamp ?? observedAt;
 
             DerivedSessionActivity? activity = null;
@@ -1189,7 +1274,7 @@ public sealed class SessionLogActivityCollector : IDisposable
                 activity = new DerivedSessionActivity(provider, displayName, AgentState.Working, "think", eventTime, IsExplicitIdle: false, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
             }
 
-            return new ParsedLineResult(activity, verifiedPid, verifiedStartTicks);
+            return new ParsedLineResult(activity, verifiedIdentity, verifiedIdentity.HasValue ? eventTime : null);
         }
         catch (JsonException)
         {
@@ -2049,7 +2134,7 @@ public sealed class SessionLogActivityCollector : IDisposable
                 }
 
                 ParsedDeltaBatch parsedBatch = ReadAndParseFileDeltaInPlace(path, provider, FormatProviderDisplay(provider), now);
-                if (parsedBatch.Activity != null || parsedBatch.HasVerifiedIdentity)
+                if (parsedBatch.Activity != null || parsedBatch.HasIdentityObservation)
                 {
                     lock (_stateLock)
                     {

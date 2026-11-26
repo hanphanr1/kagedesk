@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using KageDesk.Core.Collectors;
 
 namespace KageDesk.Core.Hooks;
 
@@ -32,6 +33,20 @@ public enum OpenCodePluginApiVersion
     V1 = 1,
     V2 = 2
 }
+
+internal enum OpenCodeVersionProbeOutcome
+{
+    DetectedV1,
+    DetectedV2,
+    UnsupportedMajor,
+    ProbeFailedOrUnavailable
+}
+
+internal readonly record struct OpenCodeVersionProbeResult(
+    OpenCodeVersionProbeOutcome Outcome,
+    OpenCodePluginApiVersion? ApiVersion,
+    string? Reason
+);
 
 public sealed record HookTargetResult(
     HookTargetKind Target,
@@ -86,7 +101,7 @@ public sealed class HookInstaller
     private readonly string? _codexHomeDir;
     private readonly int _bridgePort;
     private readonly Func<DateTimeOffset> _clock;
-    private readonly Func<string?> _openCodeVersionProbe;
+    private readonly Func<OpenCodeVersionProbeResult> _openCodeVersionProbe;
 
     /// <summary>
     /// Internal test seam invoked after staging/flushing the temp file and immediately before
@@ -111,7 +126,9 @@ public sealed class HookInstaller
         _codexHomeDir = string.IsNullOrWhiteSpace(codexHomeDir) ? null : codexHomeDir;
         _bridgePort = bridgePort is >= 1 and <= 65535 ? bridgePort : 4319;
         _clock = clock ?? (() => DateTimeOffset.Now);
-        _openCodeVersionProbe = openCodeVersionProbe ?? ProbeInstalledOpenCodeVersion;
+        _openCodeVersionProbe = openCodeVersionProbe != null
+            ? () => InvokeCustomOpenCodeVersionProbe(openCodeVersionProbe)
+            : ProbeInstalledOpenCodeVersion;
     }
 
     public string DefaultEmitterScriptPath => Path.Combine(_appDataDir, "hooks", EmitterMarkerPs1);
@@ -460,86 +477,290 @@ public sealed class HookInstaller
         return int.TryParse(m.Groups["major"].Value, out majorVersion);
     }
 
-    private bool TryResolveOpenCodePluginApiVersion(out OpenCodePluginApiVersion apiVersion, out string? unsupportedReason)
+    internal static OpenCodeVersionProbeResult ClassifyOpenCodeVersionOutput(string? rawVersionOutput)
     {
-        apiVersion = OpenCodePluginApiVersion.V1;
-        unsupportedReason = null;
-
-        string? rawVersion;
-        try
+        if (string.IsNullOrWhiteSpace(rawVersionOutput))
         {
-            rawVersion = _openCodeVersionProbe();
-        }
-        catch
-        {
-            rawVersion = null;
+            return new OpenCodeVersionProbeResult(
+                OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable,
+                null,
+                "OpenCode CLI version could not be determined (empty or unavailable output); refused to guess plugin API version.");
         }
 
-        // If the opencode binary is not on PATH (config-directory-only environment), fall back to V1 entrypoint.
-        if (rawVersion == null)
+        if (!TryParseOpenCodeMajorVersion(rawVersionOutput, out int major))
         {
-            return true;
-        }
-
-        if (!TryParseOpenCodeMajorVersion(rawVersion, out int major))
-        {
-            unsupportedReason = $"Unable to determine supported OpenCode major version from '{rawVersion.Trim()}'; refused to install an unloadable plugin.";
-            return false;
+            return new OpenCodeVersionProbeResult(
+                OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable,
+                null,
+                $"Unable to determine supported OpenCode major version from '{rawVersionOutput.Trim()}'; refused to install an unloadable plugin.");
         }
 
         if (major == 1)
         {
-            apiVersion = OpenCodePluginApiVersion.V1;
-            return true;
+            return new OpenCodeVersionProbeResult(
+                OpenCodeVersionProbeOutcome.DetectedV1,
+                OpenCodePluginApiVersion.V1,
+                null);
         }
 
         if (major == 2)
         {
-            apiVersion = OpenCodePluginApiVersion.V2;
-            return true;
+            return new OpenCodeVersionProbeResult(
+                OpenCodeVersionProbeOutcome.DetectedV2,
+                OpenCodePluginApiVersion.V2,
+                null);
         }
 
-        unsupportedReason = $"OpenCode major version v{major}.x is unsupported (supported: v1.x and v2.x; detected '{rawVersion.Trim()}'); refused to write an unloadable plugin.";
-        return false;
+        return new OpenCodeVersionProbeResult(
+            OpenCodeVersionProbeOutcome.UnsupportedMajor,
+            null,
+            $"OpenCode major version v{major}.x is unsupported (supported: v1.x and v2.x; detected '{rawVersionOutput.Trim()}'); refused to write an unloadable plugin.");
     }
 
-    private static string? ProbeInstalledOpenCodeVersion()
+    private static OpenCodeVersionProbeResult InvokeCustomOpenCodeVersionProbe(Func<string?> customProbe)
     {
+        string? rawVersion;
         try
         {
-            var psi = new ProcessStartInfo
-            {
-                FileName = "opencode",
-                Arguments = "--version",
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            };
+            rawVersion = customProbe();
+        }
+        catch (Exception ex)
+        {
+            return new OpenCodeVersionProbeResult(
+                OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable,
+                null,
+                $"OpenCode version probe failed ({ex.Message}); refused to guess plugin API version.");
+        }
 
-            using var proc = Process.Start(psi);
-            if (proc == null) return null;
+        return ClassifyOpenCodeVersionOutput(rawVersion);
+    }
 
-            string stdout = proc.StandardOutput.ReadToEnd();
-            string stderr = proc.StandardError.ReadToEnd();
-            if (!proc.WaitForExit((int)VersionProbeTimeout.TotalMilliseconds))
+    private bool TryResolveOpenCodePluginApiVersion(out OpenCodePluginApiVersion apiVersion, out string? unsupportedReason)
+    {
+        apiVersion = default;
+        unsupportedReason = null;
+
+        OpenCodeVersionProbeResult probeResult;
+        try
+        {
+            probeResult = _openCodeVersionProbe();
+        }
+        catch (Exception ex)
+        {
+            unsupportedReason = $"OpenCode version probe failed ({ex.Message}); refused to guess plugin API version.";
+            return false;
+        }
+
+        switch (probeResult.Outcome)
+        {
+            case OpenCodeVersionProbeOutcome.DetectedV1:
+                apiVersion = OpenCodePluginApiVersion.V1;
+                return true;
+
+            case OpenCodeVersionProbeOutcome.DetectedV2:
+                apiVersion = OpenCodePluginApiVersion.V2;
+                return true;
+
+            case OpenCodeVersionProbeOutcome.UnsupportedMajor:
+                unsupportedReason = probeResult.Reason
+                    ?? "Unsupported OpenCode major version detected; refused to write an unloadable plugin.";
+                return false;
+
+            case OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable:
+            default:
+                // Fail-closed: NEVER silently fall back to V1 when the installed OpenCode version cannot be verified.
+                unsupportedReason = probeResult.Reason
+                    ?? "OpenCode CLI version could not be verified; refused to guess plugin API version.";
+                return false;
+        }
+    }
+
+    private static OpenCodeVersionProbeResult ProbeInstalledOpenCodeVersion()
+        => ProbeOpenCodeExecutableVersion("opencode", new[] { "--version" }, VersionProbeTimeout);
+
+    internal static OpenCodeVersionProbeResult ProbeOpenCodeExecutableVersion(
+        string executable,
+        IReadOnlyList<string> arguments,
+        TimeSpan timeout)
+    {
+        return ProbeOpenCodeExecutableVersionAsync(executable, arguments, timeout)
+            .GetAwaiter()
+            .GetResult();
+    }
+
+    internal static async Task<OpenCodeVersionProbeResult> ProbeOpenCodeExecutableVersionAsync(
+        string executable,
+        IReadOnlyList<string> arguments,
+        TimeSpan timeout)
+    {
+        if (string.IsNullOrWhiteSpace(executable))
+        {
+            return new OpenCodeVersionProbeResult(
+                OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable,
+                null,
+                "OpenCode executable name is empty; cannot verify v1/v2 plugin API version.");
+        }
+
+        string? resolvedPath;
+        try
+        {
+            if (Path.IsPathFullyQualified(executable))
             {
-                try { proc.Kill(entireProcessTree: true); } catch { }
-                return null;
+                resolvedPath = File.Exists(executable) ? Path.GetFullPath(executable) : null;
             }
+            else
+            {
+                resolvedPath = ExecutableResolver.Resolve(executable);
+            }
+        }
+        catch (Exception ex)
+        {
+            return new OpenCodeVersionProbeResult(
+                OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable,
+                null,
+                $"Unable to resolve OpenCode CLI ('{executable}'): {ex.Message}");
+        }
+
+        if (resolvedPath == null)
+        {
+            return new OpenCodeVersionProbeResult(
+                OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable,
+                null,
+                $"OpenCode CLI ('{executable}') was not found on PATH; cannot verify v1/v2 plugin API version.");
+        }
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = resolvedPath,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8
+        };
+
+        foreach (string arg in arguments)
+        {
+            psi.ArgumentList.Add(arg);
+        }
+
+        TimeSpan effectiveTimeout = timeout > TimeSpan.Zero ? timeout : TimeSpan.FromMilliseconds(1);
+        using var deadlineCts = new CancellationTokenSource(effectiveTimeout);
+        CancellationToken ct = deadlineCts.Token;
+
+        Process? proc = null;
+        Task<string>? stdoutTask = null;
+        Task<string>? stderrTask = null;
+        Task? exitTask = null;
+
+        try
+        {
+            proc = Process.Start(psi);
+            if (proc == null)
+            {
+                return new OpenCodeVersionProbeResult(
+                    OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable,
+                    null,
+                    $"Failed to start OpenCode CLI ('{executable}'); cannot verify v1/v2 plugin API version.");
+            }
+
+            // Drain stdout and stderr concurrently alongside WaitForExitAsync under ONE single deadline.
+            stdoutTask = proc.StandardOutput.ReadToEndAsync(ct);
+            stderrTask = proc.StandardError.ReadToEndAsync(ct);
+            exitTask = proc.WaitForExitAsync(ct);
+
+            await Task.WhenAll(stdoutTask, stderrTask, exitTask).ConfigureAwait(false);
 
             if (proc.ExitCode != 0)
             {
-                return null;
+                return new OpenCodeVersionProbeResult(
+                    OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable,
+                    null,
+                    $"OpenCode CLI version probe exited with code {proc.ExitCode}; cannot verify v1/v2 plugin API version.");
             }
 
+            string stdout = await stdoutTask.ConfigureAwait(false);
+            string stderr = await stderrTask.ConfigureAwait(false);
             string combined = !string.IsNullOrWhiteSpace(stdout) ? stdout.Trim() : stderr.Trim();
-            return string.IsNullOrWhiteSpace(combined) ? null : combined;
+            if (string.IsNullOrWhiteSpace(combined))
+            {
+                return new OpenCodeVersionProbeResult(
+                    OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable,
+                    null,
+                    "OpenCode CLI returned empty version output; cannot verify v1/v2 plugin API version.");
+            }
+
+            return ClassifyOpenCodeVersionOutput(combined);
+        }
+        catch (OperationCanceledException)
+        {
+            if (proc != null)
+            {
+                TryKillProbeChildOnly(proc);
+            }
+            ObserveBackgroundProbeTask(stdoutTask);
+            ObserveBackgroundProbeTask(stderrTask);
+            ObserveBackgroundProbeTask(exitTask);
+
+            return new OpenCodeVersionProbeResult(
+                OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable,
+                null,
+                $"OpenCode CLI version probe timed out after {(int)effectiveTimeout.TotalMilliseconds}ms; refused to guess plugin API version.");
+        }
+        catch (Exception ex)
+        {
+            if (proc != null)
+            {
+                TryKillProbeChildOnly(proc);
+            }
+            ObserveBackgroundProbeTask(stdoutTask);
+            ObserveBackgroundProbeTask(stderrTask);
+            ObserveBackgroundProbeTask(exitTask);
+
+            return new OpenCodeVersionProbeResult(
+                OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable,
+                null,
+                $"OpenCode CLI version probe failed ({ex.Message}); refused to guess plugin API version.");
+        }
+        finally
+        {
+            proc?.Dispose();
+        }
+    }
+
+    private static void TryKillProbeChildOnly(Process proc)
+    {
+        try
+        {
+            if (!proc.HasExited)
+            {
+                proc.Kill(entireProcessTree: false);
+                proc.WaitForExit(250);
+            }
         }
         catch
         {
-            return null;
         }
+    }
+
+    private static void ObserveBackgroundProbeTask(Task? task)
+    {
+        if (task == null) return;
+        if (task.IsCompleted)
+        {
+            if (task.IsFaulted)
+            {
+                _ = task.Exception;
+            }
+            return;
+        }
+
+        _ = task.ContinueWith(
+            static t => _ = t.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     public HookTargetResult UninstallOpenCode()
@@ -2348,17 +2569,12 @@ export const KageDeskPlugin = async () => ({
 
         if (obj.Properties.Count > 0)
         {
-            ReadOnlySpan<byte> beforeFirst = body.Slice(obj.Start + 1, obj.Properties[0].FullStart - (obj.Start + 1));
-            ReadOnlySpan<byte> afterLast = body.Slice(obj.Properties[^1].FullEnd, obj.CloseBraceIndex - obj.Properties[^1].FullEnd);
-            if (beforeFirst.IndexOf((byte)'\n') < 0 && afterLast.IndexOf((byte)'\n') < 0)
-            {
-                // Preserve compact interior whitespace around zero-width-inserted properties (e.g. "{  }").
-                edits.Add(new ByteEdit(obj.Properties[0].FullStart, obj.Properties[^1].FullEnd, Array.Empty<byte>()));
-                return;
-            }
+            // Unproven container (provenance missing or invalidated by external edits):
+            // delete ONLY the owned property span(s) and internal separators, retaining the
+            // container's original leading & trailing interior whitespace/CRLF bytes untouched.
+            edits.Add(new ByteEdit(obj.Properties[0].FullStart, obj.Properties[^1].FullEnd, Array.Empty<byte>()));
+            return;
         }
-
-        edits.Add(new ByteEdit(obj.Start + 1, obj.CloseBraceIndex, Array.Empty<byte>()));
     }
 
     private static void AddRestoreEmptyArrayEdit(
@@ -2375,17 +2591,12 @@ export const KageDeskPlugin = async () => ({
 
         if (arr.Elements.Count > 0)
         {
-            ReadOnlySpan<byte> beforeFirst = body.Slice(arr.Start + 1, arr.Elements[0].Start - (arr.Start + 1));
-            ReadOnlySpan<byte> afterLast = body.Slice(arr.Elements[^1].End, arr.CloseBracketIndex - arr.Elements[^1].End);
-            if (beforeFirst.IndexOf((byte)'\n') < 0 && afterLast.IndexOf((byte)'\n') < 0)
-            {
-                // Preserve compact interior whitespace around zero-width-inserted elements (e.g. "[  ]").
-                edits.Add(new ByteEdit(arr.Elements[0].Start, arr.Elements[^1].End, Array.Empty<byte>()));
-                return;
-            }
+            // Unproven container (provenance missing or invalidated by external edits):
+            // delete ONLY the owned element span(s) and internal separators, retaining the
+            // container's original leading & trailing interior whitespace/CRLF bytes untouched.
+            edits.Add(new ByteEdit(arr.Elements[0].Start, arr.Elements[^1].End, Array.Empty<byte>()));
+            return;
         }
-
-        edits.Add(new ByteEdit(arr.Start + 1, arr.CloseBracketIndex, Array.Empty<byte>()));
     }
 
     private static void AddRemoveObjectPropertiesEdits(
@@ -2404,7 +2615,10 @@ export const KageDeskPlugin = async () => ({
 
         if (kept.Count == 0)
         {
-            edits.Add(new ByteEdit(obj.Start + 1, obj.CloseBraceIndex, Array.Empty<byte>()));
+            if (obj.Properties.Count > 0)
+            {
+                edits.Add(new ByteEdit(obj.Properties[0].FullStart, obj.Properties[^1].FullEnd, Array.Empty<byte>()));
+            }
             return;
         }
 
@@ -2449,7 +2663,10 @@ export const KageDeskPlugin = async () => ({
 
         if (kept.Count == 0)
         {
-            edits.Add(new ByteEdit(arr.Start + 1, arr.CloseBracketIndex, Array.Empty<byte>()));
+            if (arr.Elements.Count > 0)
+            {
+                edits.Add(new ByteEdit(arr.Elements[0].Start, arr.Elements[^1].End, Array.Empty<byte>()));
+            }
             return;
         }
 
