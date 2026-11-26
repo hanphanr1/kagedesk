@@ -25,15 +25,61 @@ public record BotItemInfo(
 
 public static class OrcaSnapshotParser
 {
-    private static readonly HashSet<string> ApprovalVerdicts = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "waiting", "approval", "input", "needs-input", "blocked"
-    };
-
     private static readonly HashSet<string> ApprovalStates = new(StringComparer.OrdinalIgnoreCase)
     {
-        "waiting", "needs-approval", "needs_approval", "needs-you", "needs_you"
+        "waiting",
+        "waiting-for-input",
+        "waiting_for_input",
+        "waiting-input",
+        "waiting_input",
+        "needs-you",
+        "needs_you",
+        "needs-approval",
+        "needs_approval",
+        "needs-input",
+        "needs_input",
+        "needs-permission",
+        "needs_permission",
+        "pending-approval",
+        "pending_approval",
+        "approval",
+        "input",
+        "blocked",
+        "permission"
     };
+
+    private static readonly HashSet<string> WorkingStates = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "working",
+        "starting",
+        "running",
+        "in-progress",
+        "in_progress",
+        "busy",
+        "active",
+        "thinking",
+        "streaming",
+        "queued",
+        "initializing",
+        "launching"
+    };
+
+    private static readonly HashSet<string> FailedStates = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "failed",
+        "error",
+        "errored",
+        "crashed"
+    };
+
+    private static bool IsApprovalToken(string? value)
+        => !string.IsNullOrWhiteSpace(value) && ApprovalStates.Contains(value.Trim());
+
+    private static bool IsWorkingToken(string? value)
+        => !string.IsNullOrWhiteSpace(value) && WorkingStates.Contains(value.Trim());
+
+    private static bool IsFailedToken(string? value)
+        => !string.IsNullOrWhiteSpace(value) && FailedStates.Contains(value.Trim());
 
     public static IReadOnlyList<OrcaBotInfo> ParseBotList(string? json)
     {
@@ -213,29 +259,28 @@ public static class OrcaSnapshotParser
                             taskTitle = actTitle.GetString();
                     }
 
-                    // Always resolve canonical role/sprite across both agent-level and worktree-level fields
-                    // Priority: explicit worker/agent DisplayName/Name first, then BotName/Bot/UnderBot.
-                    string? effectiveDisplayName = !string.IsNullOrWhiteSpace(displayName) ? displayName : agDisplayName;
-                    string? effectiveNameField = !string.IsNullOrWhiteSpace(agName)
-                        ? agName
-                        : (!string.IsNullOrWhiteSpace(agDisplayName) ? agDisplayName : wtName);
-                    string? effectiveBot = !string.IsNullOrWhiteSpace(agBot) ? agBot : bot;
-                    string? effectiveBotName = !string.IsNullOrWhiteSpace(agBotName) ? agBotName : botName;
-                    string? effectiveUnderBot = !string.IsNullOrWhiteSpace(agUnderBot) ? agUnderBot : underBot;
-                    string? effectiveRoleText = !string.IsNullOrWhiteSpace(agRole) ? agRole : wtRole;
+                    // Resolve canonical Orca identity ONCE: agent's own explicit metadata FIRST
+                    // (explicit agent name, displayName prefix, botName/bot, exact role, underBot),
+                    // THEN worktree structured worker prefix / validated owner bot metadata.
                     string? effectiveAgentId = !string.IsNullOrWhiteSpace(agentIdField) ? agentIdField : address;
 
                     var (effectiveRole, effectiveSprite) = InferRoleAndSprite(
-                        bot: effectiveBot,
-                        displayName: effectiveDisplayName,
+                        bot: bot,
+                        displayName: displayName,
                         conversationName: convName,
                         isBotHome: botHome,
                         worktreeId: worktreeId,
-                        name: effectiveNameField,
-                        botName: effectiveBotName,
-                        underBot: effectiveUnderBot,
-                        roleText: effectiveRoleText,
-                        agentId: effectiveAgentId);
+                        name: wtName,
+                        botName: botName,
+                        underBot: underBot,
+                        roleText: wtRole,
+                        agentId: effectiveAgentId,
+                        agentName: agName,
+                        agentDisplayName: agDisplayName,
+                        agentBotName: agBotName,
+                        agentBot: agBot,
+                        agentRoleText: agRole,
+                        agentUnderBot: agUnderBot);
 
                     var agentState = ComputeState(status, sidebarStatus, terminalVerdict, agentStateStr, mainAgentOutcome, updatedAt, now);
 
@@ -260,11 +305,13 @@ public static class OrcaSnapshotParser
                     }
 
                     var id = !string.IsNullOrEmpty(address) ? address : (agentIdField ?? worktreeId ?? bot ?? displayName ?? wtName ?? Guid.NewGuid().ToString());
-                    var name = !string.IsNullOrEmpty(displayName)
-                        ? displayName
-                        : (!string.IsNullOrEmpty(agName)
-                            ? agName
-                            : (!string.IsNullOrEmpty(wtName) ? wtName : (bot ?? botName ?? convName ?? "Orca Worker")));
+                    var name = !string.IsNullOrWhiteSpace(agName)
+                        ? agName.Trim()
+                        : (!string.IsNullOrWhiteSpace(displayName)
+                            ? displayName.Trim()
+                            : (!string.IsNullOrWhiteSpace(wtName)
+                                ? wtName.Trim()
+                                : (agBotName ?? agBot ?? botName ?? bot ?? convName ?? "Orca Worker")));
 
                     list.Add(new AgentSnapshot(
                         Id: id,
@@ -375,11 +422,14 @@ public static class OrcaSnapshotParser
         string? botName = null,
         string? underBot = null,
         string? roleText = null,
-        string? agentId = null)
+        string? agentId = null,
+        string? agentName = null,
+        string? agentDisplayName = null,
+        string? agentBotName = null,
+        string? agentBot = null,
+        string? agentRoleText = null,
+        string? agentUnderBot = null)
     {
-        // Always check canonical Orca bots FIRST (Shikamaru/Kazama, Minato, Kakashi, Tsunade)
-        // across all metadata fields — with explicit DisplayName/Name priority over Bot/UnderBot —
-        // even when dispatched to a non-botHome worktree (e.g. "Minato · KageDesk v2.1").
         if (AgentAppearanceRegistry.TryResolveCanonicalOrcaBot(
             displayName: displayName,
             name: name,
@@ -391,12 +441,19 @@ public static class OrcaSnapshotParser
             roleText: roleText,
             worktreeId: worktreeId,
             out var canonicalRole,
-            out var canonicalSprite))
+            out var canonicalSprite,
+            isBotHome: isBotHome,
+            agentName: agentName,
+            agentDisplayName: agentDisplayName,
+            agentBotName: agentBotName,
+            agentBot: agentBot,
+            agentRoleText: agentRoleText,
+            agentUnderBot: agentUnderBot))
         {
             return (canonicalRole, canonicalSprite);
         }
 
-        // Non-canonical child worker (no canonical Orca bot match in any field)
+        // Non-canonical child worker (no canonical Orca bot match in structured metadata)
         if (!isBotHome || (worktreeId != null && worktreeId.StartsWith("wt:", StringComparison.OrdinalIgnoreCase)))
         {
             return (AgentRole.Clone, "clone");
@@ -414,36 +471,35 @@ public static class OrcaSnapshotParser
         DateTimeOffset? updatedAt,
         DateTimeOffset now)
     {
-        // 1. Needs Approval
-        if (string.Equals(status, "needs-you", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(status, "needs-approval", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(status, "needs_approval", StringComparison.OrdinalIgnoreCase) ||
-            (!string.IsNullOrEmpty(terminalVerdict) && ApprovalVerdicts.Contains(terminalVerdict)) ||
-            (!string.IsNullOrEmpty(agentState) && ApprovalStates.Contains(agentState)))
+        // 1. Needs Approval (waiting-for-input, needs-you, needs-approval, blocked, etc.)
+        if (IsApprovalToken(status) ||
+            IsApprovalToken(sidebarStatus) ||
+            IsApprovalToken(terminalVerdict) ||
+            IsApprovalToken(agentState))
         {
             return AgentState.NeedsApproval;
         }
 
-        // 2. Working
-        if (string.Equals(agentState, "working", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(sidebarStatus, "working", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(status, "working", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(status, "in-progress", StringComparison.OrdinalIgnoreCase))
+        // 2. Working (working, starting, running, in-progress, etc.)
+        if (IsWorkingToken(agentState) ||
+            IsWorkingToken(sidebarStatus) ||
+            IsWorkingToken(status) ||
+            IsWorkingToken(terminalVerdict))
         {
             return AgentState.Working;
         }
 
         // 3. Failed
-        if (string.Equals(mainAgentOutcome, "error", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(mainAgentOutcome, "failed", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(agentState, "failed", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(agentState, "error", StringComparison.OrdinalIgnoreCase))
+        if (IsFailedToken(mainAgentOutcome) ||
+            IsFailedToken(agentState) ||
+            IsFailedToken(status) ||
+            IsFailedToken(sidebarStatus))
         {
             return AgentState.Failed;
         }
 
         // 4. Done (within last 15 seconds)
-        if (string.Equals(agentState, "done", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(agentState?.Trim(), "done", StringComparison.OrdinalIgnoreCase))
         {
             if (updatedAt.HasValue)
             {
@@ -582,9 +638,9 @@ public static class OrcaSnapshotParser
         var merged = new List<AgentSnapshot>(agents.Count);
         foreach (var agent in agents)
         {
-            // Find if any item is needs-you for this agent
+            // Find if any item requires approval/input for this agent
             var item = items.FirstOrDefault(i =>
-                string.Equals(i.Status, "needs-you", StringComparison.OrdinalIgnoreCase) &&
+                IsApprovalToken(i.Status) &&
                 (!string.IsNullOrEmpty(i.OwnerBotId) && (agent.Id.Contains(i.OwnerBotId, StringComparison.OrdinalIgnoreCase) || agent.Name.Contains(i.OwnerBotId, StringComparison.OrdinalIgnoreCase)) ||
                  (!string.IsNullOrEmpty(i.OwnerName) && (agent.Name.Contains(i.OwnerName, StringComparison.OrdinalIgnoreCase) || i.OwnerName.Contains(agent.Name, StringComparison.OrdinalIgnoreCase)))));
 

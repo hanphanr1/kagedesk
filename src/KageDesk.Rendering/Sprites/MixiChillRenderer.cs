@@ -85,7 +85,11 @@ public static class MixiChillRenderer
     /// Returns true ONLY when DemoScenario == "mixi" OR (showMixiWhenAllIdle == true AND zero agents/bots
     /// are non-idle AND no handoff is pending or active).
     /// </summary>
-    public static bool ShouldRenderMixiChillCorner(HqState state, bool showMixiWhenAllIdle, bool hasActiveHandoff = false)
+    public static bool ShouldRenderMixiChillCorner(
+        HqState state,
+        bool showMixiWhenAllIdle,
+        bool hasActiveHandoff = false,
+        long lastHandledHandoffSeq = -1)
     {
         if (string.Equals(state.DemoScenario, "mixi", StringComparison.OrdinalIgnoreCase))
         {
@@ -109,7 +113,8 @@ public static class MixiChillRenderer
         var events = state.PendingVisualEvents;
         for (int i = 0; i < events.Count; i++)
         {
-            if (string.Equals(events[i].Type, "handoff", StringComparison.OrdinalIgnoreCase))
+            if (events[i].SequenceId > lastHandledHandoffSeq &&
+                string.Equals(events[i].Type, "handoff", StringComparison.OrdinalIgnoreCase))
             {
                 return false;
             }

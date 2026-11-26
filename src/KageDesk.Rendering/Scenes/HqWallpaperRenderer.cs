@@ -123,7 +123,11 @@ public sealed class HqWallpaperRenderer
         float dt = _lastTime < 0f ? 0.033f : Math.Clamp(timeSeconds - _lastTime, 0f, 0.2f);
         _lastTime = timeSeconds;
 
-        bool showMixiCorner = MixiChillRenderer.ShouldRenderMixiChillCorner(state, showMixiWhenAllIdle, _motionSystem.IsHandoffActive);
+        bool showMixiCorner = MixiChillRenderer.ShouldRenderMixiChillCorner(
+            state,
+            showMixiWhenAllIdle,
+            _motionSystem.IsHandoffActive,
+            _motionSystem.LastHandledHandoffSeq);
         IsMixiChillActive = showMixiCorner;
 
         int extraCount;

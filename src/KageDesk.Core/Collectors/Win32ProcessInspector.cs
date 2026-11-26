@@ -279,6 +279,66 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
             CloseHandle(snapshot);
         }
 
+        var rawParentByPid = new Dictionary<int, int>(rawEntries.Count);
+        var rawChildrenByPid = new Dictionary<int, List<int>>(rawEntries.Count);
+        var relevantOrOrcaPids = new HashSet<int>();
+        var orcaSeedPids = new Queue<int>();
+
+        foreach (var (pid, parentPid, exeName) in rawEntries)
+        {
+            rawParentByPid[pid] = parentPid;
+            if (!rawChildrenByPid.TryGetValue(parentPid, out var childList))
+            {
+                childList = new List<int>();
+                rawChildrenByPid[parentPid] = childList;
+            }
+            childList.Add(pid);
+
+            if (IsOrcaExecutable(exeName))
+            {
+                relevantOrOrcaPids.Add(pid);
+                orcaSeedPids.Enqueue(pid);
+            }
+            else if (IsRelevantExecutable(exeName))
+            {
+                relevantOrOrcaPids.Add(pid);
+            }
+        }
+
+        // Collect all PIDs that participate in Orca descendant trees or parent chains of relevant executables
+        var ancestryTimePids = new HashSet<int>(relevantOrOrcaPids);
+        while (orcaSeedPids.Count > 0)
+        {
+            int cur = orcaSeedPids.Dequeue();
+            if (rawChildrenByPid.TryGetValue(cur, out var children))
+            {
+                for (int i = 0; i < children.Count; i++)
+                {
+                    if (ancestryTimePids.Add(children[i]))
+                    {
+                        orcaSeedPids.Enqueue(children[i]);
+                    }
+                }
+            }
+        }
+
+        foreach (var pid in relevantOrOrcaPids)
+        {
+            int cur = pid;
+            for (int depth = 0; depth < 16; depth++)
+            {
+                if (!rawParentByPid.TryGetValue(cur, out int pPid) || pPid <= 0)
+                {
+                    break;
+                }
+                if (!ancestryTimePids.Add(pPid))
+                {
+                    break;
+                }
+                cur = pPid;
+            }
+        }
+
         var results = new List<ProcessItem>(rawEntries.Count);
         var activeKeys = new HashSet<(int Pid, long StartTimeTicks)>(rawEntries.Count);
 
@@ -286,7 +346,35 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
         {
             if (!IsRelevantExecutable(exeName))
             {
-                results.Add(new ProcessItem(pid, parentPid, exeName, null, 0, 0, null));
+                long ancestryStartTicks = 0;
+                if (ancestryTimePids.Contains(pid))
+                {
+                    IntPtr hAnc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                    if (hAnc != IntPtr.Zero)
+                    {
+                        try
+                        {
+                            if (GetProcessTimes(hAnc, out var createTime, out _, out _, out _))
+                            {
+                                long ft = ((long)createTime.dwHighDateTime << 32) | (uint)createTime.dwLowDateTime;
+                                try
+                                {
+                                    ancestryStartTicks = DateTime.FromFileTimeUtc(ft).Ticks;
+                                }
+                                catch
+                                {
+                                    ancestryStartTicks = ft;
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            CloseHandle(hAnc);
+                        }
+                    }
+                }
+
+                results.Add(new ProcessItem(pid, parentPid, exeName, null, ancestryStartTicks, 0, null));
                 continue;
             }
 
@@ -685,4 +773,18 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
 
         return false;
     }
+
+    public static bool IsOrcaExecutable(string exeName)
+    {
+        return string.Equals(exeName, "Orca.exe", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(exeName, "orca", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool IsValidParentChildEdge(ProcessItem parent, ProcessItem child)
+    {
+        return parent.StartTimeTicks > 0 &&
+               child.StartTimeTicks > 0 &&
+               parent.StartTimeTicks <= child.StartTimeTicks;
+    }
 }
+

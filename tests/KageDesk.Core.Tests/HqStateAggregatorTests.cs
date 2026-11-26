@@ -1002,7 +1002,7 @@ public class HqStateAggregatorTests
 
         agg.UpdateProcessAgents(new[]
         {
-            new AgentSnapshot("proc:omp:aaaa1111", "OMP", AgentRole.Coder, "mixi", AgentState.Working, ToolName: "thinking", Source: "process", WorkStartedAt: now)
+            new AgentSnapshot("proc:omp:aaaa1111", "OMP", AgentRole.Coder, "dj-synth", AgentState.Working, ToolName: "thinking", Source: "process", WorkStartedAt: now)
         });
         var working = agg.GetState().Agents.Single();
         Assert.Equal(AgentState.Working, working.State);
@@ -1011,7 +1011,7 @@ public class HqStateAggregatorTests
         now = now.AddSeconds(5);
         agg.UpdateProcessAgents(new[]
         {
-            new AgentSnapshot("proc:omp:aaaa1111", "OMP", AgentRole.Coder, "mixi", AgentState.Done, ToolName: "thinking", UpdatedAt: now, Source: "process")
+            new AgentSnapshot("proc:omp:aaaa1111", "OMP", AgentRole.Coder, "dj-synth", AgentState.Done, ToolName: "thinking", UpdatedAt: now, Source: "process")
         });
         var done = agg.GetState().Agents.Single();
         Assert.Equal(AgentState.Done, done.State);
@@ -1031,14 +1031,13 @@ public class HqStateAggregatorTests
     {
         var agg = new HqStateAggregator(appearanceSeed: 123);
 
-        // Even if an upstream Orca worker arrived tagged as Clone/clone with IsBotHome=false,
-        // canonical Orca bot names MUST resolve to their exact canonical Role + fixed SpriteKey.
+        // Canonical Orca identity is resolved once by OrcaSnapshotParser and preserved end-to-end by HqStateAggregator.
         agg.UpdateOrcaSnapshot(new[]
         {
-            new AgentSnapshot("wt:minato-v21", "Minato \u00B7 KageDesk v2.1 (Mixi + Variety)", AgentRole.Clone, "clone", AgentState.Working, IsBotHome: false, Source: "orca", Repo: "kagedesk"),
-            new AgentSnapshot("wt:shikamaru-plan", "Shikamaru \u00B7 Sprint Plan", AgentRole.Clone, "clone", AgentState.Working, IsBotHome: false, Source: "orca", Repo: "kagedesk"),
-            new AgentSnapshot("wt:kakashi-review", "Kakashi \u00B7 PR Review", AgentRole.Clone, "clone", AgentState.Working, IsBotHome: false, Source: "orca", Repo: "kagedesk"),
-            new AgentSnapshot("wt:tsunade-qa", "Tsunade \u00B7 E2E QA", AgentRole.Clone, "clone", AgentState.Working, IsBotHome: false, Source: "orca", Repo: "kagedesk"),
+            new AgentSnapshot("wt:minato-v21", "Minato \u00B7 KageDesk v2.1 (Mixi + Variety)", AgentRole.Coder, "minato", AgentState.Working, IsBotHome: false, Source: "orca", Repo: "kagedesk"),
+            new AgentSnapshot("wt:shikamaru-plan", "Shikamaru \u00B7 Sprint Plan", AgentRole.Leader, "shikamaru", AgentState.Working, IsBotHome: false, Source: "orca", Repo: "kagedesk"),
+            new AgentSnapshot("wt:kakashi-review", "Kakashi \u00B7 PR Review", AgentRole.Reviewer, "kakashi", AgentState.Working, IsBotHome: false, Source: "orca", Repo: "kagedesk"),
+            new AgentSnapshot("wt:tsunade-qa", "Tsunade \u00B7 E2E QA", AgentRole.Tester, "tsunade", AgentState.Working, IsBotHome: false, Source: "orca", Repo: "kagedesk"),
             new AgentSnapshot("wt:generic-worker", "Generic Worker", AgentRole.Clone, "clone", AgentState.Working, IsBotHome: false, Source: "orca", Repo: "kagedesk")
         }, Array.Empty<AccountInfo>());
 
@@ -1076,5 +1075,44 @@ public class HqStateAggregatorTests
         Assert.True(AgentAppearanceRegistry.IsRandomizableSprite(omp.SpriteKey));
         Assert.True(AgentAppearanceRegistry.IsRandomizableSprite(claude.SpriteKey));
         Assert.NotEqual(omp.SpriteKey, claude.SpriteKey);
+    }
+
+    [Fact]
+    public void AgentAppearanceRegistry_AndAggregator_PreserveParserDecisionWithoutReclassifyingFromWorktreeIdOrName()
+    {
+        var slugMinato = new AgentSnapshot(
+            Id: "orca_session_id:slug-1",
+            Name: "minato-migration",
+            Role: AgentRole.Clone,
+            SpriteKey: "clone",
+            State: AgentState.Working,
+            WorktreeId: "wt:minato-migration",
+            Source: "orca");
+
+        var slugReviewer = new AgentSnapshot(
+            Id: "orca_session_id:slug-2",
+            Name: "docs-reviewer",
+            Role: AgentRole.Clone,
+            SpriteKey: "clone",
+            State: AgentState.Working,
+            WorktreeId: "wt:docs-reviewer",
+            Source: "orca");
+
+        Assert.False(AgentAppearanceRegistry.TryResolveCanonicalOrcaBot(slugMinato, out _, out _));
+        Assert.False(AgentAppearanceRegistry.TryResolveCanonicalOrcaBot(slugReviewer, out _, out _));
+
+        var agg = new HqStateAggregator(appearanceSeed: 77);
+        agg.UpdateOrcaSnapshot(new[] { slugMinato, slugReviewer }, Array.Empty<AccountInfo>());
+        var agents = agg.GetState().Agents;
+
+        var resolved1 = Assert.Single(agents, a => a.Id == "orca_session_id:slug-1");
+        Assert.Equal(AgentRole.Clone, resolved1.Role);
+        Assert.NotEqual("minato", resolved1.SpriteKey);
+        Assert.True(AgentAppearanceRegistry.IsRandomizableSprite(resolved1.SpriteKey));
+
+        var resolved2 = Assert.Single(agents, a => a.Id == "orca_session_id:slug-2");
+        Assert.Equal(AgentRole.Clone, resolved2.Role);
+        Assert.NotEqual("kakashi", resolved2.SpriteKey);
+        Assert.True(AgentAppearanceRegistry.IsRandomizableSprite(resolved2.SpriteKey));
     }
 }

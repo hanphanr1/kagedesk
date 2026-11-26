@@ -1,6 +1,7 @@
 using System.Drawing;
 using System.Windows.Forms;
 using KageDesk.App.Native;
+using KageDesk.App.Services;
 using KageDesk.App.UI;
 using KageDesk.Core.Models;
 using KageDesk.Core.Themes;
@@ -14,26 +15,26 @@ public class AgentDetailToastAndOverlayClickTests
     [Fact]
     public void AgentDetailToast_FormatSourceLabel_FormatsProcessAndOrcaSourcesCorrectly()
     {
-        // 1. Process sources
-        var ompAg = new AgentSnapshot("p1", "OMP", AgentRole.Coder, "omp", AgentState.Working, Source: "process", ProcessId: 1010);
+        // 1. Process sources (verified StartTimeTicks > 0 exposes PID)
+        var ompAg = new AgentSnapshot("p1", "OMP", AgentRole.Coder, "omp", AgentState.Working, Source: "process", ProcessId: 1010, ProcessStartTicks: 1000);
         Assert.Equal("OMP Terminal  |  PID: 1010", AgentDetailToast.FormatSourceLabel(ompAg));
 
-        var agyAg = new AgentSnapshot("p2", "AGY", AgentRole.Leader, "agy", AgentState.Working, Source: "process", ProcessId: 2020);
+        var agyAg = new AgentSnapshot("p2", "AGY", AgentRole.Leader, "agy", AgentState.Working, Source: "process", ProcessId: 2020, ProcessStartTicks: 1000);
         Assert.Equal("AGY Terminal  |  PID: 2020", AgentDetailToast.FormatSourceLabel(agyAg));
 
-        var claudeAg = new AgentSnapshot("p3", "Claude", AgentRole.Reviewer, "claude", AgentState.Working, Source: "process", ProcessId: 3030);
+        var claudeAg = new AgentSnapshot("p3", "Claude", AgentRole.Reviewer, "claude", AgentState.Working, Source: "process", ProcessId: 3030, ProcessStartTicks: 1000);
         Assert.Equal("Claude Terminal  |  PID: 3030", AgentDetailToast.FormatSourceLabel(claudeAg));
 
-        var codexAg = new AgentSnapshot("p4", "Codex", AgentRole.Tester, "codex", AgentState.Working, Source: "process", ProcessId: 4040);
+        var codexAg = new AgentSnapshot("p4", "Codex", AgentRole.Tester, "codex", AgentState.Working, Source: "process", ProcessId: 4040, ProcessStartTicks: 1000);
         Assert.Equal("Codex Terminal  |  PID: 4040", AgentDetailToast.FormatSourceLabel(codexAg));
 
-        var opencodeAg = new AgentSnapshot("p5", "OpenCode", AgentRole.Coder, "opencode", AgentState.Working, Source: "process", ProcessId: 5050);
+        var opencodeAg = new AgentSnapshot("p5", "OpenCode", AgentRole.Coder, "opencode", AgentState.Working, Source: "process", ProcessId: 5050, ProcessStartTicks: 1000);
         Assert.Equal("OpenCode Terminal  |  PID: 5050", AgentDetailToast.FormatSourceLabel(opencodeAg));
 
-        var geminiAg = new AgentSnapshot("p6", "Gemini", AgentRole.Reviewer, "gemini", AgentState.Working, Source: "process", ProcessId: 6060);
+        var geminiAg = new AgentSnapshot("p6", "Gemini", AgentRole.Reviewer, "gemini", AgentState.Working, Source: "process", ProcessId: 6060, ProcessStartTicks: 1000);
         Assert.Equal("Gemini Terminal  |  PID: 6060", AgentDetailToast.FormatSourceLabel(geminiAg));
 
-        var genericProc = new AgentSnapshot("p7", "Generic", AgentRole.External, "unknown_sprite", AgentState.Working, Source: "process", ProcessId: 7070);
+        var genericProc = new AgentSnapshot("p7", "Generic", AgentRole.External, "unknown_sprite", AgentState.Working, Source: "process", ProcessId: 7070, ProcessStartTicks: 1000);
         Assert.Equal("Terminal Agent  |  PID: 7070", AgentDetailToast.FormatSourceLabel(genericProc));
 
         // 2. Orca sources
@@ -47,11 +48,11 @@ public class AgentDetailToastAndOverlayClickTests
     [Fact]
     public void AgentDetailToast_RandomizedSpriteKeys_StillResolveCleanTerminalProviderAndNeverUseClone()
     {
-        var mixiOmp = new AgentSnapshot("proc:omp:abcd1234", "OMP", AgentRole.Coder, "mixi", AgentState.Working, Source: "process", ProcessId: 6660, DeskRig: DeskRigKind.RgbStreamerRig);
-        Assert.Equal("OMP", AgentDetailToast.ResolveTerminalProvider(mixiOmp));
-        Assert.Equal("OMP Terminal  |  PID: 6660", AgentDetailToast.FormatSourceLabel(mixiOmp));
+        var djOmp = new AgentSnapshot("proc:omp:abcd1234", "OMP", AgentRole.Coder, "dj-synth", AgentState.Working, Source: "process", ProcessId: 6660, ProcessStartTicks: 1000, DeskRig: DeskRigKind.RgbStreamerRig);
+        Assert.Equal("OMP", AgentDetailToast.ResolveTerminalProvider(djOmp));
+        Assert.Equal("OMP Terminal  |  PID: 6660", AgentDetailToast.FormatSourceLabel(djOmp));
 
-        var nekoClaude = new AgentSnapshot("proc:claude:ef567890", "Claude 2", AgentRole.Coder, "neko-dev", AgentState.Idle, Source: "process", ProcessId: 7770, DeskRig: DeskRigKind.CozyLofiRig);
+        var nekoClaude = new AgentSnapshot("proc:claude:ef567890", "Claude 2", AgentRole.Coder, "neko-dev", AgentState.Idle, Source: "process", ProcessId: 7770, ProcessStartTicks: 1000, DeskRig: DeskRigKind.CozyLofiRig);
         Assert.Equal("Claude", AgentDetailToast.ResolveTerminalProvider(nekoClaude));
         Assert.Equal("Claude Terminal  |  PID: 7770", AgentDetailToast.FormatSourceLabel(nekoClaude));
 
@@ -409,16 +410,16 @@ public class AgentDetailToastAndOverlayClickTests
 
         var cases = new[]
         {
-            // Regression: Minato worker even if mistakenly tagged AgentRole.Clone MUST show Role: Coder
-            (new AgentSnapshot("wt:minato-v21", "Minato \u00B7 KageDesk v2.1 (Mixi + Variety)", AgentRole.Clone, "clone", AgentState.Working, Repo: "kagedesk", Source: "orca", WorkStartedAt: now.AddSeconds(-95)), "Coder"),
+            // Canonical Orca workers resolved by OrcaSnapshotParser preserve their canonical role labels
+            (new AgentSnapshot("wt:minato-v21", "Minato \u00B7 KageDesk v2.1 (Mixi + Variety)", AgentRole.Coder, "minato", AgentState.Working, Repo: "kagedesk", Source: "orca", WorkStartedAt: now.AddSeconds(-95)), "Coder"),
             (new AgentSnapshot("wt:shika", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Working, Repo: "Bots", Source: "orca"), "Leader"),
             (new AgentSnapshot("wt:kakashi", "Kakashi \u00B7 PR Review", AgentRole.Reviewer, "kakashi", AgentState.Working, Repo: "kagedesk", Source: "orca"), "Reviewer"),
             (new AgentSnapshot("wt:tsunade", "Tsunade \u00B7 Final QA", AgentRole.Tester, "tsunade", AgentState.Working, Repo: "kagedesk", Source: "orca"), "Tester"),
             // Non-canonical Orca worker with AgentRole.Clone -> MUST show Worker, NEVER Clone
-            (new AgentSnapshot("wt:generic", "Worker #1", AgentRole.Clone, "mixi", AgentState.Working, Repo: "kagedesk", Source: "orca"), "Worker"),
+            (new AgentSnapshot("wt:generic", "Worker #1", AgentRole.Clone, "dj-synth", AgentState.Working, Repo: "kagedesk", Source: "orca"), "Worker"),
             // Standalone CLI sessions -> MUST show CLI Session, NEVER Clone
-            (new AgentSnapshot("proc:omp:1001", "OMP", AgentRole.Clone, "mixi", AgentState.Idle, ProcessId: 6660, Source: "process"), "CLI Session"),
-            (new AgentSnapshot("proc:claude:1002", "Claude", AgentRole.External, "neko-dev", AgentState.Working, ProcessId: 7770, Source: "process"), "CLI Session"),
+            (new AgentSnapshot("proc:omp:1001", "OMP", AgentRole.Clone, "dj-synth", AgentState.Idle, ProcessId: 6660, ProcessStartTicks: 1000, Source: "process"), "CLI Session"),
+            (new AgentSnapshot("proc:claude:1002", "Claude", AgentRole.External, "neko-dev", AgentState.Working, ProcessId: 7770, ProcessStartTicks: 1000, Source: "process"), "CLI Session"),
             // Generic external hook -> Session
             (new AgentSnapshot("hook:ext:1", "Agent", AgentRole.External, "wizard-dev", AgentState.Working, Source: "bridge"), "Session")
         };
@@ -433,6 +434,169 @@ public class AgentDetailToastAndOverlayClickTests
             Assert.DoesNotContain("Role: Clone", line, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain("Clone", roleLabel, StringComparison.OrdinalIgnoreCase);
         }
+    }
+
+    [Fact]
+    public void AgentDetailToast_FormatRoleLabel_PreservesParserDecisionWithoutReclassifyingFromNameOrWorktreeId()
+    {
+        var minatoSlug = new AgentSnapshot(
+            Id: "orca_session_id:slug-minato",
+            Name: "minato-migration",
+            Role: AgentRole.Clone,
+            SpriteKey: "dj-synth",
+            State: AgentState.Working,
+            WorktreeId: "wt:minato-migration",
+            Repo: "kagedesk",
+            Source: "orca");
+
+        var reviewerSlug = new AgentSnapshot(
+            Id: "orca_session_id:slug-reviewer",
+            Name: "docs-reviewer",
+            Role: AgentRole.Clone,
+            SpriteKey: "neko-dev",
+            State: AgentState.Working,
+            WorktreeId: "wt:docs-reviewer",
+            Repo: "kagedesk",
+            Source: "orca");
+
+        Assert.Equal("Worker", AgentDetailToast.FormatRoleLabel(minatoSlug));
+        Assert.Equal("Worker", AgentDetailToast.FormatRoleLabel(reviewerSlug));
+    }
+
+    [Fact]
+    public void KageDeskRuntime_ComputePollingDelayMs_IdleDoesNotWaitSixSeconds()
+    {
+        var idleAgents = new[]
+        {
+            new AgentSnapshot("proc:omp:1", "OMP", AgentRole.Coder, "dj-synth", AgentState.Idle, Source: "process")
+        };
+
+        int idleDelay = KageDeskRuntime.ComputePollingDelayMs(configuredIntervalMs: 2500, idleAgents);
+        int emptyDelay = KageDeskRuntime.ComputePollingDelayMs(configuredIntervalMs: 2500, Array.Empty<AgentSnapshot>());
+
+        Assert.Equal(2500, idleDelay);
+        Assert.Equal(2500, emptyDelay);
+        Assert.True(idleDelay < 6000);
+    }
+
+    [Fact]
+    public void PetOverlayForm_DismissingOnlyNeedsApprovalOrFailedAlert_HidesAlertCardWhileMixiRemainsBlocked()
+    {
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        // Case 1: Only NeedsApproval agent -> dismiss hides alert card, Mixi MUST remain blocked!
+        using (var form = new PetOverlayForm(theme, initialScale: 1, idleMode: "chill", showMixiWhenAllIdle: true))
+        {
+            _ = form.Handle;
+            var approvalState = new HqState(
+                Agents: new[]
+                {
+                    new AgentSnapshot("ag-approve", "Minato", AgentRole.Coder, "minato", AgentState.NeedsApproval, QuestionPrompt: "Approve migration?", Source: "orca")
+                },
+                Accounts: Array.Empty<AccountInfo>(),
+                Builds: Array.Empty<BuildInfo>(),
+                Weather: EffectiveWeather.Day,
+                Mood: HqMood.Alert,
+                PendingVisualEvents: Array.Empty<HqEvent>(),
+                Timestamp: now);
+
+            form.ApplyRenderState(approvalState, theme, petPaused: false, petHiddenByDndOrLock: false);
+            Assert.Contains(form.CurrentHitRegions, r => r.ActionId == "dismiss");
+            Assert.False(form.IsMixiChillActive);
+
+            form.DismissActiveApprovalOrFail();
+            Assert.DoesNotContain(form.CurrentHitRegions, r => r.ActionId == "dismiss");
+            Assert.False(form.IsMixiChillActive);
+        }
+
+        // Case 2: Only Failed agent -> dismiss hides alert card, Mixi MUST remain blocked!
+        using (var form = new PetOverlayForm(theme, initialScale: 1, idleMode: "chill", showMixiWhenAllIdle: true))
+        {
+            _ = form.Handle;
+            var failedState = new HqState(
+                Agents: new[]
+                {
+                    new AgentSnapshot("ag-fail", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Failed, TaskTitle: "Tests failed", Source: "orca")
+                },
+                Accounts: Array.Empty<AccountInfo>(),
+                Builds: Array.Empty<BuildInfo>(),
+                Weather: EffectiveWeather.Day,
+                Mood: HqMood.Alert,
+                PendingVisualEvents: Array.Empty<HqEvent>(),
+                Timestamp: now);
+
+            form.ApplyRenderState(failedState, theme, petPaused: false, petHiddenByDndOrLock: false);
+            Assert.Contains(form.CurrentHitRegions, r => r.ActionId == "dismiss");
+            Assert.False(form.IsMixiChillActive);
+
+            form.DismissActiveApprovalOrFail();
+            Assert.DoesNotContain(form.CurrentHitRegions, r => r.ActionId == "dismiss");
+            Assert.False(form.IsMixiChillActive);
+        }
+    }
+
+    [Fact]
+    public void UnverifiedProcessStartTimeZero_BlocksFocusWindowActionAndPidDisplay()
+    {
+        var unverifiedZero = new AgentSnapshot(
+            Id: "proc:omp:unverified",
+            Name: "OMP",
+            Role: AgentRole.Coder,
+            SpriteKey: "dj-synth",
+            State: AgentState.Working,
+            ProcessId: 4242,
+            ProcessStartTicks: 0,
+            Source: "process");
+
+        var unverifiedNull = unverifiedZero with { ProcessStartTicks = null };
+        var verified = unverifiedZero with { ProcessStartTicks = 123456789L };
+
+        Assert.False(AgentDetailToast.CanOfferFocusWindowAction(unverifiedZero));
+        Assert.False(AgentDetailToast.CanOfferFocusWindowAction(unverifiedNull));
+        Assert.True(AgentDetailToast.CanOfferFocusWindowAction(verified));
+
+        Assert.Equal("OMP Terminal", AgentDetailToast.FormatSourceLabel(unverifiedZero));
+        Assert.Equal("OMP Terminal", AgentDetailToast.FormatSourceLabel(unverifiedNull));
+        Assert.Equal("OMP Terminal  |  PID: 4242", AgentDetailToast.FormatSourceLabel(verified));
+
+        // WindowFocuser MUST reject expectedStartTicks <= 0 even if targetStartTicks matches 0
+        bool focused = WindowFocuser.TryFocusProcessWindowCore(
+            pid: 4242,
+            expectedStartTicks: 0,
+            getStartTime: _ => 0,
+            findWindow: _ => new IntPtr(1),
+            focusWindow: _ => true);
+        Assert.False(focused);
+    }
+
+    [Fact]
+    public void PetOverlayForm_AutoHide_ConsumedHandoffWithinExpiryDoesNotKeepFormVisible()
+    {
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        using var form = new PetOverlayForm(theme, initialScale: 1, idleMode: "auto-hide", showMixiWhenAllIdle: false);
+        _ = form.Handle;
+
+        // Unresolvable handoff event (both endpoints missing): first Render marks it handled so it cannot stall auto-hide
+        var consumedState = new HqState(
+            Agents: new[]
+            {
+                new AgentSnapshot("idle-1", "Minato", AgentRole.Coder, "minato", AgentState.Idle, Source: "orca")
+            },
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Calm,
+            PendingVisualEvents: new[] { new HqEvent(99, "handoff", "Old handoff", now, "ghost-from", 60.0, "ghost-to") },
+            Timestamp: now);
+
+        form.ApplyRenderState(consumedState, theme, petPaused: false, petHiddenByDndOrLock: false);
+        form.RenderAndPresent();
+
+        Assert.False(form.IsHandoffActive);
+        Assert.False(form.ShouldStayVisibleInAutoHide());
     }
 }
 

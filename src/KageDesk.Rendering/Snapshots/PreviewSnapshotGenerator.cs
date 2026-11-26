@@ -43,6 +43,23 @@ public static class PreviewSnapshotGenerator
         using var petScaled = new PixelBuffer(TaskbarPetRenderer.CanvasWidth * 2, TaskbarPetRenderer.CanvasHeight * 2);
         var petRenderer = new TaskbarPetRenderer();
 
+        var previewStates = BuildPreviewStates(fixedNow);
+
+        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, previewStates["shinobi-hq-working.png"], shinobi, outputDir, "shinobi-hq-working.png", warmupTicks: 10));
+        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, previewStates["shinobi-hq-approve.png"], shinobi, outputDir, "shinobi-hq-approve.png", warmupTicks: 8));
+        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, previewStates["shinobi-hq-done.png"], shinobi, outputDir, "shinobi-hq-done.png", warmupTicks: 12));
+        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, previewStates["shinobi-hq-fail.png"], shinobi, outputDir, "shinobi-hq-fail.png", warmupTicks: 10));
+        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, previewStates["shinobi-hq-clone.png"], shinobi, outputDir, "shinobi-hq-clone.png", warmupTicks: 6));
+        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, previewStates["cyber-bunker-working.png"], cyber, outputDir, "cyber-bunker-working.png", warmupTicks: 10));
+        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, previewStates["cozy-lofi-idle.png"], lofi, outputDir, "cozy-lofi-idle.png", warmupTicks: 8));
+        written.Add(RenderPetSnapshot(petRenderer, petCanvas, petScaled, previewStates["pet-overlay-approve.png"], shinobi, outputDir, "pet-overlay-approve.png", warmupTicks: 6));
+        written.Add(RenderPetSnapshot(petRenderer, petCanvas, petScaled, previewStates["pet-overlay-working.png"], cyber, outputDir, "pet-overlay-working.png", warmupTicks: 8));
+
+        return written;
+    }
+
+    internal static IReadOnlyDictionary<string, HqState> BuildPreviewStates(DateTimeOffset fixedNow)
+    {
         var sampleAccounts = new List<AccountInfo>
         {
             new("claude", "hanphanr1", "hanphanr1@pro", true, QuotaPercent: 78),
@@ -60,7 +77,6 @@ public static class PreviewSnapshotGenerator
             new("ci-fail", "kagedesk", "CI", "main", "Build #109", "completed", "failure", UpdatedAt: fixedNow)
         };
 
-        // 1. shinobi-hq-working.png
         var workingState = new HqState(
             Agents: new List<AgentSnapshot>
             {
@@ -75,14 +91,12 @@ public static class PreviewSnapshotGenerator
             Mood: HqMood.Busy,
             PendingVisualEvents: Array.Empty<HqEvent>(),
             Timestamp: fixedNow);
-        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, workingState, shinobi, outputDir, "shinobi-hq-working.png", warmupTicks: 10));
 
-        // 2. shinobi-hq-approve.png
         var approveState = new HqState(
             Agents: new List<AgentSnapshot>
             {
                 new("a-shika", "Shikamaru (Leader)", AgentRole.Leader, "shikamaru", AgentState.NeedsApproval,
-                    QuestionPrompt: "Approve deploying KageDesk v1.2 to production release?", TaskTitle: "Release Gate", Repo: "kagedesk"),
+                    QuestionPrompt: "Approve deploying KageDesk v2.1 to production release?", TaskTitle: "Release Gate", Repo: "kagedesk"),
                 new("a-minato", "Minato (Coder)", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", Repo: "kagedesk"),
                 new("a-tsunade", "Tsunade (Tester)", AgentRole.Tester, "tsunade", AgentState.Idle, Repo: "kagedesk"),
                 new("a-kakashi", "Kakashi (Reviewer)", AgentRole.Reviewer, "kakashi", AgentState.Idle, Repo: "kagedesk")
@@ -96,15 +110,13 @@ public static class PreviewSnapshotGenerator
             Mood: HqMood.Alert,
             PendingVisualEvents: Array.Empty<HqEvent>(),
             Timestamp: fixedNow);
-        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, approveState, shinobi, outputDir, "shinobi-hq-approve.png", warmupTicks: 8));
 
-        // 3. shinobi-hq-done.png
         var doneState = new HqState(
             Agents: new List<AgentSnapshot>
             {
                 new("a-shika", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Done, TaskTitle: "Milestone 2 Complete!", Repo: "kagedesk"),
                 new("a-minato", "Minato", AgentRole.Coder, "minato", AgentState.Done, TaskTitle: "Pixel Engine Green", Repo: "kagedesk"),
-                new("a-tsunade", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Done, TaskTitle: "All 75 Tests Passed", Repo: "kagedesk"),
+                new("a-tsunade", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Done, TaskTitle: "All Tests Passed", Repo: "kagedesk"),
                 new("a-kakashi", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Done, TaskTitle: "LGTM Approved", Repo: "kagedesk")
             },
             Accounts: sampleAccounts,
@@ -113,9 +125,7 @@ public static class PreviewSnapshotGenerator
             Mood: HqMood.Celebrating,
             PendingVisualEvents: Array.Empty<HqEvent>(),
             Timestamp: fixedNow);
-        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, doneState, shinobi, outputDir, "shinobi-hq-done.png", warmupTicks: 12));
 
-        // 4. shinobi-hq-fail.png
         var failState = new HqState(
             Agents: new List<AgentSnapshot>
             {
@@ -133,9 +143,7 @@ public static class PreviewSnapshotGenerator
             Mood: HqMood.Failing,
             PendingVisualEvents: Array.Empty<HqEvent>(),
             Timestamp: fixedNow);
-        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, failState, shinobi, outputDir, "shinobi-hq-fail.png", warmupTicks: 10));
 
-        // 5. shinobi-hq-clone.png (multi-terminal variety showcase)
         var cloneState = new HqState(
             Agents: new List<AgentSnapshot>
             {
@@ -143,7 +151,7 @@ public static class PreviewSnapshotGenerator
                 new("a-minato", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", Repo: "kagedesk", Source: "orca", IsBotHome: true),
                 new("a-tsunade", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test", Repo: "kagedesk", Source: "orca", IsBotHome: true),
                 new("a-kakashi", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Working, ToolName: "review", Repo: "kagedesk", Source: "orca", IsBotHome: true),
-                new("proc:omp:1001", "OMP", AgentRole.External, "mixi", AgentState.Working, ToolName: "edit", Source: "process", DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0),
+                new("proc:omp:1001", "OMP", AgentRole.External, "dj-synth", AgentState.Working, ToolName: "edit", Source: "process", DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0),
                 new("proc:claude:1002", "Claude", AgentRole.External, "neko-dev", AgentState.Working, ToolName: "test", Source: "process", DeskRig: DeskRigKind.CozyLofiRig, BehaviorVariant: 1),
                 new("proc:codex:1003", "Codex", AgentRole.External, "cyber-hacker", AgentState.Working, ToolName: "exec", Source: "process", DeskRig: DeskRigKind.CyberConsoleRig, BehaviorVariant: 2)
             },
@@ -156,13 +164,9 @@ public static class PreviewSnapshotGenerator
                 new(1, "CloneSpawned", "Multi-terminal agents active", fixedNow, "proc:omp:1001")
             },
             Timestamp: fixedNow);
-        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, cloneState, shinobi, outputDir, "shinobi-hq-clone.png", warmupTicks: 6));
 
-        // 6. cyber-bunker-working.png
         var cyberWorkingState = workingState with { Weather = EffectiveWeather.MidnightRain };
-        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, cyberWorkingState, cyber, outputDir, "cyber-bunker-working.png", warmupTicks: 10));
 
-        // 7. cozy-lofi-idle.png
         var lofiIdleState = new HqState(
             Agents: Array.Empty<AgentSnapshot>(),
             Accounts: new List<AccountInfo>
@@ -174,15 +178,19 @@ public static class PreviewSnapshotGenerator
             Mood: HqMood.Calm,
             PendingVisualEvents: Array.Empty<HqEvent>(),
             Timestamp: fixedNow);
-        written.Add(RenderWallpaperSnapshot(hqRenderer, hqCanvas, hqScaled, lofiIdleState, lofi, outputDir, "cozy-lofi-idle.png", warmupTicks: 8));
 
-        // 8. pet-overlay-approve.png
-        written.Add(RenderPetSnapshot(petRenderer, petCanvas, petScaled, approveState, shinobi, outputDir, "pet-overlay-approve.png", warmupTicks: 6));
-
-        // 9. pet-overlay-working.png
-        written.Add(RenderPetSnapshot(petRenderer, petCanvas, petScaled, workingState, cyber, outputDir, "pet-overlay-working.png", warmupTicks: 8));
-
-        return written;
+        return new Dictionary<string, HqState>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["shinobi-hq-working.png"] = workingState,
+            ["shinobi-hq-approve.png"] = approveState,
+            ["shinobi-hq-done.png"] = doneState,
+            ["shinobi-hq-fail.png"] = failState,
+            ["shinobi-hq-clone.png"] = cloneState,
+            ["cyber-bunker-working.png"] = cyberWorkingState,
+            ["cozy-lofi-idle.png"] = lofiIdleState,
+            ["pet-overlay-approve.png"] = approveState,
+            ["pet-overlay-working.png"] = workingState
+        };
     }
 
     private static string RenderWallpaperSnapshot(

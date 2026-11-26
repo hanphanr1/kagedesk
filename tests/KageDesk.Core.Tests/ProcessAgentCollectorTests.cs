@@ -662,4 +662,219 @@ public class ProcessAgentCollectorTests
         Assert.Equal("Claude", finalState.Agents[0].Name);
         Assert.Equal("process", finalState.Agents[0].Source);
     }
+
+    [Fact]
+    public void DetectProcesses_LowCpuWithHeavyStreamingIo_ClassifiesAsWorking_WhileTinyTuiRedrawStaysIdle()
+    {
+        var now = new DateTimeOffset(2026, 11, 26, 10, 0, 0, TimeSpan.Zero);
+        var mock = new MockProcessInspector
+        {
+            Processes = new List<ProcessItem>
+            {
+                // Baseline sample (valid I/O counters)
+                new(100, 10, "claude.exe", "claude.exe", StartTimeTicks: 1000, TotalCpuTimeMs: 100, ReadTransferBytes: 10_000, OtherTransferBytes: 20_000, HasIoCounters: true),
+                new(200, 10, "omp.exe", "omp.exe", StartTimeTicks: 2000, TotalCpuTimeMs: 100, ReadTransferBytes: 10_000, OtherTransferBytes: 20_000, HasIoCounters: true)
+            }
+        };
+
+        var aggregator = new HqStateAggregator();
+        var collector = new ProcessAgentCollector(aggregator, enabled: true, inspector: mock, timeProvider: () => now);
+
+        // Poll 1: baseline -> Idle
+        var poll1 = collector.DetectProcesses();
+        Assert.Equal(2, poll1.Count);
+        Assert.All(poll1, a => Assert.Equal(AgentState.Idle, a.State));
+
+        // Poll 2 (2 seconds later):
+        // - PID 100: low CPU delta (10ms < 15ms floor) + heavy streaming I/O (8 KB read + 12 KB other) -> MUST be Working
+        // - PID 200: tiny idle TUI redraw / cursor blink jitter (8ms CPU, 0 read bytes, 200 other bytes) -> MUST stay Idle
+        now = now.AddSeconds(2);
+        mock.Processes = new List<ProcessItem>
+        {
+            new(100, 10, "claude.exe", "claude.exe", StartTimeTicks: 1000, TotalCpuTimeMs: 110, ReadTransferBytes: 18_192, OtherTransferBytes: 32_288, HasIoCounters: true),
+            new(200, 10, "omp.exe", "omp.exe", StartTimeTicks: 2000, TotalCpuTimeMs: 108, ReadTransferBytes: 10_000, OtherTransferBytes: 20_200, HasIoCounters: true)
+        };
+
+        var poll2 = collector.DetectProcesses();
+        var claude = Assert.Single(poll2, a => a.ProcessId == 100);
+        var omp = Assert.Single(poll2, a => a.ProcessId == 200);
+
+        Assert.Equal(AgentState.Working, claude.State);
+        Assert.Equal(AgentState.Idle, omp.State);
+    }
+
+    [Fact]
+    public void DetectProcesses_FailedIoSampleThenValidLifetimeBytes_RebasesSafelyAsIdle()
+    {
+        var now = new DateTimeOffset(2026, 11, 26, 10, 0, 0, TimeSpan.Zero);
+        var mock = new MockProcessInspector
+        {
+            Processes = new List<ProcessItem>
+            {
+                // Poll 1: GetProcessIoCounters failed (HasIoCounters == false)
+                new(300, 10, "claude.exe", "claude.exe", StartTimeTicks: 3000, TotalCpuTimeMs: 500, ReadTransferBytes: 0, OtherTransferBytes: 0, HasIoCounters: false)
+            }
+        };
+
+        var aggregator = new HqStateAggregator();
+        var collector = new ProcessAgentCollector(aggregator, enabled: true, inspector: mock, timeProvider: () => now);
+
+        var poll1 = collector.DetectProcesses();
+        Assert.Equal(AgentState.Idle, Assert.Single(poll1).State);
+
+        // Poll 2: GetProcessIoCounters recovers with huge lifetime counters (50 MB read, 25 MB other) and 0 CPU delta.
+        // MUST rebase safely (0 delta) and stay Idle — NEVER compare lifetime bytes against 0!
+        now = now.AddSeconds(2);
+        mock.Processes = new List<ProcessItem>
+        {
+            new(300, 10, "claude.exe", "claude.exe", StartTimeTicks: 3000, TotalCpuTimeMs: 500, ReadTransferBytes: 50_000_000, OtherTransferBytes: 25_000_000, HasIoCounters: true)
+        };
+
+        var poll2 = collector.DetectProcesses();
+        Assert.Equal(AgentState.Idle, Assert.Single(poll2).State);
+
+        // Poll 3: Genuine streaming I/O delta after rebase -> now classifies as Working
+        now = now.AddSeconds(2);
+        mock.Processes = new List<ProcessItem>
+        {
+            new(300, 10, "claude.exe", "claude.exe", StartTimeTicks: 3000, TotalCpuTimeMs: 508, ReadTransferBytes: 50_008_192, OtherTransferBytes: 25_004_096, HasIoCounters: true)
+        };
+
+        var poll3 = collector.DetectProcesses();
+        Assert.Equal(AgentState.Working, Assert.Single(poll3).State);
+    }
+
+    [Fact]
+    public void DetectProcesses_RealToolChildUnderOmpWorkerDaemon_MarksWorkingViaChildIoOrCpu_WhileIdleOmpWorkerStaysIdle()
+    {
+        var now = new DateTimeOffset(2026, 11, 26, 10, 0, 0, TimeSpan.Zero);
+        var mock = new MockProcessInspector
+        {
+            Processes = new List<ProcessItem>
+            {
+                new(100, 10, "omp.exe", "omp.exe", StartTimeTicks: 1000, TotalCpuTimeMs: 50, ReadTransferBytes: 1000, OtherTransferBytes: 1000, HasIoCounters: true),
+                new(101, 100, "omp.exe", "omp.exe --__omp_worker_daemon", StartTimeTicks: 1100, TotalCpuTimeMs: 20, ReadTransferBytes: 1000, OtherTransferBytes: 1000, HasIoCounters: true)
+            }
+        };
+
+        var aggregator = new HqStateAggregator();
+        var collector = new ProcessAgentCollector(aggregator, enabled: true, inspector: mock, timeProvider: () => now);
+
+        // Poll 1: baseline
+        Assert.Equal(AgentState.Idle, Assert.Single(collector.DetectProcesses()).State);
+
+        // Poll 2: __omp_worker_* daemon itself burns background CPU/IO with no real tool child -> MUST stay Idle
+        now = now.AddSeconds(2);
+        mock.Processes = new List<ProcessItem>
+        {
+            new(100, 10, "omp.exe", "omp.exe", StartTimeTicks: 1000, TotalCpuTimeMs: 52, ReadTransferBytes: 1000, OtherTransferBytes: 1100, HasIoCounters: true),
+            new(101, 100, "omp.exe", "omp.exe --__omp_worker_daemon", StartTimeTicks: 1100, TotalCpuTimeMs: 200, ReadTransferBytes: 50_000, OtherTransferBytes: 50_000, HasIoCounters: true)
+        };
+        Assert.Equal(AgentState.Idle, Assert.Single(collector.DetectProcesses()).State);
+
+        // Poll 3: Real foreground tool (dotnet.exe) spawns underneath __omp_worker_* daemon (baseline sample for child)
+        now = now.AddSeconds(2);
+        mock.Processes = new List<ProcessItem>
+        {
+            new(100, 10, "omp.exe", "omp.exe", StartTimeTicks: 1000, TotalCpuTimeMs: 52, ReadTransferBytes: 1000, OtherTransferBytes: 1100, HasIoCounters: true),
+            new(101, 100, "omp.exe", "omp.exe --__omp_worker_daemon", StartTimeTicks: 1100, TotalCpuTimeMs: 200, ReadTransferBytes: 50_000, OtherTransferBytes: 50_000, HasIoCounters: true),
+            new(102, 101, "dotnet.exe", "dotnet build", StartTimeTicks: 1500, TotalCpuTimeMs: 10, ReadTransferBytes: 2000, OtherTransferBytes: 2000, HasIoCounters: true)
+        };
+        // First sample of dotnet.exe with low CPU (10ms) and baseline IO
+        collector.DetectProcesses();
+
+        // Poll 4: dotnet.exe streams heavy child I/O with low child CPU (8ms) -> parent OMP MUST classify as Working!
+        now = now.AddSeconds(2);
+        mock.Processes = new List<ProcessItem>
+        {
+            new(100, 10, "omp.exe", "omp.exe", StartTimeTicks: 1000, TotalCpuTimeMs: 52, ReadTransferBytes: 1000, OtherTransferBytes: 1100, HasIoCounters: true),
+            new(101, 100, "omp.exe", "omp.exe --__omp_worker_daemon", StartTimeTicks: 1100, TotalCpuTimeMs: 200, ReadTransferBytes: 50_000, OtherTransferBytes: 50_000, HasIoCounters: true),
+            new(102, 101, "dotnet.exe", "dotnet build", StartTimeTicks: 1500, TotalCpuTimeMs: 18, ReadTransferBytes: 18_000, OtherTransferBytes: 10_000, HasIoCounters: true)
+        };
+        var working = Assert.Single(collector.DetectProcesses());
+        Assert.Equal(AgentState.Working, working.State);
+        Assert.Equal("build", working.ToolName);
+    }
+
+    [Fact]
+    public void DetectProcesses_ParentYoungerThanChild_RejectsPidReuseEdgeForOrcaExclusionAndChildTools()
+    {
+        var now = new DateTimeOffset(2026, 11, 26, 10, 0, 0, TimeSpan.Zero);
+        var mock = new MockProcessInspector
+        {
+            Processes = new List<ProcessItem>
+            {
+                // Recycled PID 50 now belongs to Orca (StartTimeTicks=5000), YOUNGER than claude.exe (StartTimeTicks=1000, ParentPid=50)!
+                // MUST NOT falsely treat claude.exe as an Orca descendant.
+                new(50, 1, "orca.exe", "orca.exe", StartTimeTicks: 5000, TotalCpuTimeMs: 100),
+                new(100, 50, "claude.exe", "claude.exe", StartTimeTicks: 1000, TotalCpuTimeMs: 100, ReadTransferBytes: 1000, OtherTransferBytes: 1000, HasIoCounters: true),
+                // Recycled PID 100 reused? Here child PID 200 has ParentPid=100, but child started BEFORE parent (500 < 1000).
+                // MUST NOT traverse this stale edge or attribute PID 200's CPU to PID 100!
+                new(200, 100, "dotnet.exe", "dotnet test", StartTimeTicks: 500, TotalCpuTimeMs: 1000, ReadTransferBytes: 100_000, OtherTransferBytes: 100_000, HasIoCounters: true)
+            }
+        };
+
+        var aggregator = new HqStateAggregator();
+        var collector = new ProcessAgentCollector(aggregator, enabled: true, inspector: mock, timeProvider: () => now);
+
+        var poll1 = collector.DetectProcesses();
+        var claude1 = Assert.Single(poll1);
+        Assert.Equal(100, claude1.ProcessId);
+        Assert.Equal(AgentState.Idle, claude1.State);
+
+        // Poll 2: PID 200 burns huge CPU, but its ParentPid=100 edge is invalid (500 < 1000) -> claude.exe stays Idle
+        now = now.AddSeconds(2);
+        mock.Processes = new List<ProcessItem>
+        {
+            new(50, 1, "orca.exe", "orca.exe", StartTimeTicks: 5000, TotalCpuTimeMs: 100),
+            new(100, 50, "claude.exe", "claude.exe", StartTimeTicks: 1000, TotalCpuTimeMs: 100, ReadTransferBytes: 1000, OtherTransferBytes: 1000, HasIoCounters: true),
+            new(200, 100, "dotnet.exe", "dotnet test", StartTimeTicks: 500, TotalCpuTimeMs: 5000, ReadTransferBytes: 500_000, OtherTransferBytes: 500_000, HasIoCounters: true)
+        };
+
+        var poll2 = collector.DetectProcesses();
+        var claude2 = Assert.Single(poll2);
+        Assert.Equal(100, claude2.ProcessId);
+        Assert.Equal(AgentState.Idle, claude2.State);
+    }
+
+    [Fact]
+    public void DetectProcesses_ZeroStartTimeTicks_DoesNotReuseHistoryOrExposePid()
+    {
+        var now = new DateTimeOffset(2026, 11, 26, 10, 0, 0, TimeSpan.Zero);
+        var mock = new MockProcessInspector
+        {
+            Processes = new List<ProcessItem>
+            {
+                // Inaccessible process: StartTimeTicks == 0
+                new(777, 10, "claude.exe", "claude.exe", StartTimeTicks: 0, TotalCpuTimeMs: 100, ReadTransferBytes: 1000, OtherTransferBytes: 1000, HasIoCounters: true)
+            }
+        };
+
+        var aggregator = new HqStateAggregator();
+        var collector = new ProcessAgentCollector(aggregator, enabled: true, inspector: mock, timeProvider: () => now);
+
+        var poll1 = collector.DetectProcesses();
+        var ag1 = Assert.Single(poll1);
+        Assert.Null(ag1.ProcessId);
+        Assert.Null(ag1.ProcessStartTicks);
+        Assert.Equal(AgentState.Idle, ag1.State);
+        Assert.Equal(0, collector.HistoryCount);
+        Assert.Equal(0, collector.OpaqueTokensCount);
+
+        // Poll 2: Even if CPU/IO increases on the same PID with StartTimeTicks == 0, history MUST NOT be reused
+        // and PID MUST remain unexposed until verified StartTimeTicks > 0 is obtained.
+        now = now.AddSeconds(2);
+        mock.Processes = new List<ProcessItem>
+        {
+            new(777, 10, "claude.exe", "claude.exe", StartTimeTicks: 0, TotalCpuTimeMs: 5000, ReadTransferBytes: 500_000, OtherTransferBytes: 500_000, HasIoCounters: true)
+        };
+
+        var poll2 = collector.DetectProcesses();
+        var ag2 = Assert.Single(poll2);
+        Assert.Null(ag2.ProcessId);
+        Assert.Null(ag2.ProcessStartTicks);
+        Assert.Equal(AgentState.Idle, ag2.State);
+        Assert.Equal(0, collector.HistoryCount);
+        Assert.Equal(0, collector.OpaqueTokensCount);
+    }
 }

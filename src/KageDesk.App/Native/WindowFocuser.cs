@@ -54,8 +54,13 @@ public static class WindowFocuser
 
         try
         {
+            if (expectedStartTicks.HasValue && expectedStartTicks.Value <= 0)
+            {
+                return false;
+            }
+
             long? targetStartTicks = getStartTime(pid);
-            if (!targetStartTicks.HasValue) return false;
+            if (!targetStartTicks.HasValue || targetStartTicks.Value <= 0) return false;
 
             if (expectedStartTicks.HasValue && !IsPidAgeValid(targetStartTicks.Value, expectedStartTicks.Value))
             {

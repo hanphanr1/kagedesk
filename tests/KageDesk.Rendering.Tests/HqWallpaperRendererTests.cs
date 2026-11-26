@@ -517,7 +517,7 @@ public class HqWallpaperRendererTests
             var state = new HqState(
                 Agents: new[]
                 {
-                    new AgentSnapshot("proc:omp:rigtest", "OMP", AgentRole.External, "mixi", AgentState.Working, ToolName: "edit", Source: "process", DeskRig: rig)
+                    new AgentSnapshot("proc:omp:rigtest", "OMP", AgentRole.External, "dj-synth", AgentState.Working, ToolName: "edit", Source: "process", DeskRig: rig)
                 },
                 Accounts: Array.Empty<AccountInfo>(),
                 Builds: Array.Empty<BuildInfo>(),
@@ -545,7 +545,7 @@ public class HqWallpaperRendererTests
             for (int v = 0; v < 3; v++)
             {
                 buf.ClearTransparent();
-                ShinobiSpriteRenderer.DrawCharacter(buf, "mixi", state, 48, 68, 1.25f, actionKind: action, behaviorVariant: v);
+                ShinobiSpriteRenderer.DrawCharacter(buf, "dj-synth", state, 48, 68, 1.25f, actionKind: action, behaviorVariant: v);
                 ShinobiSpriteRenderer.DrawDesk(buf, "clone", 48, 65, ColorUtil.FromRgb(80, 60, 45), ColorUtil.FromRgb(50, 38, 28), state, 1.25f, actionKind: action, deskRig: DeskRigKind.DualMonitorRig, behaviorVariant: v);
                 hashes.Add(ComputeFrameChecksum(buf));
             }
@@ -572,7 +572,7 @@ public class HqWallpaperRendererTests
                 new AgentSnapshot("o2", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", Source: "orca", IsBotHome: true, WorkStartedAt: now.AddSeconds(-80)),
                 new AgentSnapshot("o3", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test", Source: "orca", IsBotHome: true, WorkStartedAt: now.AddSeconds(-20)),
                 new AgentSnapshot("o4", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle, Source: "orca", IsBotHome: true),
-                new AgentSnapshot("p1", "OMP", AgentRole.External, "mixi", AgentState.Working, ToolName: "edit", Source: "process", DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0, WorkStartedAt: now.AddSeconds(-30)),
+                new AgentSnapshot("p1", "OMP", AgentRole.External, "dj-synth", AgentState.Working, ToolName: "edit", Source: "process", DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0, WorkStartedAt: now.AddSeconds(-30)),
                 new AgentSnapshot("p2", "Claude", AgentRole.External, "neko-dev", AgentState.Working, ToolName: "think", Source: "process", DeskRig: DeskRigKind.CozyLofiRig, BehaviorVariant: 1, WorkStartedAt: now.AddSeconds(-25)),
                 new AgentSnapshot("p3", "Codex", AgentRole.External, "cyber-hacker", AgentState.Working, ToolName: "build", Source: "process", DeskRig: DeskRigKind.CyberConsoleRig, BehaviorVariant: 2, WorkStartedAt: now.AddSeconds(-15)),
                 new AgentSnapshot("p4", "AGY", AgentRole.External, "ronin-dev", AgentState.Working, ToolName: "search", Source: "process", DeskRig: DeskRigKind.RetroCrtRig, BehaviorVariant: 0, WorkStartedAt: now.AddSeconds(-10)),
@@ -678,5 +678,197 @@ public class HqWallpaperRendererTests
         var demoMixiState = allIdleState with { DemoScenario = "mixi" };
         renderer.Render(bufMixi, demoMixiState, theme, 1.0f, now, showMixiWhenAllIdle: false);
         Assert.True(renderer.IsMixiChillActive);
+    }
+
+    [Fact]
+    public void PreviewSnapshotGenerator_AllScenarios_ZeroWorkingAgentsUseMixiSprite()
+    {
+        var fixedNow = new DateTimeOffset(2026, 11, 26, 2, 0, 0, TimeSpan.FromHours(7));
+        var scenarios = PreviewSnapshotGenerator.BuildPreviewStates(fixedNow);
+        Assert.NotEmpty(scenarios);
+
+        foreach (var (name, state) in scenarios)
+        {
+            foreach (var ag in state.Agents)
+            {
+                if (ag.State != AgentState.Idle)
+                {
+                    Assert.False(
+                        string.Equals(ag.SpriteKey, "mixi", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(ag.SpriteKey, "domixi", StringComparison.OrdinalIgnoreCase),
+                        $"Scenario '{name}' agent '{ag.Id}' ({ag.State}) must NEVER use working sprite '{ag.SpriteKey}'.");
+                }
+            }
+        }
+
+        // Defense-in-depth: ShinobiSpriteRenderer.NormalizeSpriteKey never routes working characters to Do Mixi
+        Assert.Equal("dj-synth", ShinobiSpriteRenderer.NormalizeSpriteKey("mixi"));
+        Assert.Equal("dj-synth", ShinobiSpriteRenderer.NormalizeSpriteKey("domixi"));
+    }
+
+    [Fact]
+    public void Render_AlreadyConsumedHandoffWithinExpiry_DoesNotSuppressWallpaperMixiAfterMotionFinishes()
+    {
+        var renderer = new HqWallpaperRenderer();
+        using var buf = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        var handoffEvt = new HqEvent(77, "handoff", "Pass review", now, "o2", 60.0, "o3");
+        var workingState = new HqState(
+            Agents: new[]
+            {
+                new AgentSnapshot("o1", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o2", "Minato", AgentRole.Coder, "minato", AgentState.Working, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o3", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o4", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle, Source: "orca", IsBotHome: true)
+            },
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: new[] { handoffEvt },
+            Timestamp: now);
+
+        for (int i = 0; i < 45; i++)
+        {
+            float t = 0.05f + i * 0.1f;
+            renderer.Render(buf, workingState, theme, t, now.AddSeconds(t), showMixiWhenAllIdle: true);
+        }
+
+        var allIdleWithConsumedHandoff = workingState with
+        {
+            Agents = new[]
+            {
+                new AgentSnapshot("o1", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o2", "Minato", AgentRole.Coder, "minato", AgentState.Idle, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o3", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Idle, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o4", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle, Source: "orca", IsBotHome: true)
+            },
+            Mood = HqMood.Calm
+        };
+
+        renderer.Render(buf, allIdleWithConsumedHandoff, theme, 5.5f, now.AddSeconds(5.5), showMixiWhenAllIdle: true);
+        Assert.True(renderer.IsMixiChillActive);
+    }
+
+    [Fact]
+    public void Render_ThreePathPerformanceAndAllocationBenchmark_AllPathsUnder1Point2MsPerFrame()
+    {
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        const int warmupFrames = 30;
+        const int measureFrames = 100;
+
+        static (double MedianMs, double AvgMs, long BytesPerFrame) Measure(Action<int> renderFrame)
+        {
+            for (int i = 0; i < warmupFrames; i++)
+            {
+                renderFrame(i);
+            }
+
+            var times = new double[measureFrames];
+            var sw = new Stopwatch();
+            long allocBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < measureFrames; i++)
+            {
+                sw.Restart();
+                renderFrame(warmupFrames + i);
+                sw.Stop();
+                times[i] = sw.Elapsed.TotalMilliseconds;
+            }
+            long allocAfter = GC.GetAllocatedBytesForCurrentThread();
+
+            Array.Sort(times);
+            return (times[measureFrames / 2], times.Average(), (allocAfter - allocBefore) / measureFrames);
+        }
+
+        // (a) Warmed working wallpaper (9-agent variety scene)
+        var workingRenderer = new HqWallpaperRenderer();
+        using var wpBuf = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
+        var workingState = new HqState(
+            Agents: new[]
+            {
+                new AgentSnapshot("o1", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, ToolName: "plan", Source: "orca", IsBotHome: true, WorkStartedAt: now.AddSeconds(-40)),
+                new AgentSnapshot("o2", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", Source: "orca", IsBotHome: true, WorkStartedAt: now.AddSeconds(-80)),
+                new AgentSnapshot("o3", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test", Source: "orca", IsBotHome: true, WorkStartedAt: now.AddSeconds(-20)),
+                new AgentSnapshot("o4", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("p1", "OMP", AgentRole.External, "dj-synth", AgentState.Working, ToolName: "edit", Source: "process", DeskRig: DeskRigKind.RgbStreamerRig, BehaviorVariant: 0, WorkStartedAt: now.AddSeconds(-30)),
+                new AgentSnapshot("p2", "Claude", AgentRole.External, "neko-dev", AgentState.Working, ToolName: "think", Source: "process", DeskRig: DeskRigKind.CozyLofiRig, BehaviorVariant: 1, WorkStartedAt: now.AddSeconds(-25)),
+                new AgentSnapshot("p3", "Codex", AgentRole.External, "cyber-hacker", AgentState.Working, ToolName: "build", Source: "process", DeskRig: DeskRigKind.CyberConsoleRig, BehaviorVariant: 2, WorkStartedAt: now.AddSeconds(-15)),
+                new AgentSnapshot("p4", "AGY", AgentRole.External, "ronin-dev", AgentState.Working, ToolName: "search", Source: "process", DeskRig: DeskRigKind.RetroCrtRig, BehaviorVariant: 0, WorkStartedAt: now.AddSeconds(-10)),
+                new AgentSnapshot("p5", "OMP 2", AgentRole.External, "astro-dev", AgentState.Working, ToolName: "execute", Source: "process", DeskRig: DeskRigKind.DualMonitorRig, BehaviorVariant: 1, WorkStartedAt: now.AddSeconds(-5))
+            },
+            Accounts: new[] { new AccountInfo("anthropic", "main", "Pro", true, 75) },
+            Builds: new[] { new BuildInfo("b1", "kagedesk", "CI", "main", "Build", "completed", "success", UpdatedAt: now) },
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: Array.Empty<HqEvent>(),
+            Timestamp: now);
+
+        var (workMedian, workAvg, workBytes) = Measure(i =>
+            workingRenderer.Render(wpBuf, workingState, theme, i * 0.08f, now.AddSeconds(i * 0.08)));
+
+        // (b) All-idle Mixi frame (wallpaper + taskbar pet)
+        var mixiRenderer = new HqWallpaperRenderer();
+        var allIdleState = new HqState(
+            Agents: new[]
+            {
+                new AgentSnapshot("o1", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o2", "Minato", AgentRole.Coder, "minato", AgentState.Idle, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o3", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Idle, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o4", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle, Source: "orca", IsBotHome: true)
+            },
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Calm,
+            PendingVisualEvents: Array.Empty<HqEvent>(),
+            Timestamp: now);
+
+        var (mixiMedian, mixiAvg, mixiBytes) = Measure(i =>
+            mixiRenderer.Render(wpBuf, allIdleState, theme, i * 0.1f, now.AddSeconds(i * 0.1), showMixiWhenAllIdle: true));
+        Assert.True(mixiRenderer.IsMixiChillActive);
+
+        // (c) Active handoff frame (wallpaper + taskbar pet steady-state active handoff)
+        var handoffWpRenderer = new HqWallpaperRenderer();
+        var handoffPetRenderer = new TaskbarPetRenderer();
+        using var petBuf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+
+        var handoffState = new HqState(
+            Agents: new[]
+            {
+                new AgentSnapshot("o1", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Idle, Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o2", "Minato", AgentRole.Coder, "minato", AgentState.Working, ToolName: "edit", Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o3", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, ToolName: "test", Source: "orca", IsBotHome: true),
+                new AgentSnapshot("o4", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Idle, Source: "orca", IsBotHome: true)
+            },
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: new[] { new HqEvent(1, "handoff", "Review scroll", now, "o2", 30.0, "o3") },
+            Timestamp: now);
+
+        // Trigger active handoff and keep measuring during active walking/delivering motion
+        // Use small dt (0.01f) over 100 measured frames (=1.0s) right after warmup (0.3s) so all measured frames are actively in motion!
+        var (handoffWpMedian, handoffWpAvg, handoffWpBytes) = Measure(i =>
+            handoffWpRenderer.Render(wpBuf, handoffState, theme, 0.05f + i * 0.012f, now.AddSeconds(0.05 + i * 0.012)));
+
+        var (handoffPetMedian, handoffPetAvg, handoffPetBytes) = Measure(i =>
+            handoffPetRenderer.Render(petBuf, handoffState, theme, 0.05f + i * 0.012f, showIdleChill: true, nowOverride: now.AddSeconds(0.05 + i * 0.012), showMixiWhenAllIdle: true));
+        Assert.True(handoffPetRenderer.IsHandoffActive);
+
+        _output.WriteLine($"[BENCH-3PATH] (a) Warmed working wallpaper: median={workMedian:F3} ms/frame, avg={workAvg:F3} ms/frame, alloc={workBytes} B/frame");
+        _output.WriteLine($"[BENCH-3PATH] (b) All-idle Mixi wallpaper:  median={mixiMedian:F3} ms/frame, avg={mixiAvg:F3} ms/frame, alloc={mixiBytes} B/frame");
+        _output.WriteLine($"[BENCH-3PATH] (c) Active handoff wallpaper: median={handoffWpMedian:F3} ms/frame, avg={handoffWpAvg:F3} ms/frame, alloc={handoffWpBytes} B/frame");
+        _output.WriteLine($"[BENCH-3PATH] (c-pet) Active handoff pet:   median={handoffPetMedian:F3} ms/frame, avg={handoffPetAvg:F3} ms/frame, alloc={handoffPetBytes} B/frame");
+
+        Assert.True(workMedian < 1.2, $"Working wallpaper median {workMedian:F3} ms/frame exceeded 1.2 ms budget.");
+        Assert.True(mixiMedian < 1.2, $"All-idle Mixi wallpaper median {mixiMedian:F3} ms/frame exceeded 1.2 ms budget.");
+        Assert.True(handoffWpMedian < 1.2, $"Active handoff wallpaper median {handoffWpMedian:F3} ms/frame exceeded 1.2 ms budget.");
+        Assert.True(handoffPetMedian < 1.2, $"Active handoff taskbar pet median {handoffPetMedian:F3} ms/frame exceeded 1.2 ms budget.");
+        Assert.Equal(0, handoffPetBytes);
     }
 }

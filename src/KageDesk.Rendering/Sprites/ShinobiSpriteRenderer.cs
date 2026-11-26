@@ -2574,7 +2574,7 @@ public static class ShinobiSpriteRenderer
         if (string.Equals(trimmed, "minato", StringComparison.OrdinalIgnoreCase)) return "minato";
         if (string.Equals(trimmed, "tsunade", StringComparison.OrdinalIgnoreCase)) return "tsunade";
         if (string.Equals(trimmed, "kakashi", StringComparison.OrdinalIgnoreCase)) return "kakashi";
-        if (string.Equals(trimmed, "mixi", StringComparison.OrdinalIgnoreCase) || string.Equals(trimmed, "domixi", StringComparison.OrdinalIgnoreCase)) return "mixi";
+        if (string.Equals(trimmed, "mixi", StringComparison.OrdinalIgnoreCase) || string.Equals(trimmed, "domixi", StringComparison.OrdinalIgnoreCase)) return "dj-synth";
         if (string.Equals(trimmed, "dj-synth", StringComparison.OrdinalIgnoreCase)) return "dj-synth";
         if (string.Equals(trimmed, "neko-dev", StringComparison.OrdinalIgnoreCase)) return "neko-dev";
         if (string.Equals(trimmed, "cyber-hacker", StringComparison.OrdinalIgnoreCase)) return "cyber-hacker";

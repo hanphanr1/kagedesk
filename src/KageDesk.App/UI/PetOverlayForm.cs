@@ -227,29 +227,14 @@ public class PetOverlayForm : Form
             }
         }
 
-        if (_dismissedAgentId == null)
-        {
-            _cachedRenderState = _currentState;
-            return;
-        }
-
-        // Cache filtered agent state
-        var filtered = new List<AgentSnapshot>(_currentState.Agents.Count);
-        foreach (var ag in _currentState.Agents)
-        {
-            if (ag.Id == _dismissedAgentId)
-            {
-                filtered.Add(ag with { State = AgentState.Idle, QuestionPrompt = null });
-            }
-            else
-            {
-                filtered.Add(ag);
-            }
-        }
-        _cachedRenderState = _currentState with { Agents = filtered };
+        // Never rewrite dismissed NeedsApproval/Failed states to Idle: keep _currentState unfiltered
+        // so MixiChillRenderer.ShouldRenderMixiChillCorner stays strictly gated on real agent state.
+        _cachedRenderState = _currentState;
     }
 
-    private bool ShouldStayVisibleInAutoHide()
+    internal IReadOnlyList<PetHitRegion> CurrentHitRegions => _renderer.HitRegions;
+
+    internal bool ShouldStayVisibleInAutoHide()
     {
         // Stay visible when Do Mixi All-Idle Chill Mode is enabled or explicitly demoed
         if (_showMixiWhenAllIdle ||
@@ -258,8 +243,8 @@ public class PetOverlayForm : Form
             return true;
         }
 
-        // Stay visible while a living handoff is actively walking or newly queued
-        if (_renderer.IsHandoffActive || HasPendingHandoffEvent(_cachedRenderState))
+        // Stay visible ONLY while a living handoff is actively walking or an unconsumed handoff is pending
+        if (_renderer.IsHandoffActive || _renderer.HasUnconsumedHandoffEvent(_currentState))
         {
             return true;
         }
@@ -273,19 +258,6 @@ public class PetOverlayForm : Form
             }
         }
 
-        return false;
-    }
-
-    private static bool HasPendingHandoffEvent(HqState state)
-    {
-        if (state.PendingVisualEvents == null) return false;
-        for (int i = 0; i < state.PendingVisualEvents.Count; i++)
-        {
-            if (string.Equals(state.PendingVisualEvents[i].Type, "handoff", StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-        }
         return false;
     }
 
@@ -354,7 +326,16 @@ public class PetOverlayForm : Form
         float timeSeconds = (float)_stopwatch.Elapsed.TotalSeconds;
         bool showIdle = _idleMode != "off";
 
-        _renderer.Render(_petBuffer, _cachedRenderState, _currentTheme, timeSeconds, showIdle, DateTimeOffset.UtcNow, _showMixiWhenAllIdle);
+        _renderer.Render(
+            _petBuffer,
+            _currentState,
+            _currentTheme,
+            timeSeconds,
+            showIdle,
+            DateTimeOffset.UtcNow,
+            _showMixiWhenAllIdle,
+            _dismissedAgentId,
+            _dismissedAgentState);
 
         if (_scale == 1)
         {
@@ -383,8 +364,7 @@ public class PetOverlayForm : Form
             int unscaledX = e.X / _scale;
             int unscaledY = e.Y / _scale;
 
-            var hit = FindHitRegion(unscaledX, unscaledY);
-            if (hit != null)
+            if (FindHitRegion(unscaledX, unscaledY) is { } hit)
             {
                 if (hit.ActionId == "open_orca")
                 {
@@ -395,7 +375,7 @@ public class PetOverlayForm : Form
                 {
                     string agentId = hit.ActionId["focus_agent:".Length..];
                     var agent = _currentState.Agents.FirstOrDefault(a => a.Id == agentId);
-                    if (agent?.ProcessId.HasValue == true)
+                    if (agent is { ProcessId: > 0, ProcessStartTicks: > 0 })
                     {
                         if (!WindowFocuser.TryFocusProcessWindow(agent.ProcessId.Value, agent.ProcessStartTicks))
                         {
@@ -484,8 +464,7 @@ public class PetOverlayForm : Form
         {
             int unscaledX = e.X / _scale;
             int unscaledY = e.Y / _scale;
-            var hit = FindHitRegion(unscaledX, unscaledY);
-            Cursor = hit != null ? Cursors.Hand : Cursors.Default;
+            Cursor = FindHitRegion(unscaledX, unscaledY).HasValue ? Cursors.Hand : Cursors.Default;
         }
     }
 
@@ -508,29 +487,31 @@ public class PetOverlayForm : Form
 
     private PetHitRegion? FindHitRegion(int unscaledX, int unscaledY)
     {
-        var regions = _renderer.HitRegions;
-        for (int i = regions.Count - 1; i >= 0; i--)
-        {
-            if (regions[i].Contains(unscaledX, unscaledY))
-            {
-                return regions[i];
-            }
-        }
-        return null;
+        return _renderer.HitTest(unscaledX, unscaledY);
     }
 
-    private void DismissActiveApprovalOrFail()
+    internal void DismissActiveApprovalOrFail()
     {
+        AgentSnapshot? target = null;
         foreach (var ag in _currentState.Agents)
         {
-            if (ag.State is AgentState.NeedsApproval or AgentState.Failed)
+            if (ag.State == AgentState.NeedsApproval)
             {
-                _dismissedAgentId = ag.Id;
-                _dismissedAgentState = ag.State;
-                RecomputeCachedRenderState();
-                RenderAndPresent();
+                target = ag;
                 break;
             }
+            if (ag.State == AgentState.Failed && target == null)
+            {
+                target = ag;
+            }
+        }
+
+        if (target != null)
+        {
+            _dismissedAgentId = target.Id;
+            _dismissedAgentState = target.State;
+            RecomputeCachedRenderState();
+            RenderAndPresent();
         }
     }
 

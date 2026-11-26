@@ -185,7 +185,7 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
             await WriteJsonAsync(response, 200, new
             {
                 ok = true,
-                version = "2.0.0",
+                version = "2.1.0",
                 workingSetMb = Math.Round(workingSet, 2),
                 uptimeSec = Math.Round(uptime, 1),
                 activeTheme = activeTheme,

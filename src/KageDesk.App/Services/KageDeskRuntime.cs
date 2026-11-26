@@ -579,16 +579,7 @@ public class KageDeskRuntime : IDisposable
                 // Silently continue polling loop
             }
 
-            int delayMs = 6000;
-            var currentAgents = _aggregator.CurrentState.Agents;
-            for (int i = 0; i < currentAgents.Count; i++)
-            {
-                if (currentAgents[i].State is AgentState.Working or AgentState.NeedsApproval)
-                {
-                    delayMs = Math.Max(2000, _config.PollingIntervalMs);
-                    break;
-                }
-            }
+            int delayMs = ComputePollingDelayMs(_config.PollingIntervalMs, _aggregator.CurrentState.Agents);
 
             try
             {
@@ -599,6 +590,11 @@ public class KageDeskRuntime : IDisposable
                 break;
             }
         }
+    }
+
+    internal static int ComputePollingDelayMs(int configuredIntervalMs, IReadOnlyList<AgentSnapshot>? agents)
+    {
+        return Math.Max(2000, configuredIntervalMs);
     }
 
     private void OnHqStateChanged(object? sender, HqState state)

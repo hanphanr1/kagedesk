@@ -26,6 +26,7 @@ public class ProcessAgentCollector
         public DateTimeOffset? WorkingStartedAt { get; set; }
         public DateTimeOffset? DoneStartedAt { get; set; }
         public long LastCpuTimeMs { get; set; }
+        public bool HasValidIoSample { get; set; }
         public long LastReadBytes { get; set; }
         public long LastOtherBytes { get; set; }
         public DateTimeOffset LastSampleAt { get; set; }
@@ -36,6 +37,9 @@ public class ProcessAgentCollector
     private class ChildPidState
     {
         public long LastCpuTimeMs { get; set; }
+        public bool HasValidIoSample { get; set; }
+        public long LastReadBytes { get; set; }
+        public long LastOtherBytes { get; set; }
         public DateTimeOffset FirstSeenAt { get; set; }
         public DateTimeOffset LastSampleAt { get; set; }
         public bool IsFirstSample { get; set; } = true;
@@ -139,6 +143,11 @@ public class ProcessAgentCollector
 
     private string GetOrCreateOpaqueToken(int pid, long startTicks)
     {
+        if (startTicks <= 0)
+        {
+            return CreateEphemeralOpaqueToken();
+        }
+
         var key = (pid, startTicks);
         if (_opaqueTokens.TryGetValue(key, out var token))
         {
@@ -152,6 +161,11 @@ public class ProcessAgentCollector
 
         _opaqueTokens[key] = token;
         return token;
+    }
+
+    private static string CreateEphemeralOpaqueToken()
+    {
+        return Convert.ToHexString(RandomNumberGenerator.GetBytes(4)).ToLowerInvariant();
     }
 
     public IReadOnlyList<AgentSnapshot> DetectProcesses()
@@ -196,30 +210,39 @@ public class ProcessAgentCollector
 
             var now = _timeProvider();
 
-            // Build parent and child maps
-            var parentMap = new Dictionary<int, int>(processes.Count);
+            // Build verified parent-child maps (reject PID-reuse edges where parent is younger than child or timestamps are unverified)
             var childrenMap = new Dictionary<int, List<int>>(processes.Count);
             var procByPid = new Dictionary<int, ProcessItem>(processes.Count);
 
             foreach (var p in processes)
             {
                 procByPid[p.ProcessId] = p;
-                parentMap[p.ProcessId] = p.ParentProcessId;
-
-                if (!childrenMap.TryGetValue(p.ParentProcessId, out var childList))
-                {
-                    childList = new List<int>();
-                    childrenMap[p.ParentProcessId] = childList;
-                }
-                childList.Add(p.ProcessId);
             }
 
-            // Identify all Orca.exe processes and their descendants
+            foreach (var p in processes)
+            {
+                if (p.ParentProcessId <= 0 || p.ParentProcessId == p.ProcessId)
+                {
+                    continue;
+                }
+
+                if (procByPid.TryGetValue(p.ParentProcessId, out var parentProc) &&
+                    Win32ProcessInspector.IsValidParentChildEdge(parentProc, p))
+                {
+                    if (!childrenMap.TryGetValue(p.ParentProcessId, out var childList))
+                    {
+                        childList = new List<int>();
+                        childrenMap[p.ParentProcessId] = childList;
+                    }
+                    childList.Add(p.ProcessId);
+                }
+            }
+
+            // Identify all Orca.exe processes and their verified descendants
             var orcaPids = new HashSet<int>();
             foreach (var p in processes)
             {
-                if (string.Equals(p.ExeName, "Orca.exe", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(p.ExeName, "orca", StringComparison.OrdinalIgnoreCase))
+                if (Win32ProcessInspector.IsOrcaExecutable(p.ExeName))
                 {
                     orcaPids.Add(p.ProcessId);
                 }
@@ -296,11 +319,13 @@ public class ProcessAgentCollector
                     var liveKeys = new HashSet<(int Pid, long StartTicks)>(candidates.Count);
                     var liveChildKeys = new HashSet<(int Pid, long StartTicks)>();
                     var liveAgentIds = new HashSet<string>(candidates.Count, StringComparer.OrdinalIgnoreCase);
+                    var candidateTokens = new Dictionary<MatchedCandidate, string>(candidates.Count);
 
                     // Pre-compute live agent IDs so appearance registry only evicts truly departed sessions
                     foreach (var cand in candidates)
                     {
                         string tok = GetOrCreateOpaqueToken(cand.Pid, cand.StartTimeTicks);
+                        candidateTokens[cand] = tok;
                         liveAgentIds.Add($"proc:{cand.ProviderLower}:{tok}");
                     }
 
@@ -315,36 +340,58 @@ public class ProcessAgentCollector
                         for (int i = 0; i < sorted.Count; i++)
                         {
                             var cand = sorted[i];
-                            liveCandidatePids.Add(cand.Pid);
-                            liveKeys.Add((cand.Pid, cand.StartTimeTicks));
+                            bool hasVerifiedStartTime = cand.StartTimeTicks > 0;
+                            if (hasVerifiedStartTime)
+                            {
+                                liveCandidatePids.Add(cand.Pid);
+                                liveKeys.Add((cand.Pid, cand.StartTimeTicks));
+                            }
 
                             string name = AgentAppearanceRegistry.FormatIndexedProviderName(cand.Provider, i, sorted.Count);
-                            string opaqueToken = GetOrCreateOpaqueToken(cand.Pid, cand.StartTimeTicks);
+                            string opaqueToken = candidateTokens[cand];
                             string id = $"proc:{cand.ProviderLower}:{opaqueToken}";
 
-                            if (!_history.TryGetValue(cand.Pid, out var stateEntry) || stateEntry.StartTimeTicks != cand.StartTimeTicks)
+                            AgentPidState stateEntry;
+                            if (hasVerifiedStartTime)
                             {
+                                if (!_history.TryGetValue(cand.Pid, out stateEntry!) || stateEntry.StartTimeTicks != cand.StartTimeTicks)
+                                {
+                                    stateEntry = new AgentPidState
+                                    {
+                                        Pid = cand.Pid,
+                                        StartTimeTicks = cand.StartTimeTicks,
+                                        FirstSeenAt = now,
+                                        LastSampleAt = now,
+                                        IsFirstSample = true
+                                    };
+                                    _history[cand.Pid] = stateEntry;
+                                }
+                            }
+                            else
+                            {
+                                // Unverified StartTimeTicks == 0: never reuse prior history keyed on 0
                                 stateEntry = new AgentPidState
                                 {
                                     Pid = cand.Pid,
-                                    StartTimeTicks = cand.StartTimeTicks,
+                                    StartTimeTicks = 0,
                                     FirstSeenAt = now,
                                     LastSampleAt = now,
                                     IsFirstSample = true
                                 };
-                                _history[cand.Pid] = stateEntry;
                             }
 
                             bool wasAgentFirstSample = stateEntry.IsFirstSample;
 
-                            // 1. Detect Active Tool Child (ignores console hosts, internal/MCP/LSP daemons, and idle children)
-                            string? detectedTool = DetectActiveToolChild(
-                                cand.Pid,
-                                wasAgentFirstSample,
-                                now,
-                                childrenMap,
-                                procByPid,
-                                liveChildKeys);
+                            // 1. Detect Active Tool Child (ignores console hosts, internal/MCP/LSP daemons as tools themselves, while traversing descendants)
+                            string? detectedTool = hasVerifiedStartTime
+                                ? DetectActiveToolChild(
+                                    cand.Pid,
+                                    wasAgentFirstSample,
+                                    now,
+                                    childrenMap,
+                                    procByPid,
+                                    liveChildKeys)
+                                : null;
 
                             // 2. Read agent's own CPU and IO counters (exclude background __omp_worker_* daemon CPU)
                             procByPid.TryGetValue(cand.Pid, out var agentProc);
@@ -357,8 +404,10 @@ public class ProcessAgentCollector
                             long cpuDeltaMs = Math.Max(0, totalCpuMs - stateEntry.LastCpuTimeMs);
                             double cpuRatio = elapsedWallMs > 0 ? (double)cpuDeltaMs / elapsedWallMs : 0;
 
-                            long readBytesDelta = Math.Max(0, readBytes - stateEntry.LastReadBytes);
-                            long otherBytesDelta = Math.Max(0, otherBytes - stateEntry.LastOtherBytes);
+                            bool prevHadValidIo = stateEntry.HasValidIoSample;
+                            bool hasValidIoDelta = !stateEntry.IsFirstSample && prevHadValidIo && hasIoCounters;
+                            long readBytesDelta = hasValidIoDelta ? Math.Max(0, readBytes - stateEntry.LastReadBytes) : 0;
+                            long otherBytesDelta = hasValidIoDelta ? Math.Max(0, otherBytes - stateEntry.LastOtherBytes) : 0;
                             double elapsedSec = elapsedWallMs / 1000.0;
                             double otherBytesPerSec = elapsedSec > 0 ? otherBytesDelta / elapsedSec : 0;
 
@@ -366,8 +415,16 @@ public class ProcessAgentCollector
                             {
                                 stateEntry.IsFirstSample = false;
                                 stateEntry.LastCpuTimeMs = totalCpuMs;
-                                stateEntry.LastReadBytes = readBytes;
-                                stateEntry.LastOtherBytes = otherBytes;
+                                if (hasIoCounters)
+                                {
+                                    stateEntry.HasValidIoSample = true;
+                                    stateEntry.LastReadBytes = readBytes;
+                                    stateEntry.LastOtherBytes = otherBytes;
+                                }
+                                else
+                                {
+                                    stateEntry.HasValidIoSample = false;
+                                }
                                 stateEntry.LastSampleAt = now;
 
                                 if (detectedTool != null)
@@ -386,20 +443,37 @@ public class ProcessAgentCollector
                             else
                             {
                                 stateEntry.LastCpuTimeMs = totalCpuMs;
-                                stateEntry.LastReadBytes = readBytes;
-                                stateEntry.LastOtherBytes = otherBytes;
+                                if (hasIoCounters)
+                                {
+                                    stateEntry.HasValidIoSample = true;
+                                    stateEntry.LastReadBytes = readBytes;
+                                    stateEntry.LastOtherBytes = otherBytes;
+                                }
+                                else
+                                {
+                                    // Never store 0 as an I/O baseline when GetProcessIoCounters fails
+                                    stateEntry.HasValidIoSample = false;
+                                }
                                 stateEntry.LastSampleAt = now;
 
                                 bool isCpuActive;
                                 if (hasIoCounters)
                                 {
-                                    // Real Win32 processes (notably interactive OMP's Bun TUI) can redraw continuously
-                                    // while sitting idle at the prompt with ~0 read/socket IO. Require real read/socket
-                                    // transfer activity or a heavy local CPU burst (>= 35% core) when no tool child runs.
-                                    bool hasMeaningfulIo = readBytesDelta >= 256 || otherBytesPerSec >= 512.0;
-                                    bool hasHeavyIo = readBytesDelta >= 1024 || otherBytesPerSec >= 1024.0;
-                                    isCpuActive = (cpuDeltaMs >= 45.0 && cpuRatio >= 0.02 && (hasMeaningfulIo || cpuRatio >= 0.35))
-                                               || (hasHeavyIo && cpuDeltaMs >= 15.0);
+                                    if (hasValidIoDelta)
+                                    {
+                                        // Streaming sessions transferring kilobytes of I/O even at low CPU (~8-10ms)
+                                        // classify as Working, while tiny idle TUI redraw/cursor blink jitter stays Idle.
+                                        bool hasMeaningfulIo = readBytesDelta >= 256 || otherBytesPerSec >= 512.0;
+                                        bool hasStreamingIo = readBytesDelta >= 1024 ||
+                                            (otherBytesDelta >= 1024 && (elapsedSec <= 0 || otherBytesPerSec >= 512.0));
+                                        isCpuActive = hasStreamingIo
+                                                   || (cpuDeltaMs >= 45.0 && cpuRatio >= 0.02 && (hasMeaningfulIo || cpuRatio >= 0.35));
+                                    }
+                                    else
+                                    {
+                                        // Rebased sample after failed I/O counters: never compare lifetime counters against 0
+                                        isCpuActive = cpuDeltaMs >= 45.0 && cpuRatio >= 0.35;
+                                    }
                                 }
                                 else
                                 {
@@ -479,8 +553,8 @@ public class ProcessAgentCollector
                                 ToolName: stateEntry.ToolName,
                                 Source: "process",
                                 WorkStartedAt: stateEntry.State == AgentState.Working ? stateEntry.WorkingStartedAt : null,
-                                ProcessId: cand.Pid,
-                                ProcessStartTicks: cand.StartTimeTicks,
+                                ProcessId: hasVerifiedStartTime ? cand.Pid : null,
+                                ProcessStartTicks: hasVerifiedStartTime ? cand.StartTimeTicks : null,
                                 LastActivityAt: stateEntry.WorkingStartedAt ?? stateEntry.FirstSeenAt,
                                 UpdatedAt: now,
                                 DeskRig: appearance.DeskRig,
@@ -547,7 +621,7 @@ public class ProcessAgentCollector
         Dictionary<int, ProcessItem> procByPid,
         HashSet<(int Pid, long StartTicks)> liveChildKeys)
     {
-        // Breadth-first walk up to depth 3
+        // Breadth-first walk up to depth 4 (allows traversing through __omp_worker_* / console hosts to spawned tools)
         var queue = new Queue<(int Pid, int Depth)>();
         if (childrenMap.TryGetValue(agentPid, out var directChildren))
         {
@@ -571,29 +645,48 @@ public class ProcessAgentCollector
             {
                 var cl = item.Classification ?? Win32ProcessInspector.ClassifyProcess(item.ExeName, item.CommandLine);
 
-                // Exclude __omp_worker_* daemons and console hosts
-                if (cl.IsInternalDaemon ||
+                // Exclude __omp_worker_* daemons and console hosts from marking the agent working themselves,
+                // while still traversing their descendants to detect real foreground tools spawned underneath.
+                bool isExcludedWrapper = cl.IsInternalDaemon ||
                     item.ExeName.Equals("conhost.exe", StringComparison.OrdinalIgnoreCase) ||
-                    item.ExeName.Equals("openconsole.exe", StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
+                    item.ExeName.Equals("openconsole.exe", StringComparison.OrdinalIgnoreCase);
 
-                if (cl.RoleHint != null)
+                if (!isExcludedWrapper && cl.RoleHint != null)
                 {
-                    var childKey = (item.ProcessId, item.StartTimeTicks);
-                    liveChildKeys.Add(childKey);
+                    bool hasVerifiedChildStart = item.StartTimeTicks > 0;
+                    ChildPidState childState;
+                    if (hasVerifiedChildStart)
+                    {
+                        var childKey = (item.ProcessId, item.StartTimeTicks);
+                        liveChildKeys.Add(childKey);
 
-                    if (!_childHistory.TryGetValue(childKey, out var childState))
+                        if (!_childHistory.TryGetValue(childKey, out childState!))
+                        {
+                            childState = new ChildPidState
+                            {
+                                LastCpuTimeMs = item.TotalCpuTimeMs,
+                                HasValidIoSample = item.HasIoCounters,
+                                LastReadBytes = item.HasIoCounters ? item.ReadTransferBytes : 0,
+                                LastOtherBytes = item.HasIoCounters ? item.OtherTransferBytes : 0,
+                                FirstSeenAt = now,
+                                LastSampleAt = now,
+                                IsFirstSample = true
+                            };
+                            _childHistory[childKey] = childState;
+                        }
+                    }
+                    else
                     {
                         childState = new ChildPidState
                         {
                             LastCpuTimeMs = item.TotalCpuTimeMs,
+                            HasValidIoSample = item.HasIoCounters,
+                            LastReadBytes = item.HasIoCounters ? item.ReadTransferBytes : 0,
+                            LastOtherBytes = item.HasIoCounters ? item.OtherTransferBytes : 0,
                             FirstSeenAt = now,
                             LastSampleAt = now,
                             IsFirstSample = true
                         };
-                        _childHistory[childKey] = childState;
                     }
 
                     bool isChildFirstSample = childState.IsFirstSample;
@@ -601,8 +694,27 @@ public class ProcessAgentCollector
                     long childCpuDeltaMs = Math.Max(0, item.TotalCpuTimeMs - childState.LastCpuTimeMs);
                     double childCpuRatio = childElapsedMs > 0 ? (double)childCpuDeltaMs / childElapsedMs : 0;
 
+                    bool childHasIo = item.HasIoCounters;
+                    bool childHasValidIoDelta = !isChildFirstSample && childState.HasValidIoSample && childHasIo;
+                    long childReadDelta = childHasValidIoDelta ? Math.Max(0, item.ReadTransferBytes - childState.LastReadBytes) : 0;
+                    long childOtherDelta = childHasValidIoDelta ? Math.Max(0, item.OtherTransferBytes - childState.LastOtherBytes) : 0;
+                    double childElapsedSec = childElapsedMs / 1000.0;
+                    double childOtherPerSec = childElapsedSec > 0 ? childOtherDelta / childElapsedSec : 0;
+                    bool childHasStreamingIo = childHasValidIoDelta &&
+                        (childReadDelta >= 1024 || (childOtherDelta >= 1024 && (childElapsedSec <= 0 || childOtherPerSec >= 512.0)));
+
                     childState.IsFirstSample = false;
                     childState.LastCpuTimeMs = item.TotalCpuTimeMs;
+                    if (childHasIo)
+                    {
+                        childState.HasValidIoSample = true;
+                        childState.LastReadBytes = item.ReadTransferBytes;
+                        childState.LastOtherBytes = item.OtherTransferBytes;
+                    }
+                    else
+                    {
+                        childState.HasValidIoSample = false;
+                    }
                     childState.LastSampleAt = now;
 
                     bool isStrongTransientTool = cl.RoleHint is "git" or "test" or "build" or "search";
@@ -610,25 +722,27 @@ public class ProcessAgentCollector
 
                     if (cl.IsPersistentDaemon)
                     {
-                        // Long-lived MCP/LSP servers only count if actively burning substantial CPU
-                        isChildActive = !isChildFirstSample && childCpuDeltaMs >= 30 && childCpuRatio >= 0.025;
+                        // Long-lived MCP/LSP servers only count if actively burning substantial CPU or streaming I/O
+                        isChildActive = !isChildFirstSample &&
+                            ((childCpuDeltaMs >= 30 && childCpuRatio >= 0.025) || childHasStreamingIo);
                     }
                     else if (isStrongTransientTool)
                     {
-                        // Transient dev tools (git, dotnet, rg, pytest, vitest): active when freshly spawned or burning CPU
+                        // Transient dev tools (git, dotnet, rg, pytest, vitest): active when freshly spawned, burning CPU, or streaming I/O
                         isChildActive = isChildFirstSample
                             || (now - childState.FirstSeenAt).TotalSeconds < 8.0
                             || childCpuDeltaMs >= 15
-                            || childCpuRatio >= 0.01;
+                            || childCpuRatio >= 0.01
+                            || childHasStreamingIo;
                     }
                     else
                     {
                         // Generic shell/runtime child (node, pwsh, cmd, bash, python):
                         // Do NOT mark idle parent Working for pre-existing idle shells/MCPs;
-                        // active only if newly spawned after agent tracking began OR actively consuming CPU.
+                        // active only if newly spawned after agent tracking began OR actively consuming CPU/I/O.
                         isChildActive = isChildFirstSample
                             ? !agentIsFirstSample
-                            : (childCpuDeltaMs >= 20 && childCpuRatio >= 0.015);
+                            : ((childCpuDeltaMs >= 20 && childCpuRatio >= 0.015) || childHasStreamingIo);
                     }
 
                     if (isChildActive)
@@ -651,7 +765,7 @@ public class ProcessAgentCollector
                 }
             }
 
-            if (depth < 3 && childrenMap.TryGetValue(cPid, out var deeper))
+            if (depth < 4 && childrenMap.TryGetValue(cPid, out var deeper))
             {
                 foreach (var d in deeper)
                 {

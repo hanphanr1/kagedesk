@@ -755,6 +755,76 @@ public class ActorMotionSystemTests
         Assert.Equal(ActorMotionState.AtDesk, motionSystem.GetMotion(1).State);
         Assert.False(motionSystem.IsHandoffActive);
     }
+
+    [Fact]
+    public void Handoff_StripShrinksFromTwoToOne_RecipientDepartsWhileSenderSurvives_RebindsToSlot0AndWalksBackSmoothly()
+    {
+        var motionSystem = new ActorMotionSystem();
+        var now = DateTimeOffset.UtcNow;
+
+        var agents2 = new[]
+        {
+            new AgentSnapshot("recipient-0", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working),
+            new AgentSnapshot("sender-1", "Minato", AgentRole.Coder, "minato", AgentState.Working)
+        };
+        var state2 = new HqState(
+            Agents: agents2,
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: new[] { new HqEvent(1, "handoff", "Task handoff", now, "sender-1", 10.0, "recipient-0") },
+            Timestamp: now);
+
+        const int deskY = 118;
+        // 2-slot taskbar strip layout: slot 0 at x=346 (recipient), slot 1 at x=278 (sender)
+        var slots2 = new SlotBinding[]
+        {
+            new(0, "recipient-0", "tsunade", AgentState.Working, true, 346, deskY),
+            new(1, "sender-1", "minato", AgentState.Working, true, 278, deskY)
+        };
+
+        // Start handoff (StepOut) and advance into WalkingToTarget
+        motionSystem.Update(0.016f, 0.016f, state2, slots2, deskY, deskY, rugOffsetY: 4, enableAmbientStroll: false);
+        Assert.Equal(ActorMotionState.StepOut, motionSystem.GetMotion(1).State);
+        motionSystem.Update(0.36f, 0.38f, state2, slots2, deskY, deskY, rugOffsetY: 4, enableAmbientStroll: false);
+        Assert.Equal(ActorMotionState.WalkingToTarget, motionSystem.GetMotion(1).State);
+        motionSystem.Update(0.15f, 0.53f, state2, slots2, deskY, deskY, rugOffsetY: 4, enableAmbientStroll: false);
+
+        ref readonly var beforeShrink = ref motionSystem.GetMotion(1);
+        int worldXBeforeShrink = beforeShrink.DeskX + beforeShrink.OffsetX;
+
+        // Recipient departs: strip shrinks from 2 slots to 1 slot, moving surviving sender-1 from slot 1 to slot 0 (x=346)
+        var state1 = state2 with { Agents = new[] { agents2[1] } };
+        var slots1 = new SlotBinding[]
+        {
+            new(0, "sender-1", "minato", AgentState.Working, true, 346, deskY)
+        };
+
+        motionSystem.RevalidateActiveMotions(slots1, rugOffsetY: 4);
+        Assert.True(motionSystem.IsHandoffActive);
+        Assert.Equal(0, motionSystem.ActiveHandoffStationIndex);
+        Assert.Equal("sender-1", motionSystem.GetMotion(0).BoundAgentId);
+        // Preserves exact world X across slot rebinding (no snap/teleport)
+        Assert.Equal(worldXBeforeShrink, motionSystem.GetMotion(0).DeskX + motionSystem.GetMotion(0).OffsetX);
+
+        // Next update tick transitions sender smoothly to WalkingBack (NOT abruptly canceled to AtDesk)
+        motionSystem.Update(0.05f, 0.58f, state1, slots1, deskY, deskY, rugOffsetY: 4, enableAmbientStroll: false);
+        ref readonly var walkingBack = ref motionSystem.GetMotion(0);
+        Assert.True(motionSystem.IsHandoffActive);
+        Assert.Equal(ActorMotionState.WalkingBack, walkingBack.State);
+        Assert.False(walkingBack.CarryingScroll);
+
+        // Advance until sender smoothly arrives back at slot 0 desk
+        for (int i = 0; i < 30; i++)
+        {
+            motionSystem.Update(0.1f, 0.68f + i * 0.1f, state1, slots1, deskY, deskY, rugOffsetY: 4, enableAmbientStroll: false);
+        }
+
+        Assert.False(motionSystem.IsHandoffActive);
+        Assert.Equal(ActorMotionState.AtDesk, motionSystem.GetMotion(0).State);
+        Assert.True(motionSystem.GetMotion(0).BehindDesk);
+    }
 }
 
 

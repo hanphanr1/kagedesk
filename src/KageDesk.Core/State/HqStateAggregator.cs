@@ -395,11 +395,10 @@ public class HqStateAggregator
                     var role = payload.Role ?? AgentRole.External;
                     var name = AgentAppearanceRegistry.SanitizeDisplayName(rawName, id, "bridge", role);
 
-                    // Resolve canonical Orca bot persona when pushing Orca bot/worker events
+                    // Resolve canonical Orca bot persona only when no explicit role/provider was supplied
                     if (string.IsNullOrWhiteSpace(payload.Provider) &&
-                        role is AgentRole.External or AgentRole.Clone &&
-                        (AgentAppearanceRegistry.TryMatchCanonicalPersonaName(name, out var canonicalRole, out _) ||
-                         AgentAppearanceRegistry.TryMatchCanonicalPersonaName(id, out canonicalRole, out _)))
+                        !payload.Role.HasValue &&
+                        AgentAppearanceRegistry.TryMatchStructuredWorkerPrefix(name, out var canonicalRole, out _))
                     {
                         role = canonicalRole;
                     }
@@ -512,9 +511,9 @@ public class HqStateAggregator
 
         return type.Trim().ToLowerInvariant() switch
         {
-            "tool_start" or "working" or "start" or "running" => AgentState.Working,
+            "tool_start" or "working" or "start" or "starting" or "running" or "in-progress" or "in_progress" or "busy" or "active" or "streaming" => AgentState.Working,
             "tool_done" or "done" or "pass" or "build_pass" or "success" => AgentState.Done,
-            "notification" or "approval" or "needs_approval" or "waiting_input" => AgentState.NeedsApproval,
+            "notification" or "approval" or "needs_approval" or "needs-approval" or "needs_you" or "needs-you" or "waiting" or "waiting_input" or "waiting-input" or "waiting_for_input" or "waiting-for-input" or "blocked" => AgentState.NeedsApproval,
             "fail" or "failed" or "error" or "build_fail" => AgentState.Failed,
             "idle" or "stop" or "clear" => AgentState.Idle,
             _ => AgentState.Working

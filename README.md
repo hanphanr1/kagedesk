@@ -11,11 +11,17 @@
 | :---: | :---: |
 | ![Shinobi HQ Working](docs/previews/shinobi-hq-working.png) | ![Taskbar Pet Approval](docs/previews/pet-overlay-approve.png) |
 
-## KageDesk v2.0 — Living HQ Showcase
+## KageDesk v2.1.0 — Living HQ Showcase
 
 ![KageDesk Living HQ Demo](docs/previews/kagedesk-demo.gif)
 
-KageDesk turns your Windows desktop and taskbar into a live pixel-art command center for your coding agents. Watch agents type at desks, step out and walk across the rug delivering glowing scrolls during live handoffs, track real-time elapsed timers on long tasks, celebrate completed builds with 8-bit retro chimes, wave urgent approval banners, and record lightweight animated GIFs — all rendered natively in pure C# / Win32 GDI without Electron, WebView2, or browser runtimes.
+KageDesk v2.1.0 turns your Windows desktop and taskbar into a live pixel-art command center for your terminal sessions and multi-worktree pipelines. Watch workers type at desks, step out and walk across the rug delivering glowing scrolls during live handoffs, track real-time elapsed timers on long tasks, unwind with Do Mixi All-Idle Chill Mode when every workspace is quiet, celebrate completed builds with 8-bit retro chimes, wave urgent approval banners, and record lightweight animated GIFs — all rendered natively in pure C# / Win32 GDI without Electron, WebView2, or browser runtimes.
+
+### Highlights in v2.1.0
+- **Do Mixi All-Idle Chill Mode**: Exclusive 2-monitor chill corner on both the live wallpaper and taskbar strip with 5 rotating idle activities (noodles, YouTube, gaming, streaming, karaoke), automatically stepping aside the moment any session becomes active or a handoff begins.
+- **8-Character & 5-Desk-Rig Variety**: Distinct, stable pixel-art character sprites (`dj-synth`, `neko-dev`, `cyber-hacker`, `ronin-dev`, `astro-dev`, `wizard-dev`, `mecha-droid`, `street-gamer`) and custom desk rigs across concurrent terminal sessions.
+- **Living Taskbar Scroll Handoffs**: Smooth foreground walk-and-deliver animations across the taskbar pet strip with accurate foreground click hit-testing and graceful walk-back when slots shift.
+- **Responsive Activity Detection**: Streaming I/O and nested tool-child tracking with PID-reuse-safe process ancestry verification and consistent polling latency.
 
 ---
 

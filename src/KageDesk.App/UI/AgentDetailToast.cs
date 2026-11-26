@@ -74,15 +74,26 @@ public class AgentDetailToast : Form
         catch { }
     }
 
+    public static bool CanOfferFocusWindowAction(AgentSnapshot agent)
+    {
+        if (string.Equals(agent.Source, "process", StringComparison.OrdinalIgnoreCase))
+        {
+            return agent.ProcessId is > 0 && agent.ProcessStartTicks is > 0;
+        }
+
+        return true;
+    }
+
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
 
         if (e.Button == MouseButtons.Left)
         {
-            if (_focusBtnBounds.Contains(e.Location))
+            if (_focusBtnBounds.Contains(e.Location) && CanOfferFocusWindowAction(_agent))
             {
-                if (string.Equals(_agent.Source, "process", StringComparison.OrdinalIgnoreCase) && _agent.ProcessId.HasValue)
+                if (string.Equals(_agent.Source, "process", StringComparison.OrdinalIgnoreCase) &&
+                    _agent.ProcessId is > 0 && _agent.ProcessStartTicks is > 0)
                 {
                     WindowFocuser.TryFocusProcessWindow(_agent.ProcessId.Value, _agent.ProcessStartTicks);
                 }
@@ -197,14 +208,17 @@ public class AgentDetailToast : Form
             g.DrawString(extra, DetailFont, extraBrush, extraRect, sf);
         }
 
-        // [Focus Window] Button
-        using var btnBrush = new SolidBrush(Color.FromArgb(37, 99, 235));
-        using var btnPen = new Pen(Color.FromArgb(96, 165, 250));
-        g.FillRectangle(btnBrush, _focusBtnBounds);
-        g.DrawRectangle(btnPen, _focusBtnBounds);
+        // [Focus Window] Button (only shown when verified process identity or Orca target exists)
+        if (CanOfferFocusWindowAction(_agent))
+        {
+            using var btnBrush = new SolidBrush(Color.FromArgb(37, 99, 235));
+            using var btnPen = new Pen(Color.FromArgb(96, 165, 250));
+            g.FillRectangle(btnBrush, _focusBtnBounds);
+            g.DrawRectangle(btnPen, _focusBtnBounds);
 
-        using var btnTextBrush = new SolidBrush(Color.White);
-        g.DrawString("Focus Window", ButtonFont, btnTextBrush, _focusBtnBounds, centerSf);
+            using var btnTextBrush = new SolidBrush(Color.White);
+            g.DrawString("Focus Window", ButtonFont, btnTextBrush, _focusBtnBounds, centerSf);
+        }
     }
 
     public static string FormatRoleLabel(AgentSnapshot agent)
@@ -239,7 +253,9 @@ public class AgentDetailToast : Form
         {
             string provider = ResolveTerminalProvider(agent);
             string termTitle = provider == "Terminal Agent" ? "Terminal Agent" : $"{provider} Terminal";
-            return agent.ProcessId.HasValue ? $"{termTitle}  |  PID: {agent.ProcessId.Value}" : termTitle;
+            return (agent.ProcessId is > 0 && agent.ProcessStartTicks is > 0)
+                ? $"{termTitle}  |  PID: {agent.ProcessId.Value}"
+                : termTitle;
         }
 
         return !string.IsNullOrEmpty(agent.Repo) ? $"Orca Bot  |  Repo: {agent.Repo}" : "Orca Bot";
@@ -247,7 +263,7 @@ public class AgentDetailToast : Form
 
     public static string ResolveTerminalProvider(AgentSnapshot agent)
     {
-        // Inspect Id and Name BEFORE SpriteKey so randomized visual sprites (e.g. "mixi", "neko-dev")
+        // Inspect Id and Name BEFORE SpriteKey so randomized visual sprites (e.g. "dj-synth", "neko-dev")
         // still accurately identify the underlying terminal CLI provider.
         string[] candidates =
         {

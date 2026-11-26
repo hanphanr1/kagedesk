@@ -67,6 +67,7 @@ public sealed class ActorMotionSystem
     public const int MaxStations = 9;
 
     private readonly ActorMotion[] _motions = new ActorMotion[MaxStations];
+    private readonly ActorMotion[] _rebindScratch = new ActorMotion[MaxStations];
     private long _lastHandledHandoffSeq = -1;
     private float _ambientTimer = 0f;
     private float _nextAmbientCooldown = 26f;
@@ -78,6 +79,19 @@ public sealed class ActorMotionSystem
     public string? ActiveHandoffFromAgentId => _activeHandoffStation >= 0 ? _motions[_activeHandoffStation].BoundAgentId : null;
     public string? ActiveHandoffToAgentId => _activeHandoffStation >= 0 ? _motions[_activeHandoffStation].TargetAgentId : null;
     public long LastHandledHandoffSeq => _lastHandledHandoffSeq;
+
+    public bool HasUnconsumedHandoffEvent(HqState state)
+    {
+        return TryGetPendingHandoffEvent(state, out _);
+    }
+
+    public void MarkHandoffEventHandled(long sequenceId)
+    {
+        if (sequenceId > _lastHandledHandoffSeq)
+        {
+            _lastHandledHandoffSeq = sequenceId;
+        }
+    }
 
     public bool TryGetPendingHandoffEvent(HqState state, out HqEvent handoffEvent)
     {
@@ -109,13 +123,7 @@ public sealed class ActorMotionSystem
     {
         for (int i = 0; i < MaxStations; i++)
         {
-            _motions[i] = new ActorMotion
-            {
-                State = ActorMotionState.AtDesk,
-                BehindDesk = true,
-                FacingRight = true,
-                TargetSlotIndex = -1
-            };
+            _motions[i] = CreateIdleMotion();
         }
         _lastHandledHandoffSeq = -1;
         _ambientTimer = 0f;
@@ -123,11 +131,133 @@ public sealed class ActorMotionSystem
         _activeHandoffStation = -1;
     }
 
+    private static ActorMotion CreateIdleMotion() => new()
+    {
+        State = ActorMotionState.AtDesk,
+        BehindDesk = true,
+        FacingRight = true,
+        TargetSlotIndex = -1
+    };
+
     public ref readonly ActorMotion GetMotion(int stationIndex)
     {
         if ((uint)stationIndex >= MaxStations)
             return ref _motions[0];
         return ref _motions[stationIndex];
+    }
+
+    /// <summary>
+    /// Revalidates and rebinds all active motions by concrete BoundAgentId across slot-index/layout changes
+    /// WITHOUT scanning or consuming any new pending handoff events.
+    /// Returns true if an active handoff was canceled because its sender disappeared.
+    /// </summary>
+    public bool RevalidateActiveMotions(ReadOnlySpan<SlotBinding> slots, int rugOffsetY = 22)
+    {
+        bool anyActive = false;
+        for (int i = 0; i < MaxStations; i++)
+        {
+            if (_motions[i].IsInMotion)
+            {
+                anyActive = true;
+                break;
+            }
+        }
+
+        if (!anyActive)
+        {
+            if (_activeHandoffStation >= 0)
+            {
+                _activeHandoffStation = -1;
+                return true;
+            }
+            return false;
+        }
+
+        for (int i = 0; i < MaxStations; i++)
+        {
+            _rebindScratch[i] = CreateIdleMotion();
+        }
+
+        int newActiveHandoffStation = -1;
+        bool canceledActiveHandoff = false;
+
+        for (int i = 0; i < MaxStations; i++)
+        {
+            if (!_motions[i].IsInMotion) continue;
+
+            ActorMotion m = _motions[i];
+            int targetSlot = -1;
+
+            if (!string.IsNullOrEmpty(m.BoundAgentId))
+            {
+                // Rebind by concrete agent ID even if the strip shrank or reordered slot indices
+                for (int s = 0; s < slots.Length && s < MaxStations; s++)
+                {
+                    if (slots[s].Occupied &&
+                        string.Equals(slots[s].AgentId, m.BoundAgentId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        targetSlot = s;
+                        break;
+                    }
+                }
+            }
+            else if (i < slots.Length && slots[i].Occupied && string.IsNullOrWhiteSpace(slots[i].AgentId))
+            {
+                targetSlot = i;
+            }
+
+            if (targetSlot < 0)
+            {
+                if (_activeHandoffStation == i)
+                {
+                    canceledActiveHandoff = true;
+                }
+                continue;
+            }
+
+            // Preserve world position when home slot coordinates or slot index change (e.g. 2->1 strip shrink)
+            int worldX = m.DeskX + m.OffsetX;
+            int worldY = m.DeskY + m.OffsetY;
+            int newDeskX = slots[targetSlot].CenterX;
+            int newDeskY = slots[targetSlot].DeskY;
+            int newRugY = newDeskY + rugOffsetY;
+
+            if (m.DeskX != newDeskX || m.DeskY != newDeskY || m.RugY != newRugY)
+            {
+                m.DeskX = newDeskX;
+                m.DeskY = newDeskY;
+                m.RugY = newRugY;
+                m.OffsetX = worldX - newDeskX;
+                m.OffsetY = worldY - newDeskY;
+
+                if (m.State == ActorMotionState.WalkingBack ||
+                    (m.State == ActorMotionState.StepBack && Math.Abs(m.OffsetX) > 2))
+                {
+                    m.State = ActorMotionState.WalkingBack;
+                    m.BehindDesk = false;
+                    m.TargetX = worldX;
+                    m.TargetY = worldY;
+                    m.Elapsed = 0f;
+                    float dist = MathF.Abs(m.TargetX - m.DeskX);
+                    m.Duration = m.IsFlashTrail ? 0.6f : Math.Clamp(dist / 70f, 0.45f, 1.4f);
+                    m.FacingRight = m.DeskX >= m.TargetX;
+                }
+            }
+
+            _rebindScratch[targetSlot] = m;
+            if (_activeHandoffStation == i)
+            {
+                newActiveHandoffStation = targetSlot;
+            }
+        }
+
+        for (int i = 0; i < MaxStations; i++)
+        {
+            _motions[i] = _rebindScratch[i];
+        }
+
+        _activeHandoffStation = newActiveHandoffStation;
+        return canceledActiveHandoff;
     }
 
     public void Update(
@@ -139,47 +269,16 @@ public sealed class ActorMotionSystem
         int extraDeskY,
         ParticleSystem? particles = null,
         int rugOffsetY = 22,
-        bool enableAmbientStroll = true)
+        bool enableAmbientStroll = true,
+        bool consumeNewHandoffs = true)
     {
-        // 0. Cancel/reset motion if a moving actor's slot changes or disappears
-        for (int i = 0; i < MaxStations; i++)
-        {
-            if (_motions[i].IsInMotion)
-            {
-                bool cancel = false;
-                if (i >= slots.Length || !slots[i].Occupied)
-                {
-                    cancel = true;
-                }
-                else if (!string.Equals(slots[i].AgentId, _motions[i].BoundAgentId, StringComparison.OrdinalIgnoreCase))
-                {
-                    cancel = true;
-                }
+        // 0. Revalidate & rebind existing motions by concrete agent ID (without consuming new handoff events)
+        bool canceledActiveHandoff = RevalidateActiveMotions(slots, rugOffsetY);
 
-                if (cancel)
-                {
-                    ref var m = ref _motions[i];
-                    m.State = ActorMotionState.AtDesk;
-                    m.BehindDesk = true;
-                    m.OffsetX = 0;
-                    m.OffsetY = 0;
-                    m.CarryingScroll = false;
-                    m.IsFlashTrail = false;
-                    m.BoundAgentId = null;
-                    m.TargetAgentId = null;
-                    m.TargetSlotIndex = -1;
-                    m.TargetBoundBySpriteKey = false;
-                    m.TargetSpriteKey = null;
-                    if (_activeHandoffStation == i)
-                    {
-                        _activeHandoffStation = -1;
-                    }
-                }
-            }
-        }
-
-        // 1. Check for new handoff visual events
-        int newlyStarted = CheckForHandoffEvents(state, slots, coreDeskY, extraDeskY, rugOffsetY);
+        // 1. Check for new handoff visual events ONLY when allowed and not on the same tick an old handoff canceled
+        int newlyStarted = (consumeNewHandoffs && !canceledActiveHandoff)
+            ? CheckForHandoffEvents(state, slots, coreDeskY, extraDeskY, rugOffsetY)
+            : -1;
 
         // 2. Check for ambient idle life stroll
         if (newlyStarted < 0 && enableAmbientStroll)

@@ -562,5 +562,173 @@ public class OrcaSnapshotParserTests
         Assert.Equal("agent-1", agents[0].Id);
         Assert.Equal("agent-2", agents[1].Id);
     }
+
+    [Fact]
+    public void ParseWorktreePs_ProjectAndBranchSlugs_MinatoMigrationAndDocsReviewer_DoNotResolveToCanonicalBots()
+    {
+        var now = DateTimeOffset.UtcNow;
+        const string json = """
+        {
+          "ok": true,
+          "result": {
+            "worktrees": [
+              {
+                "worktreeId": "wt:minato-migration",
+                "repo": "minato-migration",
+                "branch": "feat/minato-migration",
+                "displayName": "minato-migration",
+                "status": "working",
+                "agents": [
+                  {
+                    "address": "orca_session_id:slug-minato",
+                    "state": "working",
+                    "updatedAt": 1795545570739
+                  }
+                ]
+              },
+              {
+                "worktreeId": "wt:docs-reviewer",
+                "repo": "docs-reviewer",
+                "branch": "chore/docs-reviewer",
+                "displayName": "docs-reviewer",
+                "status": "working",
+                "agents": [
+                  {
+                    "address": "orca_session_id:slug-reviewer",
+                    "state": "working",
+                    "updatedAt": 1795545570739
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """;
+
+        var agents = OrcaSnapshotParser.ParseWorktreePs(json, now);
+        Assert.Equal(2, agents.Count);
+
+        var slugMinato = Assert.Single(agents, a => a.Id == "orca_session_id:slug-minato");
+        Assert.Equal(AgentRole.Clone, slugMinato.Role);
+        Assert.NotEqual("minato", slugMinato.SpriteKey);
+
+        var slugReviewer = Assert.Single(agents, a => a.Id == "orca_session_id:slug-reviewer");
+        Assert.Equal(AgentRole.Clone, slugReviewer.Role);
+        Assert.NotEqual("kakashi", slugReviewer.SpriteKey);
+    }
+
+    [Fact]
+    public void ParseWorktreePs_ExplicitRoleKakashi_ResolvesToKakashiReviewer()
+    {
+        var now = DateTimeOffset.UtcNow;
+        const string json = """
+        {
+          "ok": true,
+          "result": {
+            "worktrees": [
+              {
+                "worktreeId": "wt:custom-task",
+                "repo": "kagedesk",
+                "displayName": "custom-task-branch",
+                "status": "working",
+                "agents": [
+                  {
+                    "address": "orca_session_id:explicit-kakashi",
+                    "role": "Kakashi",
+                    "state": "working",
+                    "updatedAt": 1795545570739
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """;
+
+        var agents = OrcaSnapshotParser.ParseWorktreePs(json, now);
+        var kakashi = Assert.Single(agents);
+        Assert.Equal(AgentRole.Reviewer, kakashi.Role);
+        Assert.Equal("kakashi", kakashi.SpriteKey);
+    }
+
+    [Fact]
+    public void ParseWorktreePs_ExplicitAgentName_BeatsWorktreeDisplayName()
+    {
+        var now = DateTimeOffset.UtcNow;
+        const string json = """
+        {
+          "ok": true,
+          "result": {
+            "worktrees": [
+              {
+                "worktreeId": "wt:minato-worktree",
+                "repo": "kagedesk",
+                "displayName": "Minato \u00B7 Main Implementation",
+                "underBot": "Minato (Coder)",
+                "status": "working",
+                "agents": [
+                  {
+                    "address": "orca_session_id:tsunade-helper",
+                    "name": "Tsunade",
+                    "state": "working",
+                    "updatedAt": 1795545570739
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """;
+
+        var agents = OrcaSnapshotParser.ParseWorktreePs(json, now);
+        var tsunade = Assert.Single(agents);
+        Assert.Equal(AgentRole.Tester, tsunade.Role);
+        Assert.Equal("tsunade", tsunade.SpriteKey);
+        Assert.Equal("Tsunade", tsunade.Name);
+    }
+
+    [Theory]
+    [InlineData("starting", AgentState.Working)]
+    [InlineData("in-progress", AgentState.Working)]
+    [InlineData("busy", AgentState.Working)]
+    [InlineData("streaming", AgentState.Working)]
+    [InlineData("waiting-for-input", AgentState.NeedsApproval)]
+    [InlineData("waiting_for_input", AgentState.NeedsApproval)]
+    [InlineData("needs-you", AgentState.NeedsApproval)]
+    [InlineData("needs_you", AgentState.NeedsApproval)]
+    [InlineData("needs-approval", AgentState.NeedsApproval)]
+    [InlineData("blocked", AgentState.NeedsApproval)]
+    public void ParseWorktreePs_UpstreamOrcaLifecycleStates_DoNotMapToIdle(string rawState, AgentState expected)
+    {
+        var now = DateTimeOffset.UtcNow;
+        string json = $$"""
+        {
+          "ok": true,
+          "result": {
+            "worktrees": [
+              {
+                "worktreeId": "wt:lifecycle",
+                "repo": "kagedesk",
+                "displayName": "Minato \u00B7 Lifecycle",
+                "status": "{{rawState}}",
+                "sidebarStatus": "{{rawState}}",
+                "agents": [
+                  {
+                    "address": "orca_session_id:lifecycle-1",
+                    "state": "{{rawState}}",
+                    "updatedAt": 1795545570739
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """;
+
+        var agents = OrcaSnapshotParser.ParseWorktreePs(json, now);
+        var ag = Assert.Single(agents);
+        Assert.Equal(expected, ag.State);
+        Assert.NotEqual(AgentState.Idle, ag.State);
+    }
 }
 

@@ -55,11 +55,15 @@ public sealed class AgentAppearanceRegistry
     }
 
     private static readonly Regex CanonicalPersonaRegex = new(
-        @"(?<![a-z0-9])(shikamaru|kazama|minato|kakashi|tsunade)(?![a-z0-9])",
+        @"(?<![a-z0-9_\-./\\])(shikamaru|kazama|minato|kakashi|tsunade)(?![a-z0-9_\-./\\])",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex StructuredWorkerPrefixRegex = new(
+        @"^\s*(shikamaru|kazama|minato|kakashi|tsunade)(?:\s*$|\s*[\(\u00B7\u2022:\|\u2014\u2013]|\s+-\s+)",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static readonly Regex CanonicalRoleKeywordRegex = new(
-        @"(?<![a-z0-9])(team[\s_-]*leader|team[\s_-]*lead|teamlead|leader|lead|main[\s_-]*coder|coder|reviewer|tester|qa)(?![a-z0-9])",
+        @"(?<![a-z0-9_\-./\\])(team\s+leader|team\s+lead|teamlead|leader|lead|main\s+coder|coder|reviewer|tester|qa)(?![a-z0-9_\-./\\])",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     public static bool TryMatchCanonicalPersonaName(string? text, out AgentRole role, out string spriteKey)
@@ -69,33 +73,106 @@ public sealed class AgentAppearanceRegistry
             var match = CanonicalPersonaRegex.Match(text);
             if (match.Success)
             {
-                string token = match.Groups[1].Value.ToLowerInvariant();
-                switch (token)
-                {
-                    case "shikamaru":
-                    case "kazama":
-                        role = AgentRole.Leader;
-                        spriteKey = "shikamaru";
-                        return true;
-                    case "minato":
-                        role = AgentRole.Coder;
-                        spriteKey = "minato";
-                        return true;
-                    case "kakashi":
-                        role = AgentRole.Reviewer;
-                        spriteKey = "kakashi";
-                        return true;
-                    case "tsunade":
-                        role = AgentRole.Tester;
-                        spriteKey = "tsunade";
-                        return true;
-                }
+                return TryMapCanonicalPersonaToken(match.Groups[1].Value, out role, out spriteKey);
             }
         }
 
         role = default;
         spriteKey = string.Empty;
         return false;
+    }
+
+    public static bool TryMatchStructuredWorkerPrefix(string? text, out AgentRole role, out string spriteKey)
+    {
+        if (!string.IsNullOrWhiteSpace(text))
+        {
+            var match = StructuredWorkerPrefixRegex.Match(text);
+            if (match.Success)
+            {
+                return TryMapCanonicalPersonaToken(match.Groups[1].Value, out role, out spriteKey);
+            }
+        }
+
+        role = default;
+        spriteKey = string.Empty;
+        return false;
+    }
+
+    public static bool TryMatchCanonicalRoleValue(string? roleText, out AgentRole role, out string spriteKey)
+    {
+        if (!string.IsNullOrWhiteSpace(roleText))
+        {
+            string trimmed = roleText.Trim();
+            if (TryMapCanonicalPersonaToken(trimmed, out role, out spriteKey))
+            {
+                return true;
+            }
+
+            string normalized = trimmed.ToLowerInvariant();
+            switch (normalized)
+            {
+                case "leader":
+                case "lead":
+                case "team leader":
+                case "team lead":
+                case "teamlead":
+                case "team_leader":
+                case "team-leader":
+                case "team_lead":
+                case "team-lead":
+                    role = AgentRole.Leader;
+                    spriteKey = "shikamaru";
+                    return true;
+                case "coder":
+                case "main coder":
+                case "main_coder":
+                case "main-coder":
+                    role = AgentRole.Coder;
+                    spriteKey = "minato";
+                    return true;
+                case "reviewer":
+                    role = AgentRole.Reviewer;
+                    spriteKey = "kakashi";
+                    return true;
+                case "tester":
+                case "qa":
+                    role = AgentRole.Tester;
+                    spriteKey = "tsunade";
+                    return true;
+            }
+        }
+
+        role = default;
+        spriteKey = string.Empty;
+        return false;
+    }
+
+    private static bool TryMapCanonicalPersonaToken(string token, out AgentRole role, out string spriteKey)
+    {
+        switch (token.Trim().ToLowerInvariant())
+        {
+            case "shikamaru":
+            case "kazama":
+                role = AgentRole.Leader;
+                spriteKey = "shikamaru";
+                return true;
+            case "minato":
+                role = AgentRole.Coder;
+                spriteKey = "minato";
+                return true;
+            case "kakashi":
+                role = AgentRole.Reviewer;
+                spriteKey = "kakashi";
+                return true;
+            case "tsunade":
+                role = AgentRole.Tester;
+                spriteKey = "tsunade";
+                return true;
+            default:
+                role = default;
+                spriteKey = string.Empty;
+                return false;
+        }
     }
 
     public static bool TryMatchCanonicalRoleKeyword(string? text, out AgentRole role, out string spriteKey)
@@ -139,11 +216,12 @@ public sealed class AgentAppearanceRegistry
     }
 
     /// <summary>
-    /// Resolves a canonical Orca bot (Shikamaru, Minato, Kakashi, Tsunade) across all metadata fields.
+    /// Resolves a canonical Orca bot (Shikamaru, Minato, Kakashi, Tsunade) once from structured Orca metadata.
     /// Priority:
-    /// 1) Explicit persona name on the agent/worker's own DisplayName / Name / ConversationName / AgentId
-    /// 2) Explicit persona name on BotName / Bot / UnderBot / WorktreeId
-    /// 3) Canonical role keyword on Role / DisplayName / Name / ConversationName / BotName / Bot / UnderBot
+    /// 1) Explicit agent metadata (name, displayName prefix, botName, bot, exact role, underBot)
+    /// 2) Worktree explicit role/name and structured worker prefix in displayName (e.g. "Minato · Task")
+    /// 3) Validated owner/parent bot metadata (underBot, botName, bot) and bot-home role titles
+    /// Never matches arbitrary project/branch slugs in displayName or WorktreeId.
     /// </summary>
     public static bool TryResolveCanonicalOrcaBot(
         string? displayName,
@@ -156,34 +234,56 @@ public sealed class AgentAppearanceRegistry
         string? roleText,
         string? worktreeId,
         out AgentRole role,
-        out string spriteKey)
+        out string spriteKey,
+        bool isBotHome = false,
+        string? agentName = null,
+        string? agentDisplayName = null,
+        string? agentBotName = null,
+        string? agentBot = null,
+        string? agentRoleText = null,
+        string? agentUnderBot = null)
     {
-        // Priority 1: Explicit persona name on worker/agent identity itself
-        if (TryMatchCanonicalPersonaName(displayName, out role, out spriteKey) ||
+        // 1. Agent's own explicit metadata FIRST (explicit agent name, bot name, exact role, underBot)
+        if (TryMatchCanonicalPersonaName(agentName, out role, out spriteKey) ||
+            TryMatchCanonicalRoleValue(agentName, out role, out spriteKey) ||
+            TryMatchStructuredWorkerPrefix(agentDisplayName, out role, out spriteKey) ||
+            TryMatchCanonicalPersonaName(agentBotName, out role, out spriteKey) ||
+            TryMatchCanonicalPersonaName(agentBot, out role, out spriteKey) ||
+            TryMatchCanonicalRoleValue(agentRoleText, out role, out spriteKey) ||
+            TryMatchCanonicalRoleKeyword(agentBotName, out role, out spriteKey) ||
+            TryMatchCanonicalRoleKeyword(agentBot, out role, out spriteKey) ||
+            TryMatchCanonicalPersonaName(agentUnderBot, out role, out spriteKey) ||
+            TryMatchCanonicalRoleKeyword(agentUnderBot, out role, out spriteKey))
+        {
+            return true;
+        }
+
+        // 2. Worktree explicit role/name and structured worker prefix (e.g. "Minato · KageDesk v2.1")
+        if (TryMatchCanonicalRoleValue(roleText, out role, out spriteKey) ||
             TryMatchCanonicalPersonaName(name, out role, out spriteKey) ||
-            TryMatchCanonicalPersonaName(conversationName, out role, out spriteKey) ||
-            TryMatchCanonicalPersonaName(agentId, out role, out spriteKey))
+            TryMatchCanonicalRoleValue(name, out role, out spriteKey) ||
+            TryMatchStructuredWorkerPrefix(displayName, out role, out spriteKey))
         {
             return true;
         }
 
-        // Priority 2: Explicit persona name on owner bot / underBot / worktreeId
-        if (TryMatchCanonicalPersonaName(botName, out role, out spriteKey) ||
+        // 3. Validated owner/parent bot metadata (underBot, botName, bot)
+        if (TryMatchCanonicalPersonaName(underBot, out role, out spriteKey) ||
+            TryMatchCanonicalPersonaName(botName, out role, out spriteKey) ||
             TryMatchCanonicalPersonaName(bot, out role, out spriteKey) ||
-            TryMatchCanonicalPersonaName(underBot, out role, out spriteKey) ||
-            TryMatchCanonicalPersonaName(worktreeId, out role, out spriteKey))
+            TryMatchCanonicalRoleKeyword(underBot, out role, out spriteKey) ||
+            TryMatchCanonicalRoleKeyword(botName, out role, out spriteKey) ||
+            TryMatchCanonicalRoleKeyword(bot, out role, out spriteKey))
         {
             return true;
         }
 
-        // Priority 3: Canonical role keywords on explicit role or agent/bot titles
-        if (TryMatchCanonicalRoleKeyword(roleText, out role, out spriteKey) ||
-            TryMatchCanonicalRoleKeyword(displayName, out role, out spriteKey) ||
-            TryMatchCanonicalRoleKeyword(name, out role, out spriteKey) ||
-            TryMatchCanonicalRoleKeyword(conversationName, out role, out spriteKey) ||
-            TryMatchCanonicalRoleKeyword(botName, out role, out spriteKey) ||
-            TryMatchCanonicalRoleKeyword(bot, out role, out spriteKey) ||
-            TryMatchCanonicalRoleKeyword(underBot, out role, out spriteKey))
+        // 4. Bot-home entries may carry role-based display names (e.g. "Senior coder bot", "Code reviewer")
+        if (isBotHome &&
+            (TryMatchCanonicalPersonaName(displayName, out role, out spriteKey) ||
+             TryMatchCanonicalRoleKeyword(displayName, out role, out spriteKey) ||
+             TryMatchCanonicalPersonaName(conversationName, out role, out spriteKey) ||
+             TryMatchCanonicalRoleKeyword(conversationName, out role, out spriteKey)))
         {
             return true;
         }
@@ -203,15 +303,8 @@ public sealed class AgentAppearanceRegistry
             return false;
         }
 
-        // 1. Explicit canonical persona name in Name / Id / WorktreeId (even if upstream tagged Role=Clone)
-        if (TryMatchCanonicalPersonaName(agent.Name, out role, out spriteKey) ||
-            TryMatchCanonicalPersonaName(agent.Id, out role, out spriteKey) ||
-            TryMatchCanonicalPersonaName(agent.WorktreeId, out role, out spriteKey))
-        {
-            return true;
-        }
-
-        // 2. Canonical sprite key already assigned for a non-Clone/External role (or Orca source)
+        // Preserve the parser's authoritative resolved identity end-to-end without reclassifying
+        // from Name, Id, or WorktreeId.
         if (agent.Role is AgentRole.Leader or AgentRole.Coder or AgentRole.Reviewer or AgentRole.Tester)
         {
             bool isOrcaOrDirect =
@@ -232,12 +325,6 @@ public sealed class AgentAppearanceRegistry
                 };
                 return true;
             }
-        }
-
-        // 3. Bot-home entries with canonical role keywords in Name
-        if (agent.IsBotHome && TryMatchCanonicalRoleKeyword(agent.Name, out role, out spriteKey))
-        {
-            return true;
         }
 
         role = default;

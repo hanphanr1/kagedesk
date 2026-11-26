@@ -85,7 +85,7 @@ public class TaskbarPetRendererTests
 
         // 1. Must render approval card with "open_orca" button
         var openOrca = Assert.Single(regions, r => r.ActionId == "open_orca");
-        Assert.NotNull(openOrca);
+        Assert.True(openOrca.Width > 0 && openOrca.Height > 0);
 
         // 2. Must NEVER emit focus_agent: (approval takes priority, never routes to terminal window!)
         Assert.DoesNotContain(regions, r => r.ActionId.StartsWith("focus_agent:", StringComparison.Ordinal));
@@ -178,13 +178,20 @@ public class TaskbarPetRendererTests
         var renderer = new TaskbarPetRenderer();
         using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
 
-        // Case 1: Single process working agent -> emits focus_agent:<id>
+        // Case 1: Single verified process working agent -> emits focus_agent:<id>
         var singleProcessState = MakeState(
-            new AgentSnapshot("proc:omp:abcd1234", "OMP", AgentRole.Coder, "omp", AgentState.Working, Source: "process", ProcessId: 100));
+            new AgentSnapshot("proc:omp:abcd1234", "OMP", AgentRole.Coder, "omp", AgentState.Working, Source: "process", ProcessId: 100, ProcessStartTicks: 1000));
 
         var regions1 = renderer.Render(buf, singleProcessState, ThemePackLoader.BuiltInFallback, 1.0f);
         Assert.Contains(regions1, r => r.ActionId == "focus_agent:proc:omp:abcd1234");
         Assert.DoesNotContain(regions1, r => r.ActionId == "open_orca");
+
+        // Case 1b: Process agent with unverified StartTimeTicks (0 or null) -> MUST NOT emit focus_agent:
+        var unverifiedProcessState = MakeState(
+            new AgentSnapshot("proc:omp:unverified", "OMP", AgentRole.Coder, "omp", AgentState.Working, Source: "process", ProcessId: 100, ProcessStartTicks: 0));
+        var regionsUnverified = renderer.Render(buf, unverifiedProcessState, ThemePackLoader.BuiltInFallback, 1.0f);
+        Assert.DoesNotContain(regionsUnverified, r => r.ActionId.StartsWith("focus_agent:", StringComparison.Ordinal));
+        Assert.Contains(regionsUnverified, r => r.ActionId == "agent:proc:omp:unverified");
 
         // Case 2: Single Orca/non-process working agent -> emits open_orca
         var singleOrcaState = MakeState(
@@ -321,7 +328,7 @@ public class TaskbarPetRendererTests
         foreach (DeskRigKind rig in AgentAppearanceRegistry.RandomizableDeskRigs)
         {
             var state = MakeState(
-                new AgentSnapshot("proc:omp:petrig", "OMP", AgentRole.External, "mixi", AgentState.Working, ToolName: "edit", Source: "process", DeskRig: rig));
+                new AgentSnapshot("proc:omp:petrig", "OMP", AgentRole.External, "dj-synth", AgentState.Working, ToolName: "edit", Source: "process", DeskRig: rig));
 
             renderer.ResetEffects();
             renderer.Render(buf, state, theme, 1.0f);
@@ -625,6 +632,357 @@ public class TaskbarPetRendererTests
         var demoRegions = renderer.Render(buf, demoMixiState, theme, 3.0f, showIdleChill: true, showMixiWhenAllIdle: false);
         Assert.True(renderer.IsMixiChillActive);
         Assert.Contains(demoRegions, r => r.ActionId == "agent:mixi-chill");
+    }
+
+    [Fact]
+    public void Render_IdleMode_MixiDisabled_IdleCanonicalBotRendersMatchingSpriteAndHitTarget()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var bufMinato = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        using var bufTsunade = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+
+        var idleMinato = MakeState(
+            new AgentSnapshot("minato-1", "Minato", AgentRole.Coder, "minato", AgentState.Idle, Source: "orca", IsBotHome: true));
+        var minatoRegions = renderer.Render(bufMinato, idleMinato, theme, 1.0f, showIdleChill: true, showMixiWhenAllIdle: false);
+        Assert.False(renderer.IsMixiChillActive);
+        Assert.Equal("minato", renderer.LastRenderedIdlePrimarySprite);
+        Assert.Contains(minatoRegions, r => r.ActionId == "agent:minato-1");
+
+        var idleTsunade = MakeState(
+            new AgentSnapshot("tsunade-1", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Idle, Source: "orca", IsBotHome: true));
+        var tsunadeRegions = renderer.Render(bufTsunade, idleTsunade, theme, 1.0f, showIdleChill: true, showMixiWhenAllIdle: false);
+        Assert.False(renderer.IsMixiChillActive);
+        Assert.Equal("tsunade", renderer.LastRenderedIdlePrimarySprite);
+        Assert.Contains(tsunadeRegions, r => r.ActionId == "agent:tsunade-1");
+
+        Assert.NotEqual(ComputeChecksum(bufMinato), ComputeChecksum(bufTsunade));
+    }
+
+    [Fact]
+    public void Render_ActiveHandoff_BothEndpointsVanishAndZeroWorkers_ClearsMotionAndUnblocksMixi()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        var handoffState = new HqState(
+            Agents: new[]
+            {
+                new AgentSnapshot("minato-1", "Minato", AgentRole.Coder, "minato", AgentState.Working, Source: "orca"),
+                new AgentSnapshot("tsunade-1", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, Source: "orca")
+            },
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: new[] { new HqEvent(1, "handoff", "Pass tests", now, "minato-1", 10.0, "tsunade-1") },
+            Timestamp: now);
+
+        renderer.Render(buf, handoffState, theme, 0.1f, showIdleChill: true, nowOverride: now, showMixiWhenAllIdle: true);
+        renderer.Render(buf, handoffState, theme, 0.5f, showIdleChill: true, nowOverride: now, showMixiWhenAllIdle: true);
+        Assert.True(renderer.IsHandoffActive);
+        Assert.False(renderer.IsMixiChillActive);
+
+        // Both endpoints vanish leaving 0 working agents -> motion MUST clear cleanly and unblock Mixi!
+        var emptyState = handoffState with { Agents = Array.Empty<AgentSnapshot>(), Mood = HqMood.Calm };
+        renderer.Render(buf, emptyState, theme, 0.6f, showIdleChill: true, nowOverride: now.AddSeconds(0.5), showMixiWhenAllIdle: true);
+
+        Assert.False(renderer.IsHandoffActive);
+        Assert.True(renderer.IsMixiChillActive);
+    }
+
+    [Fact]
+    public void Render_ActiveHandoff_StripShrinksTwoToOneWhenRecipientDeparts_SenderWalksBackSmoothlyToSlot0()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        // Recipient is slot 0 (x=346), Sender is slot 1 (x=278)
+        var handoffState = new HqState(
+            Agents: new[]
+            {
+                new AgentSnapshot("tsunade-0", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, Source: "orca"),
+                new AgentSnapshot("minato-1", "Minato", AgentRole.Coder, "minato", AgentState.Working, Source: "orca")
+            },
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: new[] { new HqEvent(1, "handoff", "Hand off", now, "minato-1", 10.0, "tsunade-0") },
+            Timestamp: now);
+
+        // Advance into WalkingToTarget
+        renderer.Render(buf, handoffState, theme, 0.05f, nowOverride: now);
+        renderer.Render(buf, handoffState, theme, 0.45f, nowOverride: now);
+        renderer.Render(buf, handoffState, theme, 0.60f, nowOverride: now);
+        Assert.True(renderer.IsHandoffActive);
+
+        // Recipient departs, leaving only sender in a 1-slot strip (slot 0)
+        var oneSlotState = handoffState with
+        {
+            Agents = new[]
+            {
+                new AgentSnapshot("minato-1", "Minato", AgentRole.Coder, "minato", AgentState.Working, Source: "orca")
+            }
+        };
+
+        // Immediately after shrink: sender MUST still be actively walking back (NOT abruptly canceled!)
+        renderer.Render(buf, oneSlotState, theme, 0.66f, nowOverride: now);
+        Assert.True(renderer.IsHandoffActive);
+
+        // Advance until walk-back completes cleanly
+        for (int i = 1; i <= 35; i++)
+        {
+            renderer.Render(buf, oneSlotState, theme, 0.66f + i * 0.1f, nowOverride: now.AddSeconds(i * 0.1));
+        }
+
+        Assert.False(renderer.IsHandoffActive);
+        Assert.Contains(renderer.HitRegions, r => r.ActionId == "agent:minato-1");
+    }
+
+    [Fact]
+    public void Render_BackToBackHandoffEvents_FirstEndsOrCancels_SecondEventPrioritizedAndVisiblyAnimated()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        // 8 working agents: event #1 is w1 -> w2; event #2 is w7 -> w8 (initially outside the top-6 strip!)
+        var agents = new List<AgentSnapshot>
+        {
+            new("w1", "Minato", AgentRole.Coder, "minato", AgentState.Working, Source: "orca"),
+            new("w2", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, Source: "orca"),
+            new("w3", "Worker 3", AgentRole.Clone, "dj-synth", AgentState.Working, Source: "orca"),
+            new("w4", "Worker 4", AgentRole.Clone, "neko-dev", AgentState.Working, Source: "orca"),
+            new("w5", "Worker 5", AgentRole.Clone, "cyber-hacker", AgentState.Working, Source: "orca"),
+            new("w6", "Worker 6", AgentRole.Clone, "ronin-dev", AgentState.Working, Source: "orca"),
+            new("w7", "Shikamaru", AgentRole.Leader, "shikamaru", AgentState.Working, Source: "orca"),
+            new("w8", "Kakashi", AgentRole.Reviewer, "kakashi", AgentState.Working, Source: "orca")
+        };
+
+        var state = new HqState(
+            Agents: agents,
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: new[]
+            {
+                new HqEvent(1, "handoff", "First handoff", now, "w1", 20.0, "w2"),
+                new HqEvent(2, "handoff", "Second handoff", now, "w7", 20.0, "w8")
+            },
+            Timestamp: now);
+
+        // Start event #1 (w1 -> w2)
+        renderer.Render(buf, state, theme, 0.05f, nowOverride: now);
+        Assert.True(renderer.IsHandoffActive);
+        Assert.Contains(renderer.HitRegions, r => r.ActionId == "agent:w1");
+        Assert.Contains(renderer.HitRegions, r => r.ActionId == "agent:w2");
+
+        // Advance past event #1 natural completion (or cancellation): event #2 must NOT be dropped against old layout!
+        // Instead, once event #1 finishes, w7 and w8 MUST be prioritized into the visible strip and event #2 MUST animate!
+        bool sawSecondHandoffAnimated = false;
+        for (int step = 1; step <= 60; step++)
+        {
+            float t = 0.05f + step * 0.08f;
+            var regions = renderer.Render(buf, state, theme, t, nowOverride: now.AddSeconds(t));
+            if (renderer.IsHandoffActive &&
+                regions.Any(r => r.ActionId == "agent:w7") &&
+                regions.Any(r => r.ActionId == "agent:w8"))
+            {
+                sawSecondHandoffAnimated = true;
+                break;
+            }
+        }
+
+        Assert.True(sawSecondHandoffAnimated, "Second handoff endpoints (w7, w8) must be prioritized into the visible strip and visibly animated after first handoff completes.");
+
+        // Case B: First handoff cancels mid-flight when sender vanishes -> second event MUST be prioritized and visibly animated!
+        var cancelRenderer = new TaskbarPetRenderer();
+        cancelRenderer.Render(buf, state, theme, 0.05f, nowOverride: now);
+        cancelRenderer.Render(buf, state, theme, 0.45f, nowOverride: now.AddSeconds(0.4));
+        Assert.True(cancelRenderer.IsHandoffActive);
+
+        // Sender w1 disappears mid-handoff while event #2 (w7 -> w8) is pending
+        var afterCancelState = state with { Agents = agents.Where(a => a.Id != "w1").ToList() };
+        var regionsAfterCancel = cancelRenderer.Render(buf, afterCancelState, theme, 0.55f, nowOverride: now.AddSeconds(0.5));
+        Assert.True(cancelRenderer.IsHandoffActive);
+        Assert.Contains(regionsAfterCancel, r => r.ActionId == "agent:w7");
+        Assert.Contains(regionsAfterCancel, r => r.ActionId == "agent:w8");
+    }
+
+    [Fact]
+    public void Render_ActiveHandoffDelivering_OverlapHitTestSelectsForegroundSenderOverRecipient()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        // Slot 0 (x=346): Minato (sender); Slot 1 (x=278): Tsunade (recipient)
+        var handoffState = new HqState(
+            Agents: new[]
+            {
+                new AgentSnapshot("minato-sender", "Minato", AgentRole.Coder, "minato", AgentState.Working, Source: "orca"),
+                new AgentSnapshot("tsunade-recipient", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, Source: "orca")
+            },
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: new[] { new HqEvent(1, "handoff", "Deliver scroll", now, "minato-sender", 10.0, "tsunade-recipient") },
+            Timestamp: now);
+
+        // Advance into Delivering phase where foreground sender stands right next to recipient (overlapping X range)
+        IReadOnlyList<PetHitRegion> regions = Array.Empty<PetHitRegion>();
+        for (int i = 0; i < 20; i++)
+        {
+            float t = 0.05f + i * 0.06f;
+            regions = renderer.Render(buf, handoffState, theme, t, nowOverride: now.AddSeconds(t));
+            var s = regions.FirstOrDefault(r => r.ActionId == "agent:minato-sender");
+            var rcp = regions.FirstOrDefault(r => r.ActionId == "agent:tsunade-recipient");
+            if (s.Width > 0 && rcp.Width > 0)
+            {
+                int overlapLeft = Math.Max(s.X, rcp.X);
+                int overlapRight = Math.Min(s.X + s.Width, rcp.X + rcp.Width);
+                if (overlapRight > overlapLeft)
+                {
+                    int overlapX = (overlapLeft + overlapRight) / 2;
+                    int overlapY = Math.Max(s.Y, rcp.Y) + 10;
+
+                    var hit = renderer.HitTest(overlapX, overlapY);
+                    Assert.True(hit.HasValue);
+                    Assert.Equal("agent:minato-sender", hit.Value.ActionId);
+                    return;
+                }
+            }
+        }
+
+        Assert.Fail("Expected foreground sender and stationary recipient hit regions to overlap during handoff delivery.");
+    }
+
+    [Fact]
+    public void Render_SameCountWorkingSlotReorder_UpdatesHitTargetsImmediately()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+
+        var agentA = new AgentSnapshot("agent-a", "Minato", AgentRole.Coder, "minato", AgentState.Working, Source: "orca");
+        var agentB = new AgentSnapshot("agent-b", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, Source: "orca");
+
+        // Render [A, B]: A at slot 0 (x=346), B at slot 1 (x=278)
+        var stateAB = MakeState(agentA, agentB);
+        renderer.Render(buf, stateAB, theme, 1.0f);
+        Assert.Equal("agent:agent-a", renderer.HitTest(346, 105)?.ActionId);
+        Assert.Equal("agent:agent-b", renderer.HitTest(278, 105)?.ActionId);
+
+        // Reorder with SAME count (2): [B, A] -> hit targets MUST update immediately!
+        var stateBA = stateAB with { Agents = new[] { agentB, agentA } };
+        renderer.Render(buf, stateBA, theme, 1.1f);
+        Assert.Equal("agent:agent-b", renderer.HitTest(346, 105)?.ActionId);
+        Assert.Equal("agent:agent-a", renderer.HitTest(278, 105)?.ActionId);
+    }
+
+    [Theory]
+    [InlineData("starting")]
+    [InlineData("waiting-for-input")]
+    [InlineData("waiting_for_input")]
+    [InlineData("needs_you")]
+    [InlineData("blocked")]
+    public void Render_UpstreamOrcaLifecycleStates_BlockMixiChillMode(string rawState)
+    {
+        var now = DateTimeOffset.UtcNow;
+        string json = $$"""
+        {
+          "ok": true,
+          "result": {
+            "worktrees": [
+              {
+                "worktreeId": "wt:active",
+                "repo": "kagedesk",
+                "displayName": "Minato \u00B7 Active",
+                "status": "{{rawState}}",
+                "agents": [
+                  {
+                    "address": "orca_session_id:active-1",
+                    "state": "{{rawState}}",
+                    "updatedAt": 1795545570739
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """;
+
+        var parsed = KageDesk.Core.Collectors.OrcaSnapshotParser.ParseWorktreePs(json, now);
+        var state = MakeState(parsed.ToArray());
+
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        renderer.Render(buf, state, ThemePackLoader.BuiltInFallback, 1.0f, showIdleChill: true, nowOverride: now, showMixiWhenAllIdle: true);
+
+        Assert.False(renderer.IsMixiChillActive);
+    }
+
+    [Fact]
+    public void Render_AlreadyConsumedHandoffStillWithinExpiry_DoesNotSuppressMixiAfterMotionFinishes()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        // Long-lived handoff event (60s duration) that lingers in PendingVisualEvents after motion completes (~2.5s)
+        var handoffEvt = new HqEvent(42, "handoff", "Quick pass", now, "minato-1", 60.0, "tsunade-1");
+        var workingState = new HqState(
+            Agents: new[]
+            {
+                new AgentSnapshot("minato-1", "Minato", AgentRole.Coder, "minato", AgentState.Working, Source: "orca"),
+                new AgentSnapshot("tsunade-1", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Working, Source: "orca")
+            },
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: new[] { handoffEvt },
+            Timestamp: now);
+
+        // Start and run the handoff motion completely to finish (~3 seconds)
+        for (int i = 0; i < 40; i++)
+        {
+            float t = 0.05f + i * 0.1f;
+            renderer.Render(buf, workingState, theme, t, showIdleChill: true, nowOverride: now.AddSeconds(t), showMixiWhenAllIdle: true);
+        }
+
+        Assert.False(renderer.IsHandoffActive);
+        Assert.False(renderer.HasUnconsumedHandoffEvent(workingState));
+
+        // Now all agents go Idle, while the already-consumed handoffEvt STILL lingers in PendingVisualEvents (well within 60s expiry)
+        var idleWithLingeringEvent = workingState with
+        {
+            Agents = new[]
+            {
+                new AgentSnapshot("minato-1", "Minato", AgentRole.Coder, "minato", AgentState.Idle, Source: "orca"),
+                new AgentSnapshot("tsunade-1", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Idle, Source: "orca")
+            },
+            Mood = HqMood.Calm
+        };
+
+        renderer.Render(buf, idleWithLingeringEvent, theme, 5.0f, showIdleChill: true, nowOverride: now.AddSeconds(5.0), showMixiWhenAllIdle: true);
+        Assert.True(renderer.IsMixiChillActive);
+    }
+
+    [Fact]
+    public void PetHitRegion_IsValueType_ZeroReferenceAllocationPerHitRegion()
+    {
+        Assert.True(typeof(PetHitRegion).IsValueType);
     }
 
     private static long ComputeChecksum(PixelBuffer buf)
