@@ -2123,7 +2123,15 @@ public class V22HooksAndSessionLogTests
                 "warning: plugin api deprecated\n2.1.0",
                 "opencode 2.1.0 (plugin API 1.0.0)",
                 "opencode\n2.1.0",
-                "v2.1"
+                "v2.1",
+                "02.1.0",
+                "2.01.0",
+                "2.1.00",
+                "2.1.0-01",
+                "2.1.0+..",
+                "2.1.0+",
+                "2.1.0-",
+                "2.1.0-.1"
             };
 
             foreach (string raw in invalidOutputs)
@@ -2179,8 +2187,11 @@ public class V22HooksAndSessionLogTests
 
             // 5. Positive sanity checks: strict anchored single-line CLI formats still parse cleanly
             Assert.Equal(OpenCodeVersionProbeOutcome.DetectedV1, HookInstaller.ClassifyOpenCodeVersionOutput("opencode 1.18.29\n").Outcome);
+            Assert.Equal(OpenCodeVersionProbeOutcome.DetectedV1, HookInstaller.ClassifyOpenCodeVersionOutput("1.2.3").Outcome);
+            Assert.Equal(OpenCodeVersionProbeOutcome.DetectedV2, HookInstaller.ClassifyOpenCodeVersionOutput("opencode 2.0.0").Outcome);
             Assert.Equal(OpenCodeVersionProbeOutcome.DetectedV2, HookInstaller.ClassifyOpenCodeVersionOutput("  v2.1.0-beta.1+build.7\r\n").Outcome);
             Assert.Equal(OpenCodeVersionProbeOutcome.DetectedV2, HookInstaller.ClassifyOpenCodeVersionOutput("2.1.0").Outcome);
+            Assert.Equal(OpenCodeVersionProbeOutcome.DetectedV2, HookInstaller.ClassifyOpenCodeVersionOutput("2.1.0-0a.1+01").Outcome);
         }
         finally
         {

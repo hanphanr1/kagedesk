@@ -900,6 +900,7 @@ public class V22MultiMonitorWakeUpMediaAndUiTests
                 openCodeVersionProbe: () => "opencode 2.1.0");
 
             string claudeSettings1 = Path.Combine(fakeHome1, ".claude", "settings.json");
+            File.WriteAllText(claudeSettings1, "{}");
             string codexHooks1 = Path.Combine(fakeHome1, ".codex", "hooks.json");
             string provenancePath1 = installer1.ProvenanceStorePath;
             string provenanceMutexName = KageDesk.Core.Hooks.HookInstaller.ComputeTargetLockMutexName(provenancePath1);

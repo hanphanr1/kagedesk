@@ -85,7 +85,7 @@ public sealed class HookInstaller
     private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan VersionProbeTimeout = TimeSpan.FromSeconds(2);
     private static readonly Regex OpenCodeSemVerRegex = new(
-        @"^(?:opencode[ \t]+)?v?(?<major>[0-9]+)\.(?<minor>[0-9]+)\.(?<patch>[0-9]+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$",
+        @"^(?:opencode[ \t]+)?v?(?<major>0|[1-9][0-9]*)\.(?<minor>0|[1-9][0-9]*)\.(?<patch>0|[1-9][0-9]*)(?:-(?<prerelease>(?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+(?<buildmetadata>[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$",
         RegexOptions.CultureInvariant | RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private static readonly char[] ForbiddenShellChars =
