@@ -12,9 +12,11 @@ public interface IMediaPlaybackProbe
 
 /// <summary>
 /// Ultra-lightweight native Windows now-playing media sync monitor.
-/// Queries Windows Core Audio active render sessions + peak meter scalar (ZERO audio capture,
-/// ZERO external dependencies, ZERO unrelated window-title reads, &lt; 0.1% CPU).
-/// Gracefully degrades to NotPlaying if audio endpoint/service is unavailable.
+/// Serializes all Core Audio probing on a single dedicated MTA background thread (zero overlapping
+/// timer callbacks), gated by a monotonic enableGeneration so stale samples never overwrite newer
+/// state or fire after disable/re-enable.
+/// Queries all active Windows Core Audio render endpoints + scalar peak meter (ZERO audio capture,
+/// ZERO external dependencies, ZERO unrelated window-title reads).
 /// </summary>
 public sealed class MediaSessionMonitor : IDisposable
 {
@@ -22,10 +24,13 @@ public sealed class MediaSessionMonitor : IDisposable
     private readonly int _pollIntervalMs;
     private readonly int _pauseHysteresisTicks;
     private readonly object _lock = new();
+    private readonly AutoResetEvent _wakeSignal = new(false);
 
-    private System.Threading.Timer? _timer;
+    private Thread? _mtaPollThread;
+    private bool _running;
     private bool _enabled;
     private bool _disposed;
+    private long _enableGeneration;
     private int _consecutiveSilentTicks;
     private MediaPlaybackSnapshot _current;
 
@@ -50,16 +55,21 @@ public sealed class MediaSessionMonitor : IDisposable
         get { lock (_lock) return _current; }
     }
 
+    public long EnableGeneration
+    {
+        get { lock (_lock) return _enableGeneration; }
+    }
+
     public event EventHandler<MediaPlaybackSnapshot>? PlaybackChanged;
 
     public MediaSessionMonitor(
         bool enabled = true,
-        int pollIntervalMs = 2000,
+        int pollIntervalMs = 2500,
         int pauseHysteresisTicks = 2,
         IMediaPlaybackProbe? probe = null)
     {
         _probe = probe ?? new CoreAudioMediaPlaybackProbe();
-        _pollIntervalMs = Math.Max(500, pollIntervalMs);
+        _pollIntervalMs = Math.Max(50, pollIntervalMs);
         _pauseHysteresisTicks = Math.Max(1, pauseHysteresisTicks);
         _enabled = enabled;
     }
@@ -69,19 +79,26 @@ public sealed class MediaSessionMonitor : IDisposable
         lock (_lock)
         {
             if (_disposed || !_enabled) return;
-            if (_timer == null)
-            {
-                _timer = new System.Threading.Timer(_ => PollOnce(), null, 300, _pollIntervalMs);
-            }
+            EnsureMtaPollThreadLocked();
+            _wakeSignal.Set();
         }
     }
 
     public void Stop()
     {
+        Thread? threadToJoin = null;
         lock (_lock)
         {
-            _timer?.Dispose();
-            _timer = null;
+            _enableGeneration++;
+            _running = false;
+            threadToJoin = _mtaPollThread;
+            _mtaPollThread = null;
+            try { _wakeSignal.Set(); } catch (ObjectDisposedException) { }
+        }
+
+        if (threadToJoin != null && threadToJoin != Thread.CurrentThread)
+        {
+            try { threadToJoin.Join(TimeSpan.FromSeconds(2)); } catch { }
         }
     }
 
@@ -92,10 +109,10 @@ public sealed class MediaSessionMonitor : IDisposable
         {
             if (_disposed || _enabled == enabled) return;
             _enabled = enabled;
+            _enableGeneration++;
+
             if (!_enabled)
             {
-                _timer?.Dispose();
-                _timer = null;
                 _consecutiveSilentTicks = 0;
                 if (_current.IsPlaying || _current.SourceApp != null)
                 {
@@ -105,8 +122,10 @@ public sealed class MediaSessionMonitor : IDisposable
             }
             else
             {
-                _timer = new System.Threading.Timer(_ => PollOnce(), null, 150, _pollIntervalMs);
+                EnsureMtaPollThreadLocked();
             }
+
+            try { _wakeSignal.Set(); } catch (ObjectDisposedException) { }
         }
 
         if (toEmit.HasValue)
@@ -117,12 +136,14 @@ public sealed class MediaSessionMonitor : IDisposable
 
     public MediaPlaybackSnapshot PollOnce()
     {
+        long capturedGeneration;
         lock (_lock)
         {
             if (_disposed || !_enabled)
             {
                 return default;
             }
+            capturedGeneration = _enableGeneration;
         }
 
         MediaPlaybackSnapshot sample;
@@ -139,7 +160,8 @@ public sealed class MediaSessionMonitor : IDisposable
         MediaPlaybackSnapshot effective;
         lock (_lock)
         {
-            if (_disposed || !_enabled)
+            // Monotonic enableGeneration gate: discard stale sample if disabled, stopped, or toggled mid-probe
+            if (_disposed || !_enabled || capturedGeneration != _enableGeneration)
             {
                 return default;
             }
@@ -172,33 +194,130 @@ public sealed class MediaSessionMonitor : IDisposable
 
         if (toEmit.HasValue)
         {
-            PlaybackChanged?.Invoke(this, toEmit.Value);
+            // Verify generation one final time before notifying listeners
+            bool stillValid;
+            lock (_lock)
+            {
+                stillValid = !_disposed && _enabled && capturedGeneration == _enableGeneration;
+            }
+
+            if (stillValid)
+            {
+                PlaybackChanged?.Invoke(this, toEmit.Value);
+            }
         }
 
         return effective;
     }
 
+    private void EnsureMtaPollThreadLocked()
+    {
+        if (_running && _mtaPollThread != null && _mtaPollThread.IsAlive)
+        {
+            return;
+        }
+
+        _running = true;
+        var thread = new Thread(MtaPollLoop)
+        {
+            Name = "KageDesk.MediaSessionMonitor.MTA",
+            IsBackground = true
+        };
+        if (OperatingSystem.IsWindows())
+        {
+            thread.SetApartmentState(ApartmentState.MTA);
+        }
+
+        _mtaPollThread = thread;
+        thread.Start();
+    }
+
+    private void MtaPollLoop()
+    {
+        // Short initial delay before first probe
+        try
+        {
+            _wakeSignal.WaitOne(Math.Min(250, _pollIntervalMs));
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+
+        while (true)
+        {
+            bool shouldPoll;
+            lock (_lock)
+            {
+                if (_disposed || !_running)
+                {
+                    return;
+                }
+                shouldPoll = _enabled;
+            }
+
+            if (shouldPoll)
+            {
+                PollOnce();
+            }
+
+            int waitMs;
+            lock (_lock)
+            {
+                if (_disposed || !_running)
+                {
+                    return;
+                }
+                waitMs = _enabled ? _pollIntervalMs : Timeout.Infinite;
+            }
+
+            try
+            {
+                _wakeSignal.WaitOne(waitMs);
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
+        }
+    }
+
     public void Dispose()
     {
+        Thread? threadToJoin;
         lock (_lock)
         {
             if (_disposed) return;
             _disposed = true;
-            _timer?.Dispose();
-            _timer = null;
+            _enabled = false;
+            _running = false;
+            _enableGeneration++;
+            threadToJoin = _mtaPollThread;
+            _mtaPollThread = null;
+            try { _wakeSignal.Set(); } catch (ObjectDisposedException) { }
         }
+
+        if (threadToJoin != null && threadToJoin != Thread.CurrentThread)
+        {
+            try { threadToJoin.Join(TimeSpan.FromSeconds(2)); } catch { }
+        }
+
+        _wakeSignal.Dispose();
     }
 }
 
 /// <summary>
 /// Pure native Windows Core Audio session probe (no WinRT packages, no audio capture,
-/// no window-title inspection). Reads only active render session state + peak meter scalar
-/// and maps session process names strictly against a safe media-app allowlist.
+/// no window-title inspection). Enumerates ALL active render endpoints (headphones, HDMI,
+/// speakers, USB DACs) with short-circuit on the first qualifying playing session, and keeps
+/// every raw COM RCW in a strict finally release chain.
 /// </summary>
 public sealed class CoreAudioMediaPlaybackProbe : IMediaPlaybackProbe
 {
     private const float PeakPlayingThreshold = 0.0005f;
     private const int AudioSessionStateActive = 1;
+    private const int ERender = 0;
+    private const uint DeviceStateActive = 0x00000001;
     private static readonly uint OwnPid = (uint)Environment.ProcessId;
 
     private static readonly Dictionary<string, string> KnownMediaApps = new(StringComparer.OrdinalIgnoreCase)
@@ -234,74 +353,101 @@ public sealed class CoreAudioMediaPlaybackProbe : IMediaPlaybackProbe
 
     public MediaPlaybackSnapshot Probe()
     {
-        IMMDeviceEnumerator? enumerator = null;
-        IMMDevice? device = null;
-        IAudioSessionManager2? manager = null;
-        IAudioSessionEnumerator? sessionEnum = null;
+        object? rawEnumeratorObj = null;
+        IMMDeviceCollection? deviceCollection = null;
 
         try
         {
             Type? enumType = Type.GetTypeFromCLSID(ClsidMMDeviceEnumerator, throwOnError: false);
             if (enumType == null) return default;
 
-            enumerator = Activator.CreateInstance(enumType) as IMMDeviceEnumerator;
-            if (enumerator == null) return default;
+            rawEnumeratorObj = Activator.CreateInstance(enumType);
+            if (rawEnumeratorObj is not IMMDeviceEnumerator enumerator)
+                return default;
 
-            // eRender = 0, eMultimedia = 1
-            int hr = enumerator.GetDefaultAudioEndpoint(0, 1, out device);
-            if (hr != 0 || device == null) return default;
+            int hr = enumerator.EnumAudioEndpoints(ERender, DeviceStateActive, out deviceCollection);
+            if (hr != 0 || deviceCollection == null)
+                return default;
 
-            Guid iidManager2 = IidIAudioSessionManager2;
-            hr = device.Activate(ref iidManager2, ClsCtxAll, IntPtr.Zero, out object managerObj);
-            if (hr != 0 || managerObj is not IAudioSessionManager2 mgr) return default;
-            manager = mgr;
-
-            hr = manager.GetSessionEnumerator(out sessionEnum);
-            if (hr != 0 || sessionEnum == null) return default;
-
-            hr = sessionEnum.GetCount(out int count);
-            if (hr != 0 || count <= 0) return default;
+            hr = deviceCollection.GetCount(out uint deviceCount);
+            if (hr != 0 || deviceCount == 0)
+                return default;
 
             string? fallbackAudioSource = null;
-            for (int i = 0; i < count; i++)
+
+            for (uint d = 0; d < deviceCount; d++)
             {
-                IAudioSessionControl? ctrl = null;
+                IMMDevice? device = null;
+                object? rawManagerObj = null;
+                IAudioSessionEnumerator? sessionEnum = null;
+
                 try
                 {
-                    if (sessionEnum.GetSession(i, out ctrl) != 0 || ctrl == null)
+                    if (deviceCollection.Item(d, out device) != 0 || device == null)
                         continue;
 
-                    if (ctrl.GetState(out int state) != 0 || state != AudioSessionStateActive)
+                    Guid iidManager2 = IidIAudioSessionManager2;
+                    hr = device.Activate(ref iidManager2, ClsCtxAll, IntPtr.Zero, out rawManagerObj);
+                    if (hr != 0 || rawManagerObj is not IAudioSessionManager2 manager)
                         continue;
 
-                    uint pid = 0;
-                    if (ctrl is IAudioSessionControl2 ctrl2)
-                    {
-                        if (ctrl2.IsSystemSoundsSession() == 0)
-                            continue;
+                    hr = manager.GetSessionEnumerator(out sessionEnum);
+                    if (hr != 0 || sessionEnum == null)
+                        continue;
 
-                        ctrl2.GetProcessId(out pid);
-                        if (pid == OwnPid)
-                            continue;
-                    }
+                    hr = sessionEnum.GetCount(out int count);
+                    if (hr != 0 || count <= 0)
+                        continue;
 
-                    // Verify actual audio output via OS scalar peak meter (zero audio capture!)
-                    if (ctrl is IAudioMeterInformation meter &&
-                        meter.GetPeakValue(out float peak) == 0 &&
-                        peak > PeakPlayingThreshold)
+                    for (int i = 0; i < count; i++)
                     {
-                        string? knownApp = pid > 0 ? TryResolveAllowlistedApp(pid) : null;
-                        if (knownApp != null)
+                        IAudioSessionControl? ctrl = null;
+                        try
                         {
-                            return new MediaPlaybackSnapshot(true, knownApp);
-                        }
+                            if (sessionEnum.GetSession(i, out ctrl) != 0 || ctrl == null)
+                                continue;
 
-                        fallbackAudioSource ??= "Audio";
+                            if (ctrl.GetState(out int state) != 0 || state != AudioSessionStateActive)
+                                continue;
+
+                            uint pid = 0;
+                            if (ctrl is IAudioSessionControl2 ctrl2)
+                            {
+                                if (ctrl2.IsSystemSoundsSession() == 0)
+                                    continue;
+
+                                ctrl2.GetProcessId(out pid);
+                                if (pid == OwnPid)
+                                    continue;
+                            }
+
+                            // Verify actual audio output via OS scalar peak meter (zero audio capture!)
+                            if (ctrl is IAudioMeterInformation meter &&
+                                meter.GetPeakValue(out float peak) == 0 &&
+                                peak > PeakPlayingThreshold)
+                            {
+                                string? knownApp = pid > 0 ? TryResolveAllowlistedApp(pid) : null;
+                                if (knownApp != null)
+                                {
+                                    // Short-circuit immediately on first qualifying allowlisted media session
+                                    return new MediaPlaybackSnapshot(true, knownApp);
+                                }
+
+                                fallbackAudioSource ??= "Audio";
+                            }
+                        }
+                        finally
+                        {
+                            ReleaseComSafe(ctrl);
+                        }
                     }
                 }
                 finally
                 {
-                    ReleaseComSafe(ctrl);
+                    // Raw activated COM object RCW is ALWAYS released even if cast to IAudioSessionManager2 failed
+                    ReleaseComSafe(sessionEnum);
+                    ReleaseComSafe(rawManagerObj);
+                    ReleaseComSafe(device);
                 }
             }
 
@@ -318,10 +464,8 @@ public sealed class CoreAudioMediaPlaybackProbe : IMediaPlaybackProbe
         }
         finally
         {
-            ReleaseComSafe(sessionEnum);
-            ReleaseComSafe(manager);
-            ReleaseComSafe(device);
-            ReleaseComSafe(enumerator);
+            ReleaseComSafe(deviceCollection);
+            ReleaseComSafe(rawEnumeratorObj);
         }
     }
 
@@ -357,14 +501,21 @@ public sealed class CoreAudioMediaPlaybackProbe : IMediaPlaybackProbe
     [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     private interface IMMDeviceEnumerator
     {
-        [PreserveSig] int EnumAudioEndpoints(int dataFlow, uint stateMask, out IntPtr devices);
+        [PreserveSig] int EnumAudioEndpoints(int dataFlow, uint stateMask, out IMMDeviceCollection? devices);
         [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice? endpoint);
+    }
+
+    [ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IMMDeviceCollection
+    {
+        [PreserveSig] int GetCount(out uint pcDevices);
+        [PreserveSig] int Item(uint nDevice, out IMMDevice? ppDevice);
     }
 
     [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     private interface IMMDevice
     {
-        [PreserveSig] int Activate(ref Guid iid, uint dwClsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object interfacePointer);
+        [PreserveSig] int Activate(ref Guid iid, uint dwClsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object? interfacePointer);
     }
 
     [ComImport, Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]

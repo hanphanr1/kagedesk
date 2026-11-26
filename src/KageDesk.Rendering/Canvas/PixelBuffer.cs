@@ -133,9 +133,11 @@ public sealed class PixelBuffer : IDisposable
         int sr = (straightArgb >> 16) & 0xFF;
         int sg = (straightArgb >> 8) & 0xFF;
         int sb = straightArgb & 0xFF;
-        int srp = (sr * sa + 127) / 255;
-        int sgp = (sg * sa + 127) / 255;
-        int sbp = (sb * sa + 127) / 255;
+        int srp = ColorUtil.Div255(sr * sa);
+        int sgp = ColorUtil.Div255(sg * sa);
+        int sbp = ColorUtil.Div255(sb * sa);
+        int invSa = 255 - sa;
+        int srcPremul = (sa << 24) | (srp << 16) | (sgp << 8) | sbp;
 
         int[] pixels = _pixels;
         int width = Width;
@@ -145,7 +147,25 @@ public sealed class PixelBuffer : IDisposable
             for (int col = x0; col < x1; col++)
             {
                 int idx = rowStart + col;
-                pixels[idx] = ColorUtil.BlendPremultipliedOverPremultiplied(pixels[idx], sa, srp, sgp, sbp);
+                int dstPArgb = pixels[idx];
+                int da = (dstPArgb >> 24) & 0xFF;
+                if (da == 0)
+                {
+                    pixels[idx] = srcPremul;
+                    continue;
+                }
+
+                int oa = sa + ColorUtil.Div255(da * invSa);
+                int or_ = srp + ColorUtil.Div255(((dstPArgb >> 16) & 0xFF) * invSa);
+                int og = sgp + ColorUtil.Div255(((dstPArgb >> 8) & 0xFF) * invSa);
+                int ob = sbp + ColorUtil.Div255((dstPArgb & 0xFF) * invSa);
+
+                if (oa > 255) oa = 255;
+                if (or_ > oa) or_ = oa;
+                if (og > oa) og = oa;
+                if (ob > oa) ob = oa;
+
+                pixels[idx] = (oa << 24) | (or_ << 16) | (og << 8) | ob;
             }
         }
     }

@@ -42,7 +42,7 @@ public sealed class TaskbarPetRenderer
     private readonly List<PetHitRegion> _hitRegions = new(16);
     private readonly ParticleSystem _particles = new();
     private readonly ActorMotionSystem _motionSystem = new();
-    private readonly TeamDramaController _dramaController = new();
+    private readonly TeamDramaController _dramaController;
     private readonly SlotBinding[] _slotBindings = new SlotBinding[6];
     private readonly AgentSnapshot[] _workingScratch = new AgentSnapshot[6];
     private readonly AgentSnapshot[] _celebrateScratch = new AgentSnapshot[4];
@@ -50,6 +50,11 @@ public sealed class TaskbarPetRenderer
     private int _idleTerminalCount = 0;
     private AgentSnapshot? _idlePrimaryNonProcess = null;
     private readonly char[] _textScratch = new char[64];
+
+    public TaskbarPetRenderer(TeamDramaController? sharedDramaController = null)
+    {
+        _dramaController = sharedDramaController ?? new TeamDramaController();
+    }
 
     private struct WorkingCacheItem
     {
@@ -72,6 +77,7 @@ public sealed class TaskbarPetRenderer
     private string? _cachedWorkingMultiLabel;
     private HqState? _lastRenderedState;
     private int _lastStripCount;
+    private int _lastDoneCount;
 
     private ThemePack? _cachedTheme;
     private ResolvedScenePalette _palette;
@@ -84,6 +90,7 @@ public sealed class TaskbarPetRenderer
     public bool IsDramaActive => _dramaController.IsDramaActive;
     public bool IsCelebrationActive => _dramaController.IsCelebrationActive;
     public ActorMotionSystem MotionSystem => _motionSystem;
+    public TeamDramaController DramaController => _dramaController;
     public bool IsMixiChillActive { get; private set; }
     public MixiChillActivity? ActiveMixiActivity { get; private set; }
     public string? ActiveAlertAgentId { get; private set; }
@@ -113,6 +120,7 @@ public sealed class TaskbarPetRenderer
         _emitAccum = 0f;
         _lastRenderedState = null;
         _lastStripCount = 0;
+        _lastDoneCount = 0;
         Array.Clear(_cachedWorkingItems);
         Array.Clear(_cachedCelebrateAgentIds);
         Array.Clear(_cachedCelebrateActionIds);
@@ -170,6 +178,20 @@ public sealed class TaskbarPetRenderer
         if (string.Equals(state.DemoScenario, "mixi", StringComparison.OrdinalIgnoreCase))
         {
             if (_motionSystem.IsHandoffActive) _motionSystem.Reset();
+            _dramaController.Update(
+                dt,
+                timeSeconds,
+                state,
+                ReadOnlySpan<SlotBinding>.Empty,
+                _particles,
+                CanvasWidth,
+                confettiMinX: 160,
+                confettiMaxX: CanvasWidth - 10,
+                confettiTopY: 20,
+                emitTick: emitTick,
+                allowConsumeDrama: false,
+                allowConsumeCelebrate: false,
+                rendererToken: 2);
             RenderMixiChillMode(buf, timeSeconds, isNight, effects);
             _particles.Update(dt);
             _particles.Render(buf);
@@ -270,14 +292,19 @@ public sealed class TaskbarPetRenderer
             }
         }
 
-        // Phase 2b: Check for active/pending review_changes drama event and prioritize Kakashi & Minato into visible strip!
+        // Phase 2b: Check for active/pending review_changes drama event and prioritize bound endpoints into visible strip!
         bool dramaMode = false;
         if (approvalAgent == null && failedAgent == null)
         {
             if (_dramaController.IsDramaActive)
             {
-                AgentSnapshot? dramaFrom = ResolveHandoffAgentInSnapshot(_dramaController.DramaFromAgentId ?? "kakashi", agents, _dramaController.DramaFromIsConcreteId);
-                AgentSnapshot? dramaTo = ResolveHandoffAgentInSnapshot(_dramaController.DramaToAgentId ?? "minato", agents, _dramaController.DramaToIsConcreteId);
+                string fromKey = _dramaController.BoundFromAgentId ?? _dramaController.DramaFromAgentId ?? "kakashi";
+                bool fromConcrete = !string.IsNullOrEmpty(_dramaController.BoundFromAgentId) || _dramaController.DramaFromIsConcreteId;
+                string toKey = _dramaController.BoundTargetAgentId ?? _dramaController.DramaToAgentId ?? "minato";
+                bool toConcrete = !string.IsNullOrEmpty(_dramaController.BoundTargetAgentId) || _dramaController.DramaToIsConcreteId;
+
+                AgentSnapshot? dramaFrom = ResolveHandoffAgentInSnapshot(fromKey, agents, fromConcrete);
+                AgentSnapshot? dramaTo = ResolveHandoffAgentInSnapshot(toKey, agents, toConcrete);
                 if (dramaFrom != null && dramaTo != null)
                 {
                     EnsureAgentInStrip(dramaFrom, dramaTo, ref stripCount);
@@ -333,6 +360,49 @@ public sealed class TaskbarPetRenderer
             RefreshStripCaches(agents, stripCount, totalWorking);
         }
 
+        // Trigger bounded 3s celebration window once on transition into 2+ Done agents
+        if (approvalAgent == null && failedAgent == null && doneCount > 1 && _lastDoneCount <= 1)
+        {
+            _dramaController.StartCelebrationWindow();
+        }
+        _lastDoneCount = doneCount;
+
+        // Build live strip slot bindings once so TeamDramaController runs EXACTLY ONCE per frame across all branches
+        if (stripCount > 0)
+        {
+            BuildStripSlotBindings(stripCount);
+        }
+
+        bool allowConsumeDrama = approvalAgent == null && failedAgent == null && stripCount > 0;
+        bool allowConsumeCelebrate = approvalAgent == null && failedAgent == null;
+        ReadOnlySpan<SlotBinding> dramaSlots = allowConsumeDrama
+            ? _slotBindings.AsSpan(0, stripCount)
+            : ReadOnlySpan<SlotBinding>.Empty;
+
+        int confettiSpanCount = Math.Max(stripCount, Math.Max(doneCount, 1));
+        int confettiSpacing = confettiSpanCount == 2 ? 64 : 46;
+        int confettiMinX = Math.Max(12, 346 - (confettiSpanCount - 1) * confettiSpacing - 24);
+
+        _dramaController.Update(
+            dt,
+            timeSeconds,
+            state,
+            dramaSlots,
+            _particles,
+            CanvasWidth,
+            confettiMinX: confettiMinX,
+            confettiMaxX: CanvasWidth - 10,
+            confettiTopY: 16,
+            emitTick: emitTick,
+            allowConsumeDrama: allowConsumeDrama,
+            allowConsumeCelebrate: allowConsumeCelebrate,
+            rendererToken: 2);
+
+        if (allowConsumeDrama && _dramaController.IsDramaActive)
+        {
+            dramaMode = true;
+        }
+
         bool isSquadCelebrationDemo = string.Equals(state.DemoScenario, "celebrate", StringComparison.OrdinalIgnoreCase);
 
         if (approvalAgent != null)
@@ -349,11 +419,10 @@ public sealed class TaskbarPetRenderer
         }
         else if (isSquadCelebrationDemo || (doneCount > 1))
         {
-            RenderSquadCelebrationMode(buf, state, doneCount, dt, timeSeconds, emitTick, isNight, effects);
+            RenderSquadCelebrationMode(buf, state, doneCount, timeSeconds, emitTick, isNight, effects);
         }
         else if (doneAgent != null)
         {
-            _dramaController.Update(dt, timeSeconds, state, ReadOnlySpan<SlotBinding>.Empty, _particles, CanvasWidth, 140, CanvasWidth - 10, 20, emitTick);
             RenderDoneMode(buf, doneAgent, timeSeconds, emitTick);
         }
         else if (stripCount > 0)
@@ -362,14 +431,21 @@ public sealed class TaskbarPetRenderer
         }
         else if (showIdleChill)
         {
-            _dramaController.Update(dt, timeSeconds, state, ReadOnlySpan<SlotBinding>.Empty, _particles, CanvasWidth, 160, CanvasWidth - 10, 20, emitTick);
             if (_dramaController.IsCelebrationActive && agents.Count > 0)
             {
                 int celCount = Math.Min(4, agents.Count);
                 for (int i = 0; i < celCount; i++) _celebrateScratch[i] = agents[i];
-                RenderSquadCelebrationMode(buf, state, celCount, dt, timeSeconds, emitTick, isNight, effects);
+                RenderSquadCelebrationMode(buf, state, celCount, timeSeconds, emitTick, isNight, effects);
             }
-            else if (MixiChillRenderer.ShouldRenderMixiChillCorner(state, showMixiWhenAllIdle, _motionSystem.IsHandoffActive, _motionSystem.LastHandledHandoffSeq, _dramaController.IsDramaActive))
+            else if (MixiChillRenderer.ShouldRenderMixiChillCorner(
+                state,
+                showMixiWhenAllIdle,
+                _motionSystem.IsHandoffActive,
+                _motionSystem.LastHandledHandoffSeq,
+                _dramaController.IsDramaActive,
+                _dramaController.IsCelebrationActive,
+                _dramaController.LastHandledDramaSeq,
+                _dramaController.LastHandledCelebrateSeq))
             {
                 RenderMixiChillMode(buf, timeSeconds, isNight, effects);
             }
@@ -379,7 +455,7 @@ public sealed class TaskbarPetRenderer
             }
         }
 
-        _dramaController.DrawOverlays(buf, timeSeconds);
+        _dramaController.DrawOverlays(buf, timeSeconds, dramaSlots);
         _particles.Update(dt);
         _particles.Render(buf);
         DrawWakeUpPulse(buf, timeSeconds, effects.WakeUpPulseRemainingSeconds);
@@ -730,7 +806,6 @@ public sealed class TaskbarPetRenderer
         PixelBuffer buf,
         HqState state,
         int count,
-        float dt,
         float timeSeconds,
         bool emitTick,
         bool isNight,
@@ -746,20 +821,9 @@ public sealed class TaskbarPetRenderer
         int spacing = count == 2 ? 64 : 46;
         const int rightmostX = 346;
         int minX = Math.Max(12, rightmostX - (count - 1) * spacing - 24);
+        bool celebrationActive = _dramaController.IsCelebrationActive;
 
-        _dramaController.Update(
-            dt,
-            timeSeconds,
-            state,
-            ReadOnlySpan<SlotBinding>.Empty,
-            _particles,
-            CanvasWidth,
-            confettiMinX: minX,
-            confettiMaxX: CanvasWidth - 10,
-            confettiTopY: 16,
-            emitTick: emitTick);
-
-        if (emitTick && _particles.ActiveCount < 48)
+        if (celebrationActive && emitTick && _particles.ActiveCount < 48)
         {
             _particles.EmitCelebrationConfettiShower(minX, CanvasWidth - 10, 16, 8);
         }
@@ -789,7 +853,7 @@ public sealed class TaskbarPetRenderer
                 timeSeconds,
                 phaseOffset: i,
                 behaviorVariant: ag.BehaviorVariant,
-                celebrationHop: true);
+                celebrationHop: celebrationActive);
 
             int hitCx = Math.Clamp(cx, 18, CanvasWidth - 18);
             if (!string.Equals(_cachedCelebrateAgentIds[i], ag.Id, StringComparison.OrdinalIgnoreCase))
@@ -800,14 +864,14 @@ public sealed class TaskbarPetRenderer
             _hitRegions.Add(new PetHitRegion(_cachedCelebrateActionIds[i]!, hitCx - 16, GroundY - 34, 32, 36, ag.Name));
         }
 
-        // Crisp celebratory emerald/gold banner pill above the hopping squad
-        ReadOnlySpan<char> banner = "SQUAD CELEBRATION!".AsSpan();
+        // Crisp celebratory emerald/gold banner pill above the squad
+        ReadOnlySpan<char> banner = celebrationActive ? "SQUAD CELEBRATION!".AsSpan() : "TASKS COMPLETE!".AsSpan();
         int pillW = Math.Min(150, PixelFont.MeasureWidth(banner, PixelFontSize.Small) + 22);
         int pillH = 17;
         int groupCenterX = rightmostX - ((count - 1) * spacing) / 2;
         int pillX = Math.Clamp(groupCenterX - pillW / 2, 8, CanvasWidth - pillW - 6);
         int pillY = GroundY - 56;
-        int borderCol = (((int)(timeSeconds * 8f)) & 1) == 0 ? ColorEmerald : ColorGold;
+        int borderCol = celebrationActive && (((int)(timeSeconds * 8f)) & 1) == 0 ? ColorGold : ColorEmerald;
 
         buf.BlendRect(pillX + 1, pillY + 1, pillW, pillH, ColorOutline, 135);
         buf.DrawPixelCard(pillX, pillY, pillW, pillH, ColorEmeraldCardBg, borderCol, ColorUtil.WithAlpha(ColorWhite, 42));
@@ -832,9 +896,7 @@ public sealed class TaskbarPetRenderer
         const int rightmostX = 346;
         const int deskCharY = GroundY - 6;
 
-        // 1. Bind visible slots into ActorMotionSystem & TeamDramaController
-        BuildStripSlotBindings(stripCount);
-
+        // 1. Update ActorMotionSystem with already-built live strip slot bindings
         _motionSystem.Update(
             dt,
             timeSeconds,
@@ -846,19 +908,6 @@ public sealed class TaskbarPetRenderer
             rugOffsetY: 4,
             enableAmbientStroll: false,
             consumeNewHandoffs: consumeNewHandoffs);
-
-        int confettiMinX = Math.Max(12, rightmostX - (stripCount - 1) * spacing - 24);
-        _dramaController.Update(
-            dt,
-            timeSeconds,
-            state,
-            _slotBindings.AsSpan(0, stripCount),
-            _particles,
-            CanvasWidth,
-            confettiMinX: confettiMinX,
-            confettiMaxX: CanvasWidth - 10,
-            confettiTopY: 16,
-            emitTick: emitTick);
 
         // 2. Pass 1: Stationary / behind-desk characters + ALL mini-desks
         for (int i = 0; i < stripCount; i++)

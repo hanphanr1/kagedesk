@@ -28,6 +28,12 @@ public record PushedEventPayload(
 public class HqStateAggregator
 {
     private const int MaxCappedItems = 32;
+    public const int MaxVisualEvents = 16;
+    public const int MaxMessageLength = 200;
+    public const double MinVisualEventTtlSeconds = 1.0;
+    public const double MaxVisualEventTtlSeconds = 30.0;
+    public const double MinPushedEntityTtlSeconds = 1.0;
+    public const double MaxPushedEntityTtlSeconds = 300.0;
 
     private readonly object _lock = new();
     private readonly Func<DateTimeOffset> _timeProvider;
@@ -46,6 +52,7 @@ public class HqStateAggregator
     private readonly Dictionary<string, BuildInfo> _collectorBuilds = new(StringComparer.OrdinalIgnoreCase);
     private long _ciGeneration;
     private long _processGeneration;
+    private long _sessionLogGeneration;
 
     private readonly List<HqEvent> _visualEvents = new();
     private readonly Dictionary<string, (AgentSnapshot LastSnapshot, DateTimeOffset EnteredAt)> _departedDoneAgents = new(StringComparer.OrdinalIgnoreCase);
@@ -264,17 +271,66 @@ public class HqStateAggregator
         DisableAndClearProcessAgents();
     }
 
-    public void UpdateSessionLogActivity(IReadOnlyList<AgentSnapshot> agents, double ttlSeconds = 60.0)
+    public long DisableAndClearSessionLogActivity()
+    {
+        HqState? toEmit = null;
+        long newGen;
+        lock (_lock)
+        {
+            newGen = ++_sessionLogGeneration;
+            _sessionLogAgents.Clear();
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
+        }
+
+        return newGen;
+    }
+
+    public long GetSessionLogGeneration()
+    {
+        lock (_lock)
+        {
+            return _sessionLogGeneration;
+        }
+    }
+
+    public bool UpdateSessionLogActivity(
+        IReadOnlyList<AgentSnapshot> agents,
+        double ttlSeconds = 20.0,
+        long? expectedGeneration = null)
     {
         HqState? toEmit = null;
         lock (_lock)
         {
+            if (expectedGeneration.HasValue && expectedGeneration.Value != _sessionLogGeneration)
+            {
+                return false;
+            }
+
             var now = _timeProvider();
-            var expiresAt = now.AddSeconds(Math.Max(5.0, ttlSeconds));
+            double clampedTtl = Math.Clamp(double.IsFinite(ttlSeconds) ? ttlSeconds : 20.0, 2.0, 60.0);
 
             _sessionLogAgents.Clear();
             foreach (var a in agents)
             {
+                // Measure freshness strictly from each observation's own timestamp;
+                // never renew TTL for unchanged older observations when republishing a batch.
+                DateTimeOffset observedAt = a.UpdatedAt ?? a.LastActivityAt ?? now;
+                if (observedAt > now.AddSeconds(5))
+                {
+                    observedAt = now;
+                }
+
+                DateTimeOffset expiresAt = observedAt.AddSeconds(clampedTtl);
+                if (now > expiresAt)
+                {
+                    continue;
+                }
+
                 _sessionLogAgents[a.Id] = (a, expiresAt);
             }
 
@@ -285,22 +341,13 @@ public class HqStateAggregator
         {
             StateChanged?.Invoke(this, toEmit);
         }
+
+        return true;
     }
 
     public void ClearSessionLogActivity()
     {
-        HqState? toEmit = null;
-        lock (_lock)
-        {
-            if (_sessionLogAgents.Count == 0) return;
-            _sessionLogAgents.Clear();
-            toEmit = RecalculateStateLocked();
-        }
-
-        if (toEmit != null)
-        {
-            StateChanged?.Invoke(this, toEmit);
-        }
+        DisableAndClearSessionLogActivity();
     }
 
     public void UpdateCiBuilds(IReadOnlyList<BuildInfo> builds)
@@ -408,6 +455,7 @@ public class HqStateAggregator
         lock (_lock)
         {
             var now = _timeProvider();
+            string? sanitizedMessage = ClampMessage(payload.Message);
 
             // Special-case "handoff" events: do NOT mutate agent list or create phantom agents!
             if (string.Equals(payload.Type, "handoff", StringComparison.OrdinalIgnoreCase))
@@ -415,16 +463,17 @@ public class HqStateAggregator
                 var fromId = payload.FromAgentId ?? payload.AgentId;
                 var toId = payload.ToAgentId;
                 var seq = Interlocked.Increment(ref _sequenceCounter);
-                _visualEvents.Add(new HqEvent(
+                double ttl = ClampVisualTtl(payload.TtlSeconds, 10.0);
+                AddVisualEventLocked(new HqEvent(
                     seq,
                     "handoff",
-                    payload.Message ?? $"Handoff from {fromId} to {toId}",
+                    sanitizedMessage ?? ClampMessage($"Handoff from {fromId} to {toId}")!,
                     now,
                     fromId,
-                    payload.TtlSeconds ?? 10.0,
+                    ttl,
                     toId,
                     payload.FromIsConcreteId,
-                    payload.ToIsConcreteId));
+                    payload.ToIsConcreteId), now);
                 toEmit = RecalculateStateLocked();
             }
             else if (string.Equals(payload.Type, "review_changes", StringComparison.OrdinalIgnoreCase) ||
@@ -436,42 +485,46 @@ public class HqStateAggregator
                     : (!string.IsNullOrWhiteSpace(payload.AgentId) ? payload.AgentId : "kakashi");
                 var toId = !string.IsNullOrWhiteSpace(payload.ToAgentId) ? payload.ToAgentId : "minato";
                 var seq = Interlocked.Increment(ref _sequenceCounter);
-                _visualEvents.Add(new HqEvent(
+                double ttl = ClampVisualTtl(payload.TtlSeconds, 10.0);
+                AddVisualEventLocked(new HqEvent(
                     seq,
                     "review_changes",
-                    payload.Message ?? $"Review REQUEST_CHANGES from {fromId} to {toId}",
+                    sanitizedMessage ?? ClampMessage($"Review REQUEST_CHANGES from {fromId} to {toId}")!,
                     now,
                     fromId,
-                    payload.TtlSeconds ?? 10.0,
+                    ttl,
                     toId,
                     payload.FromIsConcreteId,
-                    payload.ToIsConcreteId));
+                    payload.ToIsConcreteId), now);
                 toEmit = RecalculateStateLocked();
             }
             else if (string.Equals(payload.Type, "celebrate", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(payload.Type, "celebration", StringComparison.OrdinalIgnoreCase) ||
                      string.Equals(payload.Type, "pr_merged", StringComparison.OrdinalIgnoreCase) ||
                      string.Equals(payload.Type, "ci_pass", StringComparison.OrdinalIgnoreCase))
             {
                 var seq = Interlocked.Increment(ref _sequenceCounter);
-                _visualEvents.Add(new HqEvent(
+                double ttl = ClampVisualTtl(payload.TtlSeconds, 8.0);
+                AddVisualEventLocked(new HqEvent(
                     seq,
                     "celebrate",
-                    payload.Message ?? "Squad celebration!",
+                    sanitizedMessage ?? "Squad celebration!",
                     now,
                     payload.AgentId,
-                    payload.TtlSeconds ?? 8.0));
+                    ttl), now);
                 toEmit = RecalculateStateLocked();
             }
             else if (string.Equals(payload.Type, "mixi_poke", StringComparison.OrdinalIgnoreCase))
             {
                 var seq = Interlocked.Increment(ref _sequenceCounter);
-                _visualEvents.Add(new HqEvent(
+                double ttl = ClampVisualTtl(payload.TtlSeconds, 4.0);
+                AddVisualEventLocked(new HqEvent(
                     seq,
                     "mixi_poke",
-                    payload.Message ?? "Do Mixi poked!",
+                    sanitizedMessage ?? "Do Mixi poked!",
                     now,
                     "mixi-chill",
-                    payload.TtlSeconds ?? 4.0));
+                    ttl), now);
                 toEmit = RecalculateStateLocked();
             }
             else
@@ -499,7 +552,7 @@ public class HqStateAggregator
                     // Resolve AgentState: explicit State wins, otherwise map from Type
                     AgentState state = payload.State ?? ResolveStateFromType(payload.Type);
 
-                    var ttl = payload.TtlSeconds ?? 30.0;
+                    var ttl = ClampEntityTtl(payload.TtlSeconds, 30.0);
                     var expiresAt = now.AddSeconds(ttl);
 
                     var spriteKey = role switch
@@ -518,7 +571,7 @@ public class HqStateAggregator
                         SpriteKey: spriteKey,
                         State: state,
                         ToolName: payload.ToolName,
-                        LastMessage: payload.Message,
+                        LastMessage: sanitizedMessage,
                         LastActivityAt: now,
                         UpdatedAt: now,
                         Source: "bridge"
@@ -531,7 +584,7 @@ public class HqStateAggregator
                 if (!string.IsNullOrEmpty(payload.Repo) && !string.IsNullOrEmpty(payload.BuildStatus))
                 {
                     var buildId = $"{payload.Repo}:latest";
-                    var ttl = payload.TtlSeconds ?? 120.0;
+                    var ttl = ClampEntityTtl(payload.TtlSeconds, 120.0);
                     var expiresAt = now.AddSeconds(ttl);
 
                     _pushedBuilds[buildId] = (new BuildInfo(
@@ -539,7 +592,7 @@ public class HqStateAggregator
                         Repo: payload.Repo,
                         WorkflowName: "CI",
                         Branch: "main",
-                        Title: payload.Message ?? "Build Event",
+                        Title: sanitizedMessage ?? "Build Event",
                         Status: "completed",
                         Conclusion: payload.BuildStatus,
                         UpdatedAt: now
@@ -557,7 +610,7 @@ public class HqStateAggregator
                 if (!string.IsNullOrEmpty(payload.AccountProvider))
                 {
                     var accKey = $"{payload.AccountProvider}:{payload.AccountName ?? "default"}";
-                    double ttl = payload.TtlSeconds ?? 300.0;
+                    double ttl = ClampEntityTtl(payload.TtlSeconds, 300.0);
                     var expiresAt = now.AddSeconds(ttl);
 
                     var accountInfo = new AccountInfo(
@@ -598,19 +651,52 @@ public class HqStateAggregator
         }
     }
 
+    public static bool IsKnownHookOrAgentEventType(string? type)
+    {
+        if (string.IsNullOrWhiteSpace(type)) return true;
+        return type.Trim().ToLowerInvariant() switch
+        {
+            "tool_start" or "tool_complete" or "working" or "start" or "starting" or "running" or "in-progress" or "in_progress" or "busy" or "active" or "streaming" => true,
+            "tool_done" or "turn_done" or "turn_complete" or "done" or "pass" or "build_pass" or "success" => true,
+            "notification" or "approval" or "needs_approval" or "needs-approval" or "needs_you" or "needs-you" or "waiting" or "waiting_input" or "waiting-input" or "waiting_for_input" or "waiting-for-input" or "blocked" => true,
+            "fail" or "failed" or "error" or "build_fail" => true,
+            "idle" or "stop" or "clear" => true,
+            _ => false
+        };
+    }
+
     public static AgentState ResolveStateFromType(string? type)
     {
         if (string.IsNullOrWhiteSpace(type)) return AgentState.Working;
 
         return type.Trim().ToLowerInvariant() switch
         {
-            "tool_start" or "working" or "start" or "starting" or "running" or "in-progress" or "in_progress" or "busy" or "active" or "streaming" => AgentState.Working,
-            "tool_done" or "done" or "pass" or "build_pass" or "success" => AgentState.Done,
+            "tool_start" or "tool_complete" or "working" or "start" or "starting" or "running" or "in-progress" or "in_progress" or "busy" or "active" or "streaming" => AgentState.Working,
+            "tool_done" or "turn_done" or "turn_complete" or "done" or "pass" or "build_pass" or "success" => AgentState.Done,
             "notification" or "approval" or "needs_approval" or "needs-approval" or "needs_you" or "needs-you" or "waiting" or "waiting_input" or "waiting-input" or "waiting_for_input" or "waiting-for-input" or "blocked" => AgentState.NeedsApproval,
             "fail" or "failed" or "error" or "build_fail" => AgentState.Failed,
             "idle" or "stop" or "clear" => AgentState.Idle,
             _ => AgentState.Working
         };
+    }
+
+    public static double ClampVisualTtl(double? ttlSeconds, double defaultSeconds)
+    {
+        double raw = ttlSeconds.HasValue && double.IsFinite(ttlSeconds.Value) ? ttlSeconds.Value : defaultSeconds;
+        return Math.Clamp(raw, MinVisualEventTtlSeconds, MaxVisualEventTtlSeconds);
+    }
+
+    public static double ClampEntityTtl(double? ttlSeconds, double defaultSeconds)
+    {
+        double raw = ttlSeconds.HasValue && double.IsFinite(ttlSeconds.Value) ? ttlSeconds.Value : defaultSeconds;
+        return Math.Clamp(raw, MinPushedEntityTtlSeconds, MaxPushedEntityTtlSeconds);
+    }
+
+    public static string? ClampMessage(string? message)
+    {
+        if (message == null) return null;
+        if (message.Length <= MaxMessageLength) return message;
+        return message.Substring(0, MaxMessageLength);
     }
 
     public void Reevaluate()
@@ -641,7 +727,9 @@ public class HqStateAggregator
         {
             var seq = Interlocked.Increment(ref _sequenceCounter);
             var now = _timeProvider();
-            _visualEvents.Add(new HqEvent(seq, type, message, now, agentId, ttlSeconds, targetAgentId, fromIsConcreteId, toIsConcreteId));
+            AddVisualEventLocked(
+                new HqEvent(seq, type, ClampMessage(message) ?? string.Empty, now, agentId, ClampVisualTtl(ttlSeconds, 10.0), targetAgentId, fromIsConcreteId, toIsConcreteId),
+                now);
             toEmit = RecalculateStateLocked();
         }
 
@@ -651,12 +739,41 @@ public class HqStateAggregator
         }
     }
 
+    private void AddVisualEventLocked(HqEvent ev, DateTimeOffset now)
+    {
+        _visualEvents.RemoveAll(e => (now - e.Timestamp).TotalSeconds > e.TtlSeconds);
+
+        // Coalesce duplicate events of the same type + endpoints if queue is approaching cap
+        if (_visualEvents.Count >= MaxVisualEvents)
+        {
+            int dupIdx = _visualEvents.FindIndex(e =>
+                string.Equals(e.Type, ev.Type, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(e.AgentId, ev.AgentId, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(e.TargetAgentId, ev.TargetAgentId, StringComparison.OrdinalIgnoreCase));
+            if (dupIdx >= 0)
+            {
+                _visualEvents.RemoveAt(dupIdx);
+            }
+        }
+
+        _visualEvents.Add(ev);
+
+        while (_visualEvents.Count > MaxVisualEvents)
+        {
+            _visualEvents.RemoveAt(0);
+        }
+    }
+
     private HqState? RecalculateStateLocked()
     {
         var now = _timeProvider();
 
-        // 1. Expire old visual events
+        // 1. Expire old visual events & enforce hard cap
         _visualEvents.RemoveAll(e => (now - e.Timestamp).TotalSeconds > e.TtlSeconds);
+        while (_visualEvents.Count > MaxVisualEvents)
+        {
+            _visualEvents.RemoveAt(0);
+        }
 
         // 2. Expire old pushed agents and pushed builds
         var expiredPushedAgents = _pushedAgents.Where(kv => now > kv.Value.ExpiresAt).Select(kv => kv.Key).ToList();
@@ -683,7 +800,7 @@ public class HqStateAggregator
             return ApplyDemoScenarioLocked(_demoScenario, now);
         }
 
-        // 3. Merge agents: live orca agents + active pushed agents + process agents (with instant session-log override)
+        // 3. Merge agents: live orca agents + active pushed agents + process agents (with verified/unambiguous session-log correlation)
         var mergedAgents = new Dictionary<string, AgentSnapshot>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var a in _orcaAgents.Values)
@@ -692,51 +809,85 @@ public class HqStateAggregator
         foreach (var (_, val) in _pushedAgents)
             mergedAgents[val.Agent.Id] = val.Agent;
 
-        var matchedSessionLogKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
+        var candidateProcesses = new List<AgentSnapshot>(_processAgents.Count);
         foreach (var a in _processAgents.Values)
         {
-            if (mergedAgents.ContainsKey(a.Id))
-                continue;
-
-            var effectiveAgent = a;
-            foreach (var (slKey, (slAgent, _)) in _sessionLogAgents)
+            if (!mergedAgents.ContainsKey(a.Id))
             {
-                if (MatchesSessionProvider(effectiveAgent, slAgent))
+                candidateProcesses.Add(a);
+            }
+        }
+
+        var processOverrides = new Dictionary<string, AgentSnapshot>(StringComparer.OrdinalIgnoreCase);
+        var matchedSessionLogKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (slKey, (slAgent, _)) in _sessionLogAgents)
+        {
+            AgentSnapshot? verifiedMatch = null;
+            AgentSnapshot? singleProviderMatch = null;
+            int providerMatchCount = 0;
+
+            foreach (var proc in candidateProcesses)
+            {
+                if (IsVerifiedSessionCorrelation(proc, slAgent))
                 {
-                    effectiveAgent = effectiveAgent with
-                    {
-                        State = slAgent.State,
-                        ToolName = slAgent.ToolName ?? effectiveAgent.ToolName,
-                        LastActivityAt = slAgent.LastActivityAt ?? effectiveAgent.LastActivityAt,
-                        UpdatedAt = slAgent.UpdatedAt ?? effectiveAgent.UpdatedAt
-                    };
-                    matchedSessionLogKeys.Add(slKey);
+                    verifiedMatch = proc;
                     break;
+                }
+
+                if (MatchesSessionProvider(proc, slAgent))
+                {
+                    providerMatchCount++;
+                    singleProviderMatch = proc;
                 }
             }
 
-            mergedAgents[effectiveAgent.Id] = effectiveAgent;
+            // Correlate ONLY when identity is verified (PID / exact ID / workspace/repo) OR
+            // when exactly ONE process of that provider exists. Never overwrite multiple unrelated processes!
+            AgentSnapshot? targetProc = verifiedMatch ?? (providerMatchCount == 1 ? singleProviderMatch : null);
+            if (targetProc != null && !processOverrides.ContainsKey(targetProc.Id))
+            {
+                processOverrides[targetProc.Id] = targetProc with
+                {
+                    State = slAgent.State,
+                    ToolName = slAgent.ToolName ?? targetProc.ToolName,
+                    LastActivityAt = slAgent.LastActivityAt ?? targetProc.LastActivityAt,
+                    UpdatedAt = slAgent.UpdatedAt ?? targetProc.UpdatedAt
+                };
+                matchedSessionLogKeys.Add(slKey);
+            }
         }
 
-        // Include fresh session-log providers that don't yet have a matching process or pushed agent
+        foreach (var proc in candidateProcesses)
+        {
+            mergedAgents[proc.Id] = processOverrides.TryGetValue(proc.Id, out var enriched) ? enriched : proc;
+        }
+
+        // Include fresh uncorrelated session-log observations as one separate provider activity tile
+        // (unless already represented by an authoritative Orca/pushed agent or matched to a single process above)
         foreach (var (slKey, (slAgent, _)) in _sessionLogAgents)
         {
             if (matchedSessionLogKeys.Contains(slKey))
                 continue;
 
-            bool alreadyRepresented = false;
+            bool alreadyRepresentedByAuthoritative = false;
             foreach (var existing in mergedAgents.Values)
             {
-                if (string.Equals(existing.Id, slAgent.Id, StringComparison.OrdinalIgnoreCase) ||
+                if (string.Equals(existing.Id, slAgent.Id, StringComparison.OrdinalIgnoreCase))
+                {
+                    alreadyRepresentedByAuthoritative = true;
+                    break;
+                }
+
+                if (!string.Equals(existing.Source, "process", StringComparison.OrdinalIgnoreCase) &&
                     MatchesSessionProvider(existing, slAgent))
                 {
-                    alreadyRepresented = true;
+                    alreadyRepresentedByAuthoritative = true;
                     break;
                 }
             }
 
-            if (!alreadyRepresented)
+            if (!alreadyRepresentedByAuthoritative)
             {
                 mergedAgents[slAgent.Id] = slAgent;
             }
@@ -904,7 +1055,7 @@ public class HqStateAggregator
             if (!prevClones.ContainsKey(id))
             {
                 var seq = Interlocked.Increment(ref _sequenceCounter);
-                _visualEvents.Add(new HqEvent(seq, "CloneSpawned", $"{clone.Name} joined", now, id, 8.0));
+                AddVisualEventLocked(new HqEvent(seq, "CloneSpawned", $"{clone.Name} joined", now, id, 8.0), now);
             }
         }
 
@@ -913,7 +1064,7 @@ public class HqStateAggregator
             if (!currClones.ContainsKey(id))
             {
                 var seq = Interlocked.Increment(ref _sequenceCounter);
-                _visualEvents.Add(new HqEvent(seq, "CloneDespawned", $"{clone.Name} exited", now, id, 8.0));
+                AddVisualEventLocked(new HqEvent(seq, "CloneDespawned", $"{clone.Name} exited", now, id, 8.0), now);
             }
         }
 
@@ -930,7 +1081,7 @@ public class HqStateAggregator
                 if (!wasNeedsApproval)
                 {
                     var seq = Interlocked.Increment(ref _sequenceCounter);
-                    _visualEvents.Add(new HqEvent(seq, "ApprovalRaised", $"{ag.Name} needs approval: {ag.QuestionPrompt ?? "Pending question"}", now, ag.Id, 15.0));
+                    AddVisualEventLocked(new HqEvent(seq, "ApprovalRaised", ClampMessage($"{ag.Name} needs approval: {ag.QuestionPrompt ?? "Pending question"}")!, now, ag.Id, 15.0), now);
                 }
             }
 
@@ -950,7 +1101,7 @@ public class HqStateAggregator
                 string toId = coder?.Id ?? "minato";
                 bool toConcrete = coder != null;
                 var seq = Interlocked.Increment(ref _sequenceCounter);
-                _visualEvents.Add(new HqEvent(
+                AddVisualEventLocked(new HqEvent(
                     seq,
                     "review_changes",
                     $"{ag.Name} requested changes from {coder?.Name ?? "Minato"}",
@@ -959,14 +1110,14 @@ public class HqStateAggregator
                     10.0,
                     toId,
                     FromIsConcreteId: true,
-                    ToIsConcreteId: toConcrete));
+                    ToIsConcreteId: toConcrete), now);
             }
         }
 
         if (anyDoneTransition)
         {
             var seq = Interlocked.Increment(ref _sequenceCounter);
-            _visualEvents.Add(new HqEvent(seq, "celebrate", "Task completed! Squad celebration!", now, null, 6.0));
+            AddVisualEventLocked(new HqEvent(seq, "celebrate", "Task completed! Squad celebration!", now, null, 6.0), now);
         }
 
         // Build pass / fail transitions
@@ -978,12 +1129,12 @@ public class HqStateAggregator
             if (b.IsSuccessful && (!hadPrev || !prevB!.IsSuccessful))
             {
                 var seq = Interlocked.Increment(ref _sequenceCounter);
-                _visualEvents.Add(new HqEvent(seq, "BuildPassed", $"Build {b.Repo} passed", now, null, 10.0));
+                AddVisualEventLocked(new HqEvent(seq, "BuildPassed", $"Build {b.Repo} passed", now, null, 10.0), now);
             }
             else if (b.IsFailing && (!hadPrev || !prevB!.IsFailing))
             {
                 var seq = Interlocked.Increment(ref _sequenceCounter);
-                _visualEvents.Add(new HqEvent(seq, "BuildFailed", $"Build {b.Repo} failed", now, null, 12.0));
+                AddVisualEventLocked(new HqEvent(seq, "BuildFailed", $"Build {b.Repo} failed", now, null, 12.0), now);
             }
         }
 
@@ -1014,7 +1165,7 @@ public class HqStateAggregator
                         _lastWorkingStartedAt.Remove(matchB);
                         _lastWorkingFinishedAt.Remove(prevId);
                         var seq = Interlocked.Increment(ref _sequenceCounter);
-                        _visualEvents.Add(new HqEvent(seq, "handoff", $"Handoff from {prevAg.Name} to {matchB}", now, prevId, 10.0, matchB, FromIsConcreteId: true, ToIsConcreteId: true));
+                        AddVisualEventLocked(new HqEvent(seq, "handoff", $"Handoff from {prevAg.Name} to {matchB}", now, prevId, 10.0, matchB, FromIsConcreteId: true, ToIsConcreteId: true), now);
                     }
                 }
             }
@@ -1041,11 +1192,31 @@ public class HqStateAggregator
                         _lastWorkingFinishedAt.Remove(matchA);
                         _lastWorkingStartedAt.Remove(currAg.Id);
                         var seq = Interlocked.Increment(ref _sequenceCounter);
-                        _visualEvents.Add(new HqEvent(seq, "handoff", $"Handoff from {matchA} to {currAg.Name}", now, matchA, 10.0, currAg.Id, FromIsConcreteId: true, ToIsConcreteId: true));
+                        AddVisualEventLocked(new HqEvent(seq, "handoff", $"Handoff from {matchA} to {currAg.Name}", now, matchA, 10.0, currAg.Id, FromIsConcreteId: true, ToIsConcreteId: true), now);
                     }
                 }
             }
         }
+    }
+
+    private static bool IsVerifiedSessionCorrelation(AgentSnapshot candidate, AgentSnapshot sessionAgent)
+    {
+        if (sessionAgent.ProcessId.HasValue && candidate.ProcessId.HasValue &&
+            sessionAgent.ProcessId.Value > 0 &&
+            sessionAgent.ProcessId.Value == candidate.ProcessId.Value)
+        {
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(sessionAgent.Repo) &&
+            !string.IsNullOrWhiteSpace(candidate.Repo) &&
+            string.Equals(sessionAgent.Repo, candidate.Repo, StringComparison.OrdinalIgnoreCase) &&
+            MatchesSessionProvider(candidate, sessionAgent))
+        {
+            return true;
+        }
+
+        return false;
     }
 
     private static bool MatchesSessionProvider(AgentSnapshot candidate, AgentSnapshot sessionAgent)

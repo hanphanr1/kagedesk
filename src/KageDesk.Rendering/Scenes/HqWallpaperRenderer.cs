@@ -56,8 +56,13 @@ public sealed class HqWallpaperRenderer
         ComputeExtraStationPriority(b).CompareTo(ComputeExtraStationPriority(a));
     private readonly ParticleSystem _particles = new();
     private readonly ActorMotionSystem _motionSystem = new();
-    private readonly TeamDramaController _dramaController = new();
+    private readonly TeamDramaController _dramaController;
     private readonly char[] _fmtScratch = new char[48];
+
+    public HqWallpaperRenderer(TeamDramaController? sharedDramaController = null)
+    {
+        _dramaController = sharedDramaController ?? new TeamDramaController();
+    }
 
     private ThemePack? _cachedTheme;
     private ResolvedScenePalette _palette;
@@ -140,7 +145,10 @@ public sealed class HqWallpaperRenderer
             showMixiWhenAllIdle,
             _motionSystem.IsHandoffActive,
             _motionSystem.LastHandledHandoffSeq,
-            _dramaController.IsDramaActive);
+            _dramaController.IsDramaActive,
+            _dramaController.IsCelebrationActive,
+            _dramaController.LastHandledDramaSeq,
+            _dramaController.LastHandledCelebrateSeq);
         IsMixiChillActive = showMixiCorner;
 
         int extraCount;
@@ -233,7 +241,8 @@ public sealed class HqWallpaperRenderer
             confettiMinX: 14,
             confettiMaxX: CanvasWidth - 14,
             confettiTopY: 18,
-            emitTick: emitTick);
+            emitTick: emitTick,
+            rendererToken: 1);
 
         // 5. Row 1: 4 Core Character Workstations
         for (int i = 0; i < 4; i++)
@@ -301,7 +310,7 @@ public sealed class HqWallpaperRenderer
         }
 
         // 7. Render Active Team Drama Overlays (red scroll arc) & Particles on top
-        _dramaController.DrawOverlays(buf, timeSeconds);
+        _dramaController.DrawOverlays(buf, timeSeconds, _slotBindings.AsSpan(0, slotCount));
         _particles.Render(buf);
 
         // 8. Approval Spotlight & Pulsing Amber Border

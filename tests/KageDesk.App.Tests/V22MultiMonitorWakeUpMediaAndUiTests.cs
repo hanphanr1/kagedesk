@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.IO.Pipes;
 using System.Text;
 using System.Windows.Forms;
 using KageDesk.App;
@@ -13,15 +14,18 @@ using Xunit;
 
 namespace KageDesk.App.Tests;
 
+[Collection("WinFormsGdi")]
 public class V22MultiMonitorWakeUpMediaAndUiTests
 {
     private sealed class FakeMediaProbe : IMediaPlaybackProbe
     {
         public MediaPlaybackSnapshot NextSnapshot { get; set; }
         public bool ShouldThrow { get; set; }
+        public Action? OnProbe { get; set; }
 
         public MediaPlaybackSnapshot Probe()
         {
+            OnProbe?.Invoke();
             if (ShouldThrow)
             {
                 throw new InvalidOperationException("Simulated COM audio failure");
@@ -60,64 +64,213 @@ public class V22MultiMonitorWakeUpMediaAndUiTests
     [Fact]
     public void MonitorLayoutHelper_WallpaperVirtualOffset_HandlesNegativeLeftAndTopMonitors()
     {
-        // Secondary monitor positioned to the LEFT of Primary (-1920..0)
+        // Secondary monitor positioned to the LEFT and ABOVE Primary
         var virtualScreen = new Rectangle(-1920, -1080, 3840, 2160);
         var leftMonitor = new Rectangle(-1920, 0, 1920, 1080);
+        var topLeftMonitor = new Rectangle(-1920, -1080, 1920, 1080);
         var primaryMonitor = new Rectangle(0, 0, 1920, 1080);
 
-        var leftOffset = MonitorLayoutHelper.ComputeWallpaperVirtualOffset(leftMonitor, virtualScreen);
-        Assert.Equal(new Rectangle(0, 1080, 1920, 1080), leftOffset);
-
-        var primaryOffset = MonitorLayoutHelper.ComputeWallpaperVirtualOffset(primaryMonitor, virtualScreen);
-        Assert.Equal(new Rectangle(1920, 1080, 1920, 1080), primaryOffset);
+        Assert.Equal(new Rectangle(0, 1080, 1920, 1080), MonitorLayoutHelper.ComputeWallpaperVirtualOffset(leftMonitor, virtualScreen));
+        Assert.Equal(new Rectangle(0, 0, 1920, 1080), MonitorLayoutHelper.ComputeWallpaperVirtualOffset(topLeftMonitor, virtualScreen));
+        Assert.Equal(new Rectangle(1920, 1080, 1920, 1080), MonitorLayoutHelper.ComputeWallpaperVirtualOffset(primaryMonitor, virtualScreen));
     }
 
     [Fact]
-    public void MonitorLayoutHelper_TaskbarDocking_AdaptsToBottomTopAndSecondaryMonitorEdges()
+    public void MonitorLayoutHelper_TaskbarDocking_AllFourEdgesNegativeCoordinatesAndDpiScaling()
     {
-        // Secondary monitor on right with bottom taskbar (40px)
-        var monBounds = new Rectangle(1920, 0, 2560, 1440);
-        var bottomWork = new Rectangle(1920, 0, 2560, 1400);
-        var dockedBottom = MonitorLayoutHelper.ComputeTaskbarDockedBounds(monBounds, bottomWork, 768, 256, relativeX: 200);
-        Assert.Equal(2120, dockedBottom.Left);
-        Assert.Equal(1400 - 256, dockedBottom.Top);
+        // Negative-X/Y secondary monitor with Bottom taskbar
+        var negBounds = new Rectangle(-1920, -1080, 1920, 1080);
+        var negBottomWork = new Rectangle(-1920, -1080, 1920, 1040);
+        Assert.Equal(TaskbarEdge.Bottom, MonitorLayoutHelper.DetectTaskbarEdge(negBounds, negBottomWork));
+        var dockedNegBottom = MonitorLayoutHelper.ComputeTaskbarDockedBounds(negBounds, negBottomWork, 768, 256, relativeX: 120);
+        Assert.Equal(-1800, dockedNegBottom.Left);
+        Assert.Equal(-40 - 256, dockedNegBottom.Top);
 
         // Top taskbar (40px at top)
+        var monBounds = new Rectangle(1920, 0, 2560, 1440);
         var topWork = new Rectangle(1920, 40, 2560, 1400);
+        Assert.Equal(TaskbarEdge.Top, MonitorLayoutHelper.DetectTaskbarEdge(monBounds, topWork));
         var dockedTop = MonitorLayoutHelper.ComputeTaskbarDockedBounds(monBounds, topWork, 768, 256, relativeX: 9999);
-        Assert.Equal(topWork.Right - 768, dockedTop.Left); // clamped safely inside work area
+        Assert.Equal(topWork.Right - 768, dockedTop.Left);
         Assert.Equal(40, dockedTop.Top);
 
-        // Point-to-monitor resolution across virtual desktop
+        // Left taskbar (64px on left)
+        var leftWork = new Rectangle(1984, 0, 2496, 1440);
+        Assert.Equal(TaskbarEdge.Left, MonitorLayoutHelper.DetectTaskbarEdge(monBounds, leftWork));
+        var dockedLeft = MonitorLayoutHelper.ComputeTaskbarDockedBounds(monBounds, leftWork, 768, 256);
+        Assert.Equal(leftWork.Left, dockedLeft.Left);
+        Assert.Equal(leftWork.Bottom - 256, dockedLeft.Top);
+
+        // Right taskbar (64px on right)
+        var rightWork = new Rectangle(1920, 0, 2496, 1440);
+        Assert.Equal(TaskbarEdge.Right, MonitorLayoutHelper.DetectTaskbarEdge(monBounds, rightWork));
+        var dockedRight = MonitorLayoutHelper.ComputeTaskbarDockedBounds(monBounds, rightWork, 768, 256);
+        Assert.Equal(rightWork.Right - 768, dockedRight.Left);
+        Assert.Equal(rightWork.Bottom - 256, dockedRight.Top);
+
+        // DPI scaling: 100% (96 DPI) vs 150% (144 DPI)
+        Assert.Equal(new Size(384, 128), MonitorLayoutHelper.ComputeDpiScaledPetSize(384, 128, 1, 96));
+        Assert.Equal(new Size(576, 192), MonitorLayoutHelper.ComputeDpiScaledPetSize(384, 128, 1, 144));
+        Assert.Equal(new Size(768, 256), MonitorLayoutHelper.ComputeDpiScaledPetSize(384, 128, 2, 96));
+        Assert.Equal(new Size(1152, 384), MonitorLayoutHelper.ComputeDpiScaledPetSize(384, 128, 2, 144));
+
+        // Point-to-monitor resolution across negative & positive monitors
         var monitors = new[]
         {
+            new MonitorDescriptor(@"\\.\DISPLAY_NEG", false, negBounds, negBottomWork, 96),
             new MonitorDescriptor(@"\\.\DISPLAY1", true, new Rectangle(0, 0, 1920, 1080), new Rectangle(0, 0, 1920, 1040), 96),
-            new MonitorDescriptor(@"\\.\DISPLAY2", false, monBounds, bottomWork, 144)
+            new MonitorDescriptor(@"\\.\DISPLAY2", false, monBounds, topWork, 144)
         };
+        Assert.Equal(@"\\.\DISPLAY_NEG", MonitorLayoutHelper.ResolveMonitorAtPoint(monitors, new Point(-1000, -500)).DeviceName);
         Assert.Equal(@"\\.\DISPLAY2", MonitorLayoutHelper.ResolveMonitorAtPoint(monitors, new Point(2500, 1200)).DeviceName);
         Assert.Equal(@"\\.\DISPLAY1", MonitorLayoutHelper.ResolveMonitorAtPoint(monitors, new Point(500, 900)).DeviceName);
     }
 
     [Fact]
-    public void SingleInstanceWakeUp_UiDispatcherFormReceivesMessageAndRaisesEvent()
+    public void Win32WallpaperBridge_TryResolveMappedRect_DistinguishesZeroDisplacementFromWin32Error()
     {
-        Assert.NotEqual(0u, SingleInstanceWakeUp.MessageId);
+        var raw = new Win32Interop.RECT { Left = 10, Top = 20, Right = 1930, Bottom = 1100 };
 
-        using var form = new UiDispatcherForm();
-        _ = form.Handle;
-        Assert.Equal(SingleInstanceWakeUp.DispatcherWindowTitle, form.Text);
+        // MapWindowPoints returns 0 with LastError == 0 -> valid zero displacement!
+        Assert.True(Win32WallpaperBridge.TryResolveMappedRect(0, 0, raw, out var mappedZero));
+        Assert.Equal(new Rectangle(10, 20, 1920, 1080), mappedZero);
 
-        bool wokeUp = false;
-        form.WakeUpRequested += () => wokeUp = true;
+        // MapWindowPoints returns 0 with non-zero Win32 error -> failure!
+        Assert.False(Win32WallpaperBridge.TryResolveMappedRect(0, 1400, raw, out _));
 
-        Assert.True(SingleInstanceWakeUp.TrySignalRunningInstance(form.Handle));
-        for (int i = 0; i < 20 && !wokeUp; i++)
+        // Non-zero displacement -> valid mapped rectangle
+        Assert.True(Win32WallpaperBridge.TryResolveMappedRect(0x00010001, 0, raw, out var mappedShift));
+        Assert.Equal(new Rectangle(10, 20, 1920, 1080), mappedShift);
+    }
+
+    [Fact]
+    public void DesktopOcclusionMonitor_DualMonitorSplit_WallpaperOcclusionVsFullscreenGameDnd()
+    {
+        var mon1 = new Rectangle(0, 0, 1920, 1080);
+        var mon2 = new Rectangle(1920, 0, 2560, 1440);
+        var monitors = new[]
         {
-            Application.DoEvents();
-            Thread.Sleep(10);
-        }
+            new MonitorDescriptor(@"\\.\DISPLAY1", true, mon1, new Rectangle(0, 0, 1920, 1040)),
+            new MonitorDescriptor(@"\\.\DISPLAY2", false, mon2, new Rectangle(1920, 0, 2560, 1400))
+        };
 
-        Assert.True(wokeUp);
+        // Case 1: Maximized browser on Monitor 1 (wallpaper monitor) while Pet is on Monitor 2
+        // -> Wallpaper occluded = true, Fullscreen Game DND = false!
+        var browserWin = new WindowSnapshot(new IntPtr(100), 9999, "Chrome_WidgetWin_1", IsVisible: true, IsIconic: false, IsCloaked: false, ExStyle: 0, Bounds: new Rectangle(0, 0, 1920, 1040));
+        var (wpOcc1, gameDnd1) = DesktopOcclusionMonitor.EvaluateDualMonitorOcclusionAndDnd(
+            monitors,
+            wallpaperMonitorDeviceName: @"\\.\DISPLAY1",
+            petMonitorDeviceName: @"\\.\DISPLAY2",
+            quns: Win32Interop.QUERY_USER_NOTIFICATION_STATE.QUNS_ACCEPTS_NOTIFICATIONS,
+            windows: new[] { browserWin },
+            ownPid: 1234);
+        Assert.True(wpOcc1);
+        Assert.False(gameDnd1);
+
+        // Case 2: Fullscreen game covering Monitor 2 (pet monitor) while Wallpaper is on Monitor 1
+        // -> Wallpaper occluded = false, Fullscreen Game DND = true!
+        var gameWin = new WindowSnapshot(new IntPtr(200), 8888, "UnrealWindow", IsVisible: true, IsIconic: false, IsCloaked: false, ExStyle: 0, Bounds: mon2);
+        var (wpOcc2, gameDnd2) = DesktopOcclusionMonitor.EvaluateDualMonitorOcclusionAndDnd(
+            monitors,
+            wallpaperMonitorDeviceName: @"\\.\DISPLAY1",
+            petMonitorDeviceName: @"\\.\DISPLAY2",
+            quns: Win32Interop.QUERY_USER_NOTIFICATION_STATE.QUNS_BUSY,
+            windows: new[] { gameWin },
+            ownPid: 1234);
+        Assert.False(wpOcc2);
+        Assert.True(gameDnd2);
+
+        // Case 3: OS reports QUNS_RUNNING_D_3D_FULL_SCREEN -> Game DND = true even without matching rect
+        var (_, gameDnd3) = DesktopOcclusionMonitor.EvaluateDualMonitorOcclusionAndDnd(
+            monitors,
+            wallpaperMonitorDeviceName: @"\\.\DISPLAY1",
+            petMonitorDeviceName: @"\\.\DISPLAY2",
+            quns: Win32Interop.QUERY_USER_NOTIFICATION_STATE.QUNS_RUNNING_D_3D_FULL_SCREEN,
+            windows: Array.Empty<WindowSnapshot>(),
+            ownPid: 1234);
+        Assert.True(gameDnd3);
+
+        // Case 4: QUNS_BUSY without any covering window -> Game DND = false
+        var (_, gameDnd4) = DesktopOcclusionMonitor.EvaluateDualMonitorOcclusionAndDnd(
+            monitors,
+            wallpaperMonitorDeviceName: @"\\.\DISPLAY1",
+            petMonitorDeviceName: @"\\.\DISPLAY2",
+            quns: Win32Interop.QUERY_USER_NOTIFICATION_STATE.QUNS_BUSY,
+            windows: Array.Empty<WindowSnapshot>(),
+            ownPid: 1234);
+        Assert.False(gameDnd4);
+    }
+
+    [Fact]
+    public async Task SingleInstanceWakeUp_NamedPipeAcl_SignalsRateLimitsRejectsInvalidOpcodeAndRetriesStartupRace()
+    {
+        string pipeName = $"KageDesk_TestWake_{Guid.NewGuid():N}";
+        int wakeCount = 0;
+        using var wokeSignal = new ManualResetEventSlim(false);
+        var now = new DateTimeOffset(2026, 4, 10, 12, 0, 0, TimeSpan.Zero);
+
+        using var server = new SingleInstanceWakeUpServer(
+            onWakeUp: () =>
+            {
+                Interlocked.Increment(ref wakeCount);
+                wokeSignal.Set();
+            },
+            pipeName: pipeName,
+            rateLimitWindow: TimeSpan.FromSeconds(2),
+            clock: () => now);
+
+        // 1. Bounded client retry handles startup race (client starts ~120ms before server starts)
+        using var clientEntered = new ManualResetEventSlim(false);
+        var raceClientTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var clientThread = new Thread(() =>
+        {
+            clientEntered.Set();
+            try
+            {
+                bool ok = SingleInstanceWakeUp.TrySignalRunningInstance(pipeName, maxRetryWindow: TimeSpan.FromMilliseconds(2500));
+                raceClientTcs.TrySetResult(ok);
+            }
+            catch (Exception ex)
+            {
+                raceClientTcs.TrySetException(ex);
+            }
+        })
+        { IsBackground = true };
+        clientThread.Start();
+
+        Assert.True(clientEntered.Wait(TimeSpan.FromSeconds(2)));
+        Thread.Sleep(120);
+        server.Start();
+
+        bool delivered = await raceClientTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(delivered, $"TrySignalRunningInstance returned false. Server LastListenException={server.LastListenException}");
+        Assert.True(wokeSignal.Wait(TimeSpan.FromSeconds(2)));
+        Assert.Equal(1, Volatile.Read(ref wakeCount));
+
+        // 2. Second immediate signal within 2s rate-limit window is ACKed without double-triggering UI wake-up
+        Assert.True(SingleInstanceWakeUp.TrySignalRunningInstance(pipeName, maxRetryWindow: TimeSpan.FromMilliseconds(1000)));
+        await Task.Delay(80);
+        Assert.Equal(1, Volatile.Read(ref wakeCount));
+
+        // 3. Invalid opcode is rejected (does NOT trigger callback!)
+        now = now.AddSeconds(5);
+        using (var badClient = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut))
+        {
+            badClient.Connect(1000);
+            byte[] badOpcode = Encoding.ASCII.GetBytes("BAD_OP00");
+            badClient.Write(badOpcode, 0, badOpcode.Length);
+            badClient.Flush();
+            int ack = badClient.ReadByte();
+            Assert.NotEqual(1, ack);
+        }
+        await Task.Delay(80);
+        Assert.Equal(1, Volatile.Read(ref wakeCount));
+
+        // 4. After rate-limit window passes, valid wake-up fires again!
+        wokeSignal.Reset();
+        Assert.True(SingleInstanceWakeUp.TrySignalRunningInstance(pipeName, maxRetryWindow: TimeSpan.FromMilliseconds(1000)));
+        Assert.True(wokeSignal.Wait(TimeSpan.FromSeconds(2)));
+        Assert.Equal(2, Volatile.Read(ref wakeCount));
     }
 
     [Fact]
@@ -139,7 +292,47 @@ public class V22MultiMonitorWakeUpMediaAndUiTests
     }
 
     [Fact]
-    public void PetOverlayForm_MixiPokeAndQuickActivityMenu_WorkEndToEnd()
+    public void PetOverlayForm_PerMonitorDpiChangeAndPrimaryDragMarkerAlignment()
+    {
+        using var petForm = new PetOverlayForm(
+            ThemePackLoader.BuiltInFallback,
+            initialScale: 1,
+            idleMode: "chill",
+            showMixiWhenAllIdle: true);
+
+        _ = petForm.Handle;
+
+        // Apply 150% DPI (144 DPI) -> DIB surface & form bounds resize to 576x192!
+        Assert.True(petForm.ApplyDpiChangeForTest(144));
+        Assert.Equal(144, petForm.CurrentDpi);
+        Assert.Equal(new Size(576, 192), petForm.DibSurfaceSizeForTest);
+        Assert.Equal(576, petForm.Width);
+        Assert.Equal(192, petForm.Height);
+
+        // Hit-test mapping scales 576x192 client point back to 384x128 canvas accurately
+        Point mapped = petForm.MapClientToCanvas(288, 96);
+        Assert.Equal(new Point(192, 64), mapped);
+
+        // RenderAndPresent at 150% DPI succeeds cleanly via BlitNearestNeighborScaledFrom
+        petForm.RenderAndPresent();
+
+        // Drag drop onto primary monitor persists "" (empty marker) aligned with live MonitorDeviceName == null
+        string? persistedDevice = "unset";
+        petForm.PetPlacementChanged += (dev, _, _) => persistedDevice = dev;
+
+        var primaryMon = new MonitorDescriptor(@"\\.\DISPLAY1", IsPrimary: true, new Rectangle(0, 0, 1920, 1080), new Rectangle(0, 0, 1920, 1040), 96);
+        petForm.CommitDropPlacement(primaryMon, 400);
+        Assert.Null(petForm.MonitorDeviceName);
+        Assert.Equal("", persistedDevice);
+
+        var secondaryMon = new MonitorDescriptor(@"\\.\DISPLAY2", IsPrimary: false, new Rectangle(1920, 0, 2560, 1440), new Rectangle(1920, 0, 2560, 1400), 144);
+        petForm.CommitDropPlacement(secondaryMon, 2100);
+        Assert.Equal(@"\\.\DISPLAY2", petForm.MonitorDeviceName);
+        Assert.Equal(@"\\.\DISPLAY2", persistedDevice);
+    }
+
+    [Fact]
+    public void PetOverlayForm_MixiPokeAndQuickActivityMenu_RapidReopenSafeAndDetachesWhenIneligible()
     {
         using var petForm = new PetOverlayForm(
             ThemePackLoader.BuiltInFallback,
@@ -154,10 +347,37 @@ public class V22MultiMonitorWakeUpMediaAndUiTests
         petForm.MixiPoked += () => poked = true;
 
         var mixiHit = petForm.CurrentHitRegions.First(h => h.ActionId == "agent:mixi-chill");
-        petForm.SimulateMouseDown(mixiHit.X + mixiHit.Width / 2, mixiHit.Y + mixiHit.Height / 2, MouseButtons.Left);
+        int clientX = (int)((long)(mixiHit.X + mixiHit.Width / 2) * petForm.Width / TaskbarPetRenderer.CanvasWidth);
+        int clientY = (int)((long)(mixiHit.Y + mixiHit.Height / 2) * petForm.Height / TaskbarPetRenderer.CanvasHeight);
+        petForm.SimulateMouseDown(clientX, clientY, MouseButtons.Left);
         Assert.True(poked);
 
-        // Verify right-click quick activity picker menu has Auto Cycle + all 5 Mixi activities + Poke
+        // Rapid close/reopen: opening menu2 while menu1 closes MUST NOT dispose menu2!
+        var menu1 = petForm.ShowMixiQuickMenu(new Point(100, 100));
+        var menu2 = petForm.ShowMixiQuickMenu(new Point(110, 110));
+        Application.DoEvents();
+
+        Assert.True(menu1.IsDisposed);
+        Assert.False(menu2.IsDisposed);
+        Assert.Same(menu2, petForm.ActiveMixiMenuForTest);
+
+        // When state transitions to a Working agent (Mixi ineligible), active Mixi menu closes & detaches!
+        var workingState = new HqState(
+            Agents: new[] { new AgentSnapshot("minato", "Minato", AgentRole.Coder, "minato", AgentState.Working, "Coding", "CODE") },
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Busy,
+            PendingVisualEvents: Array.Empty<HqEvent>(),
+            Timestamp: DateTimeOffset.UtcNow);
+        petForm.UpdateData(workingState, ThemePackLoader.BuiltInFallback);
+        petForm.RenderAndPresent();
+        Application.DoEvents();
+
+        Assert.Null(petForm.ActiveMixiMenuForTest);
+        Assert.True(menu2.IsDisposed);
+
+        // Verify right-click quick activity picker menu items & callbacks
         MixiChillActivity? pinnedSelected = MixiChillActivity.EatingNoodles;
         bool pinRaised = false;
         petForm.MixiActivityPinned += act =>
@@ -200,7 +420,7 @@ public class V22MultiMonitorWakeUpMediaAndUiTests
     }
 
     [Fact]
-    public void MediaSessionMonitor_TracksPlaybackWithHysteresisAndSurvivesProbeErrors()
+    public void MediaSessionMonitor_TracksPlaybackWithHysteresisGenerationGateAndSurvivesProbeErrors()
     {
         var probe = new FakeMediaProbe();
         using var monitor = new MediaSessionMonitor(enabled: true, pollIntervalMs: 5000, pauseHysteresisTicks: 2, probe: probe);
@@ -228,6 +448,14 @@ public class V22MultiMonitorWakeUpMediaAndUiTests
         // Probe exceptions never crash the monitor
         probe.ShouldThrow = true;
         monitor.PollOnce();
+        Assert.False(monitor.IsPlaying);
+
+        // Monotonic enableGeneration gate: if disabled mid-probe, stale playing sample MUST be discarded!
+        probe.ShouldThrow = false;
+        probe.NextSnapshot = new MediaPlaybackSnapshot(true, "spotify");
+        probe.OnProbe = () => monitor.SetEnabled(false);
+        monitor.PollOnce();
+        probe.OnProbe = null;
         Assert.False(monitor.IsPlaying);
 
         // Allowlist privacy check: only known media apps pass

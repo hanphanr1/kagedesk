@@ -77,15 +77,18 @@ public static class BenchmarkRunner
         var wpRenderer = new HqWallpaperRenderer();
         var petRenderer = new TaskbarPetRenderer();
 
-        // Warmup: run 5 frames and force GC to reach steady state
-        for (int i = 0; i < 5; i++)
+        // Warmup: run 10 frames and force GC to reach clean steady state
+        for (int i = 0; i < 10; i++)
         {
             float t = i * 0.066f;
             var curState = aggregator.CurrentState;
             wpRenderer.Render(wpBuf, curState, theme, t);
             petRenderer.Render(petBuf, curState, theme, t);
             dibSurface.BlitNearestNeighborFrom(petBuf, 2);
-            occlusionMonitor.CheckOcclusion();
+            if (i == 0)
+            {
+                occlusionMonitor.CheckOcclusion();
+            }
         }
 
         GC.Collect();
@@ -141,8 +144,8 @@ public static class BenchmarkRunner
         }
 
         sw.Stop();
-        TimeSpan cpuEnd = proc.TotalProcessorTime;
         proc.Refresh();
+        TimeSpan cpuEnd = proc.TotalProcessorTime;
         workingSetSamples.Add(proc.WorkingSet64 / 1024.0 / 1024.0);
 
         uint gdiEnd = Win32Interop.GetGuiResources(proc.Handle, Win32Interop.GR_GDIOBJECTS);

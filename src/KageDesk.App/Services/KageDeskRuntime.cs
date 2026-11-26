@@ -30,9 +30,12 @@ public class KageDeskRuntime : IDisposable
     private readonly OrcaCliCollector _orcaCollector;
     private ProcessAgentCollector? _procCollector;
     private SessionLogActivityCollector? _sessionLogCollector;
+    private EventHandler<IReadOnlyList<AgentSnapshot>>? _sessionLogHandler;
     private GitHubCiCollector? _gitHubCollector;
     private LocalEventBridge? _localBridge;
     private readonly MediaSessionMonitor _mediaMonitor;
+    private readonly TeamDramaController _sharedDramaController = new();
+    private SingleInstanceWakeUpServer? _wakeUpServer;
 
     private readonly RetroSoundEngine _soundEngine;
     private readonly object _audioTrackLock = new();
@@ -89,6 +92,7 @@ public class KageDeskRuntime : IDisposable
     public DesktopOcclusionMonitor OcclusionMonitor => _occlusionMonitor;
     public RetroSoundEngine SoundEngine => _soundEngine;
     public MediaSessionMonitor MediaMonitor => _mediaMonitor;
+    public TeamDramaController SharedDramaController => _sharedDramaController;
     public bool WallpaperAttached => _wallpaperBridge.IsAttached;
     public string WallpaperStatusReason => _wallpaperBridge.StatusReason;
     public string BridgeToken => _bridgeToken;
@@ -106,7 +110,6 @@ public class KageDeskRuntime : IDisposable
         _dispatcherForm = new UiDispatcherForm();
         _ = _dispatcherForm.Handle;
         _dispatcherForm.TaskbarCreated += OnExplorerRestarted;
-        _dispatcherForm.WakeUpRequested += OnSingleInstanceWakeUpRequested;
 
         // Locate themes directory
         _themesDir = FindThemesDirectory();
@@ -120,7 +123,8 @@ public class KageDeskRuntime : IDisposable
         _wallpaperBridge = new Win32WallpaperBridge();
         _occlusionMonitor = new DesktopOcclusionMonitor(500)
         {
-            TargetMonitorDeviceName = _config.WallpaperMonitorDeviceName
+            WallpaperMonitorDeviceName = _config.WallpaperMonitorDeviceName,
+            PetMonitorDeviceName = _config.PetMonitorDeviceName
         };
 
         _soundEngine = new RetroSoundEngine();
@@ -242,6 +246,20 @@ public class KageDeskRuntime : IDisposable
 
     public void Start()
     {
+        if (_wakeUpServer == null)
+        {
+            try
+            {
+                _wakeUpServer = new SingleInstanceWakeUpServer(OnSingleInstanceWakeUpRequested);
+                _wakeUpServer.Start();
+            }
+            catch
+            {
+                _wakeUpServer?.Dispose();
+                _wakeUpServer = null;
+            }
+        }
+
         _occlusionMonitor.Start();
         _mediaMonitor.Start();
 
@@ -303,28 +321,38 @@ public class KageDeskRuntime : IDisposable
     {
         if (_sessionLogCollector != null) return;
 
+        long gen = _aggregator.GetSessionLogGeneration();
         var collector = new SessionLogActivityCollector();
-        collector.ActivityChanged += OnSessionLogActivityChanged;
+        EventHandler<IReadOnlyList<AgentSnapshot>> handler = (_, agents) => OnSessionLogActivityChanged(agents, gen);
+        collector.ActivityChanged += handler;
         collector.Start();
+        _sessionLogHandler = handler;
         _sessionLogCollector = collector;
     }
 
     private void StopSessionLogCollector()
     {
+        // Advance aggregator generation and clear stale session-log state FIRST so in-flight callbacks cannot reinstate state
+        _aggregator.DisableAndClearSessionLogActivity();
+
         var collector = _sessionLogCollector;
+        var handler = _sessionLogHandler;
         _sessionLogCollector = null;
+        _sessionLogHandler = null;
         if (collector != null)
         {
-            collector.ActivityChanged -= OnSessionLogActivityChanged;
+            if (handler != null)
+            {
+                collector.ActivityChanged -= handler;
+            }
             collector.Dispose();
         }
-        _aggregator.ClearSessionLogActivity();
     }
 
-    private void OnSessionLogActivityChanged(object? sender, IReadOnlyList<AgentSnapshot> agents)
+    private void OnSessionLogActivityChanged(IReadOnlyList<AgentSnapshot> agents, long expectedGeneration)
     {
         if (_stopping || _disposed) return;
-        _aggregator.UpdateSessionLogActivity(agents);
+        _aggregator.UpdateSessionLogActivity(agents, expectedGeneration: expectedGeneration);
     }
 
     private void OnMediaPlaybackChanged(object? sender, MediaPlaybackSnapshot snapshot)
@@ -336,7 +364,7 @@ public class KageDeskRuntime : IDisposable
 
     private WallpaperHostForm CreateWallpaperHostForm()
     {
-        var form = new WallpaperHostForm(_activeTheme, _config.TargetFps, _config.ShowMixiWhenAllIdle)
+        var form = new WallpaperHostForm(_activeTheme, _config.TargetFps, _config.ShowMixiWhenAllIdle, _sharedDramaController)
         {
             GetSceneEffects = GetCurrentSceneEffects
         };
@@ -363,7 +391,8 @@ public class KageDeskRuntime : IDisposable
                 _config.TargetFps,
                 _config.ShowMixiWhenAllIdle,
                 _config.PetMonitorDeviceName,
-                _config.PetRelativeX)
+                _config.PetRelativeX,
+                _sharedDramaController)
             {
                 GetSceneEffects = GetCurrentSceneEffects
             };
@@ -373,6 +402,7 @@ public class KageDeskRuntime : IDisposable
             };
             _petForm.PetPlacementChanged += (deviceName, relativeX, absoluteX) =>
             {
+                _occlusionMonitor.PetMonitorDeviceName = deviceName;
                 UpdateConfig(c =>
                 {
                     c.PetMonitorDeviceName = deviceName;
@@ -435,14 +465,18 @@ public class KageDeskRuntime : IDisposable
             },
             OnWallpaperMonitorChanged = deviceName =>
             {
-                _occlusionMonitor.TargetMonitorDeviceName = deviceName;
+                _occlusionMonitor.WallpaperMonitorDeviceName = deviceName;
                 if (_wallpaperBridge.IsAttached && _wallpaperForm != null && !_wallpaperForm.IsDisposed)
                 {
-                    _wallpaperBridge.RepositionForMonitor(deviceName);
+                    if (!_wallpaperBridge.RepositionForMonitor(deviceName))
+                    {
+                        RecoverWallpaperAttachment(deviceName);
+                    }
                 }
             },
             OnPetMonitorChanged = deviceName =>
             {
+                _occlusionMonitor.PetMonitorDeviceName = deviceName;
                 _petForm?.SetMonitorAndPosition(deviceName, null, null);
             },
             OnPetModeChanged = mode =>
@@ -550,25 +584,47 @@ public class KageDeskRuntime : IDisposable
             OnSoundToggled = enabled => UpdateConfig(c => c.SoundEnabled = enabled),
             OnInstallHooks = () =>
             {
-                var installer = new HookInstaller(bridgePort: _config.LocalBridgePort);
-                var summary = installer.InstallAll();
-                string details = string.Join(", ", summary.Results.Select(r => $"{r.Target}: {r.Status}"));
-                _trayController?.ShowBalloon(
-                    "KageDesk CLI Hooks",
-                    summary.AllSucceeded ? $"Hooks configured ({details})." : $"Some hooks failed ({details}).",
-                    summary.AllSucceeded ? ToolTipIcon.Info : ToolTipIcon.Warning,
-                    4000);
+                try
+                {
+                    var installer = new HookInstaller(bridgePort: _config.LocalBridgePort);
+                    var summary = installer.InstallAll();
+                    string details = string.Join(", ", summary.Results.Select(r => $"{r.Target}: {r.Status}"));
+                    _trayController?.ShowBalloon(
+                        "KageDesk CLI Hooks",
+                        summary.AllSucceeded ? $"Hooks configured ({details})." : $"Hooks need attention ({details}).",
+                        summary.AllSucceeded ? ToolTipIcon.Info : ToolTipIcon.Warning,
+                        4500);
+                }
+                catch (Exception ex)
+                {
+                    _trayController?.ShowBalloon(
+                        "KageDesk CLI Hooks Error",
+                        $"Hook install failed: {ex.Message}",
+                        ToolTipIcon.Error,
+                        4500);
+                }
             },
             OnUninstallHooks = () =>
             {
-                var installer = new HookInstaller(bridgePort: _config.LocalBridgePort);
-                var summary = installer.UninstallAll();
-                string details = string.Join(", ", summary.Results.Select(r => $"{r.Target}: {r.Status}"));
-                _trayController?.ShowBalloon(
-                    "KageDesk CLI Hooks",
-                    summary.AllSucceeded ? $"Hooks removed ({details})." : $"Some hooks failed ({details}).",
-                    summary.AllSucceeded ? ToolTipIcon.Info : ToolTipIcon.Warning,
-                    4000);
+                try
+                {
+                    var installer = new HookInstaller(bridgePort: _config.LocalBridgePort);
+                    var summary = installer.UninstallAll();
+                    string details = string.Join(", ", summary.Results.Select(r => $"{r.Target}: {r.Status}"));
+                    _trayController?.ShowBalloon(
+                        "KageDesk CLI Hooks",
+                        summary.AllSucceeded ? $"Hooks removed ({details})." : $"Hooks need attention ({details}).",
+                        summary.AllSucceeded ? ToolTipIcon.Info : ToolTipIcon.Warning,
+                        4500);
+                }
+                catch (Exception ex)
+                {
+                    _trayController?.ShowBalloon(
+                        "KageDesk CLI Hooks Error",
+                        $"Hook uninstall failed: {ex.Message}",
+                        ToolTipIcon.Error,
+                        4500);
+                }
             },
             OnDemoTrigger = scenario => _aggregator.SetDemoScenario(scenario),
             OnExportGif = () =>
@@ -659,6 +715,29 @@ public class KageDeskRuntime : IDisposable
         }
     }
 
+    private void RecoverWallpaperAttachment(string? deviceName)
+    {
+        if (_stopping || _disposed || _noWallpaperMode || !_config.WallpaperEnabled) return;
+
+        try
+        {
+            _wallpaperBridge.RestoreDesktopWallpaper();
+            if (_wallpaperForm == null || _wallpaperForm.IsDisposed)
+            {
+                _wallpaperForm = CreateWallpaperHostForm();
+            }
+
+            SyncUiOnDispatcher();
+            _wallpaperForm.RenderFrameNow();
+            _wallpaperBridge.AttachWallpaper(_wallpaperForm, deviceName);
+            _wallpaperForm.IsAttached = _wallpaperBridge.IsAttached;
+        }
+        catch (Exception ex)
+        {
+            Trace.WriteLine($"[KageDesk] Wallpaper recovery failed: {ex.Message}");
+        }
+    }
+
     private void OnSingleInstanceWakeUpRequested()
     {
         if (_stopping || _disposed) return;
@@ -695,11 +774,16 @@ public class KageDeskRuntime : IDisposable
                 {
                     if (_stopping || _disposed) return;
 
-                    _occlusionMonitor.TargetMonitorDeviceName = _config.WallpaperMonitorDeviceName;
+                    _occlusionMonitor.InvalidateMonitorCache();
+                    _occlusionMonitor.WallpaperMonitorDeviceName = _config.WallpaperMonitorDeviceName;
+                    _occlusionMonitor.PetMonitorDeviceName = _config.PetMonitorDeviceName;
 
                     if (_wallpaperBridge.IsAttached && _wallpaperForm != null && !_wallpaperForm.IsDisposed)
                     {
-                        _wallpaperBridge.RepositionForMonitor(_config.WallpaperMonitorDeviceName);
+                        if (!_wallpaperBridge.RepositionForMonitor(_config.WallpaperMonitorDeviceName))
+                        {
+                            RecoverWallpaperAttachment(_config.WallpaperMonitorDeviceName);
+                        }
                     }
 
                     _petForm?.HandleDisplaySettingsChanged();
@@ -1140,13 +1224,19 @@ public class KageDeskRuntime : IDisposable
             _aggregator.StateChanged -= OnHqStateChanged;
             _mediaMonitor.PlaybackChanged -= OnMediaPlaybackChanged;
             _dispatcherForm.TaskbarCreated -= OnExplorerRestarted;
-            _dispatcherForm.WakeUpRequested -= OnSingleInstanceWakeUpRequested;
             _occlusionMonitor.UnsubscribeSessionSwitch();
             if (_displaySettingsSubscribed)
             {
                 SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
                 _displaySettingsSubscribed = false;
             }
+        }
+        catch { }
+
+        try
+        {
+            _wakeUpServer?.Dispose();
+            _wakeUpServer = null;
         }
         catch { }
 

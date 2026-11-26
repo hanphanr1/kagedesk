@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using KageDesk.App.Native;
 using KageDesk.Core.Models;
 using KageDesk.Rendering.Canvas;
@@ -21,6 +22,7 @@ public class PetOverlayForm : Form
     private HqState _cachedRenderState;
     private ThemePack _currentTheme;
     private int _scale = 2;
+    private int _currentDpi = 96;
     private string _idleMode = "chill"; // "chill" | "auto-hide" | "off"
     private bool _showMixiWhenAllIdle = true;
     private string? _monitorDeviceName;
@@ -38,6 +40,7 @@ public class PetOverlayForm : Form
     private readonly Dictionary<string, AgentState> _dismissedAlerts = new(StringComparer.OrdinalIgnoreCase);
 
     public int PetScale => _scale;
+    public int CurrentDpi => _currentDpi;
     public int? PetX => _petX;
     public string? MonitorDeviceName => _monitorDeviceName;
     public int? PetRelativeX => _petRelativeX;
@@ -89,11 +92,15 @@ public class PetOverlayForm : Form
         int targetFps = 15,
         bool showMixiWhenAllIdle = true,
         string? monitorDeviceName = null,
-        int? initialRelativeX = null)
+        int? initialRelativeX = null,
+        TeamDramaController? sharedDramaController = null)
     {
         _currentTheme = initialTheme ?? throw new ArgumentNullException(nameof(initialTheme));
         _scale = Math.Clamp(initialScale, 1, 2);
-        _monitorDeviceName = string.IsNullOrWhiteSpace(monitorDeviceName) ? null : monitorDeviceName.Trim();
+        _monitorDeviceName = string.IsNullOrWhiteSpace(monitorDeviceName) ||
+                             string.Equals(monitorDeviceName.Trim(), "primary", StringComparison.OrdinalIgnoreCase)
+            ? null
+            : monitorDeviceName.Trim();
         _petRelativeX = initialRelativeX;
         _petX = initialPetX;
         _idleMode = idleMode;
@@ -109,11 +116,19 @@ public class PetOverlayForm : Form
             Timestamp: DateTimeOffset.UtcNow);
         _cachedRenderState = _currentState;
 
+        var initialMonitor = MonitorLayoutHelper.ResolveMonitorFromSystem(_monitorDeviceName);
+        _currentDpi = Math.Clamp(initialMonitor.Dpi, 96, 384);
+        Size initSize = MonitorLayoutHelper.ComputeDpiScaledPetSize(
+            TaskbarPetRenderer.CanvasWidth,
+            TaskbarPetRenderer.CanvasHeight,
+            _scale,
+            _currentDpi);
+
         try
         {
             _petBuffer = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
-            _dibSurface = new LayeredDibSurface(TaskbarPetRenderer.CanvasWidth * _scale, TaskbarPetRenderer.CanvasHeight * _scale);
-            _renderer = new TaskbarPetRenderer();
+            _dibSurface = new LayeredDibSurface(initSize.Width, initSize.Height);
+            _renderer = new TaskbarPetRenderer(sharedDramaController);
             _stopwatch = Stopwatch.StartNew();
 
             FormBorderStyle = FormBorderStyle.None;
@@ -152,6 +167,50 @@ public class PetOverlayForm : Form
         }
     }
 
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        if (_disposed) return;
+
+        int liveDpi = MonitorLayoutHelper.QueryWindowDpi(Handle, _currentDpi);
+        if (liveDpi != _currentDpi)
+        {
+            ApplyDpiChange(liveDpi, suggestedBounds: null);
+        }
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == Win32Interop.WM_DPICHANGED && !_disposed)
+        {
+            int newDpi = (int)(((long)m.WParam >> 16) & 0xFFFF);
+            if (newDpi <= 0)
+            {
+                newDpi = (int)((long)m.WParam & 0xFFFF);
+            }
+
+            Rectangle? suggested = null;
+            if (m.LParam != IntPtr.Zero)
+            {
+                try
+                {
+                    var rc = Marshal.PtrToStructure<Win32Interop.RECT>(m.LParam);
+                    if (rc.Width > 0 && rc.Height > 0)
+                    {
+                        suggested = Rectangle.FromLTRB(rc.Left, rc.Top, rc.Right, rc.Bottom);
+                    }
+                }
+                catch { }
+            }
+
+            ApplyDpiChange(newDpi, suggested);
+            m.Result = IntPtr.Zero;
+            return;
+        }
+
+        base.WndProc(ref m);
+    }
+
     public void Start()
     {
         UpdateWindowBounds();
@@ -163,9 +222,15 @@ public class PetOverlayForm : Form
         int newScale = Math.Clamp(scale, 1, 2);
         if (_scale == newScale) return true;
 
+        Size newSize = MonitorLayoutHelper.ComputeDpiScaledPetSize(
+            TaskbarPetRenderer.CanvasWidth,
+            TaskbarPetRenderer.CanvasHeight,
+            newScale,
+            _currentDpi);
+
         try
         {
-            _dibSurface.Resize(TaskbarPetRenderer.CanvasWidth * newScale, TaskbarPetRenderer.CanvasHeight * newScale);
+            _dibSurface.Resize(newSize.Width, newSize.Height);
         }
         catch
         {
@@ -184,6 +249,66 @@ public class PetOverlayForm : Form
         catch
         {
             // Do NOT return false here because _scale was committed and DIB surface was resized
+        }
+
+        return true;
+    }
+
+    internal bool ApplyDpiChangeForTest(int newDpi, Rectangle? suggestedBounds = null) =>
+        ApplyDpiChange(newDpi, suggestedBounds);
+
+    private bool ApplyDpiChange(int newDpi, Rectangle? suggestedBounds)
+    {
+        if (_disposed) return false;
+
+        int clampedDpi = Math.Clamp(newDpi, 96, 384);
+        Size newSize = MonitorLayoutHelper.ComputeDpiScaledPetSize(
+            TaskbarPetRenderer.CanvasWidth,
+            TaskbarPetRenderer.CanvasHeight,
+            _scale,
+            clampedDpi);
+
+        try
+        {
+            _dibSurface.Resize(newSize.Width, newSize.Height);
+        }
+        catch
+        {
+            return false;
+        }
+
+        _currentDpi = clampedDpi;
+
+        try
+        {
+            if (suggestedBounds.HasValue)
+            {
+                var monitors = MonitorLayoutHelper.GetConnectedMonitors();
+                var center = new Point(
+                    suggestedBounds.Value.Left + suggestedBounds.Value.Width / 2,
+                    suggestedBounds.Value.Top + suggestedBounds.Value.Height / 2);
+                var mon = MonitorLayoutHelper.ResolveMonitorAtPoint(monitors, center);
+                Rectangle docked = MonitorLayoutHelper.ComputeTaskbarDockedBounds(
+                    mon.Bounds,
+                    mon.WorkingArea,
+                    newSize.Width,
+                    newSize.Height,
+                    _petRelativeX,
+                    suggestedBounds.Value.Left);
+                SetBounds(docked.Left, docked.Top, docked.Width, docked.Height);
+            }
+            else
+            {
+                UpdateWindowBounds();
+            }
+
+            if (Visible && !_isPaused && !_isHiddenByDndOrLock && IsHandleCreated)
+            {
+                RenderAndPresent();
+            }
+        }
+        catch
+        {
         }
 
         return true;
@@ -216,16 +341,36 @@ public class PetOverlayForm : Form
             : deviceName.Trim();
         _petRelativeX = relativeX;
         _petX = legacyAbsoluteX;
-        UpdateWindowBounds();
-        if (Visible && !_isPaused && !_isHiddenByDndOrLock)
+
+        var monitor = MonitorLayoutHelper.ResolveMonitorFromSystem(_monitorDeviceName);
+        if (monitor.Dpi != _currentDpi)
         {
-            RenderAndPresent();
+            ApplyDpiChange(monitor.Dpi, suggestedBounds: null);
+        }
+        else
+        {
+            UpdateWindowBounds();
+            if (Visible && !_isPaused && !_isHiddenByDndOrLock)
+            {
+                RenderAndPresent();
+            }
         }
     }
 
     public void HandleDisplaySettingsChanged()
     {
         if (_disposed) return;
+
+        var monitor = MonitorLayoutHelper.ResolveMonitorFromSystem(_monitorDeviceName);
+        int liveDpi = IsHandleCreated
+            ? MonitorLayoutHelper.QueryWindowDpi(Handle, monitor.Dpi)
+            : monitor.Dpi;
+
+        if (liveDpi != _currentDpi)
+        {
+            ApplyDpiChange(liveDpi, suggestedBounds: null);
+            return;
+        }
 
         UpdateWindowBounds();
         if (Visible && !_isPaused && !_isHiddenByDndOrLock)
@@ -304,6 +449,17 @@ public class PetOverlayForm : Form
     }
 
     internal IReadOnlyList<PetHitRegion> CurrentHitRegions => _renderer.HitRegions;
+    internal ContextMenuStrip? ActiveMixiMenuForTest => _activeMixiMenu;
+    internal Size DibSurfaceSizeForTest => new(_dibSurface.Width, _dibSurface.Height);
+
+    internal Point MapClientToCanvas(int clientX, int clientY)
+    {
+        int cw = Math.Max(1, Width);
+        int ch = Math.Max(1, Height);
+        int cx = (int)((long)clientX * TaskbarPetRenderer.CanvasWidth / cw);
+        int cy = (int)((long)clientY * TaskbarPetRenderer.CanvasHeight / ch);
+        return new Point(cx, cy);
+    }
 
     internal bool ShouldStayVisibleInAutoHide()
     {
@@ -348,6 +504,7 @@ public class PetOverlayForm : Form
         if (_isPaused || _isHiddenByDndOrLock || _idleMode == "off")
         {
             _renderTimer.Stop();
+            CloseAndDisposeActiveMixiMenu();
             if (Visible) Hide();
             return;
         }
@@ -355,6 +512,7 @@ public class PetOverlayForm : Form
         if (_idleMode == "auto-hide" && !ShouldStayVisibleInAutoHide())
         {
             _renderTimer.Stop();
+            CloseAndDisposeActiveMixiMenu();
             if (Visible) Hide();
             return;
         }
@@ -372,14 +530,23 @@ public class PetOverlayForm : Form
 
     private void UpdateWindowBounds()
     {
-        int w = TaskbarPetRenderer.CanvasWidth * _scale;
-        int h = TaskbarPetRenderer.CanvasHeight * _scale;
+        Size scaled = MonitorLayoutHelper.ComputeDpiScaledPetSize(
+            TaskbarPetRenderer.CanvasWidth,
+            TaskbarPetRenderer.CanvasHeight,
+            _scale,
+            _currentDpi);
+
+        if (_dibSurface.Width != scaled.Width || _dibSurface.Height != scaled.Height)
+        {
+            _dibSurface.Resize(scaled.Width, scaled.Height);
+        }
+
         var monitor = MonitorLayoutHelper.ResolveMonitorFromSystem(_monitorDeviceName);
         Rectangle docked = MonitorLayoutHelper.ComputeTaskbarDockedBounds(
             monitor.Bounds,
             monitor.WorkingArea,
-            w,
-            h,
+            scaled.Width,
+            scaled.Height,
             _petRelativeX,
             _petX);
 
@@ -393,6 +560,7 @@ public class PetOverlayForm : Form
         if (_idleMode == "auto-hide" && !ShouldStayVisibleInAutoHide())
         {
             _renderTimer.Stop();
+            CloseAndDisposeActiveMixiMenu();
             if (Visible) Hide();
             return;
         }
@@ -428,15 +596,13 @@ public class PetOverlayForm : Form
             _dismissedAlerts,
             effects);
 
-        if (_scale == 1)
+        // Detach/close Mixi quick menu promptly whenever Mixi is no longer active
+        if (!_renderer.IsMixiChillActive && _activeMixiMenu != null)
         {
-            _dibSurface.CopyFrom(_petBuffer);
-        }
-        else
-        {
-            _dibSurface.BlitNearestNeighborFrom(_petBuffer, _scale);
+            CloseAndDisposeActiveMixiMenu();
         }
 
+        _dibSurface.BlitNearestNeighborScaledFrom(_petBuffer);
         _dibSurface.UpdateLayeredWindow(Handle, Left, Top);
     }
 
@@ -494,41 +660,82 @@ public class PetOverlayForm : Form
         return menu;
     }
 
-    private void ShowMixiQuickMenu(Point screenLocation)
+    internal ContextMenuStrip ShowMixiQuickMenu(Point screenLocation)
     {
-        DisposeActiveMixiMenu();
+        CloseAndDisposeActiveMixiMenu();
 
         MixiChillActivity? currentPinned = GetSceneEffects?.Invoke().PinnedMixiActivity;
-        _activeMixiMenu = BuildMixiQuickMenu(currentPinned);
-        _activeMixiMenu.Closed += (_, _) =>
+        ContextMenuStrip menu = BuildMixiQuickMenu(currentPinned);
+        _activeMixiMenu = menu;
+        menu.Closed += (_, _) =>
         {
+            // Capture the exact closing instance so rapid close/reopen never disposes the new menu
+            ContextMenuStrip closingInstance = menu;
             if (!_disposed && IsHandleCreated)
             {
-                BeginInvoke(new Action(DisposeActiveMixiMenu));
+                try
+                {
+                    BeginInvoke(new Action(() => DisposeMixiMenuInstance(closingInstance)));
+                }
+                catch
+                {
+                    DisposeMixiMenuInstance(closingInstance);
+                }
+            }
+            else
+            {
+                DisposeMixiMenuInstance(closingInstance);
             }
         };
-        _activeMixiMenu.Show(screenLocation);
+        menu.Show(screenLocation);
+        return menu;
     }
 
-    private void DisposeActiveMixiMenu()
+    private void CloseAndDisposeActiveMixiMenu()
     {
-        if (_activeMixiMenu != null)
+        var current = _activeMixiMenu;
+        if (current == null) return;
+        _activeMixiMenu = null;
+
+        try
         {
-            for (int i = _activeMixiMenu.Items.Count - 1; i >= 0; i--)
+            if (!current.IsDisposed && current.Visible)
             {
-                _activeMixiMenu.Items[i].Dispose();
+                current.Close(ToolStripDropDownCloseReason.AppFocusChange);
             }
-            _activeMixiMenu.Dispose();
+        }
+        catch { }
+
+        DisposeMixiMenuInstance(current);
+    }
+
+    private void DisposeMixiMenuInstance(ContextMenuStrip menu)
+    {
+        if (ReferenceEquals(_activeMixiMenu, menu))
+        {
             _activeMixiMenu = null;
         }
+
+        if (menu.IsDisposed) return;
+
+        try
+        {
+            for (int i = menu.Items.Count - 1; i >= 0; i--)
+            {
+                menu.Items[i].Dispose();
+            }
+            menu.Dispose();
+        }
+        catch { }
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
 
-        int unscaledX = e.X / _scale;
-        int unscaledY = e.Y / _scale;
+        Point canvasPt = MapClientToCanvas(e.X, e.Y);
+        int unscaledX = canvasPt.X;
+        int unscaledY = canvasPt.Y;
 
         if (e.Button == MouseButtons.Right)
         {
@@ -652,6 +859,11 @@ public class PetOverlayForm : Form
             var monitors = MonitorLayoutHelper.GetConnectedMonitors();
             var targetMonitor = MonitorLayoutHelper.ResolveMonitorAtPoint(monitors, cursorPos);
 
+            if (targetMonitor.Dpi != _currentDpi)
+            {
+                ApplyDpiChange(targetMonitor.Dpi, suggestedBounds: null);
+            }
+
             int desiredLeft = _dragStartWindowLeft + (cursorPos.X - _dragStartCursorX);
             Rectangle docked = MonitorLayoutHelper.ComputeTaskbarDockedBounds(
                 targetMonitor.Bounds,
@@ -670,9 +882,8 @@ public class PetOverlayForm : Form
         }
         else
         {
-            int unscaledX = e.X / _scale;
-            int unscaledY = e.Y / _scale;
-            Cursor = FindHitRegion(unscaledX, unscaledY).HasValue ? Cursors.Hand : Cursors.Default;
+            Point canvasPt = MapClientToCanvas(e.X, e.Y);
+            Cursor = FindHitRegion(canvasPt.X, canvasPt.Y).HasValue ? Cursors.Hand : Cursors.Default;
         }
     }
 
@@ -686,14 +897,20 @@ public class PetOverlayForm : Form
             var monitors = MonitorLayoutHelper.GetConnectedMonitors();
             var centerPt = new Point(Left + Width / 2, Top + Height / 2);
             var targetMonitor = MonitorLayoutHelper.ResolveMonitorAtPoint(monitors, centerPt);
-
-            _monitorDeviceName = targetMonitor.IsPrimary ? null : targetMonitor.DeviceName;
-            _petRelativeX = Left - targetMonitor.WorkingArea.Left;
-            _petX = Left;
-
-            PetPlacementChanged?.Invoke(targetMonitor.DeviceName, _petRelativeX.Value, Left);
-            PetPositionChanged?.Invoke(Left);
+            CommitDropPlacement(targetMonitor, Left);
         }
+    }
+
+    internal void CommitDropPlacement(MonitorDescriptor targetMonitor, int finalLeft)
+    {
+        // Align live & persisted primary-monitor marker: empty string "" / null for primary, explicit deviceName for secondary
+        string persistedDeviceName = targetMonitor.IsPrimary ? "" : targetMonitor.DeviceName;
+        _monitorDeviceName = targetMonitor.IsPrimary ? null : targetMonitor.DeviceName;
+        _petRelativeX = finalLeft - targetMonitor.WorkingArea.Left;
+        _petX = finalLeft;
+
+        PetPlacementChanged?.Invoke(persistedDeviceName, _petRelativeX.Value, finalLeft);
+        PetPositionChanged?.Invoke(finalLeft);
     }
 
     public void SimulateMouseDown(int x, int y, MouseButtons button = MouseButtons.Left)
@@ -753,7 +970,7 @@ public class PetOverlayForm : Form
 
         if (disposing)
         {
-            DisposeActiveMixiMenu();
+            CloseAndDisposeActiveMixiMenu();
             _renderTimer.Stop();
             _renderTimer.Dispose();
             _petBuffer.Dispose();

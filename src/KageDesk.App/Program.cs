@@ -148,8 +148,14 @@ internal static class Program
         using var mutex = new Mutex(true, SingleInstanceMutexName, out bool isNewInstance);
         if (!isNewInstance)
         {
-            // Signal the running KageDesk instance to briefly pulse Taskbar Pet & show tray balloon
-            SingleInstanceWakeUp.TrySignalRunningInstance();
+            // Signal the running KageDesk instance via authenticated current-user Named Pipe IPC (bounded retry up to 2.5s)
+            bool delivered = SingleInstanceWakeUp.TrySignalRunningInstance();
+            if (!delivered)
+            {
+                Win32Interop.AttachConsole(Win32Interop.ATTACH_PARENT_PROCESS);
+                Console.Error.WriteLine("[KageDesk] Another KageDesk instance is already running, but its wake-up pipe did not respond within 2.5s.");
+                return 1;
+            }
             return 0;
         }
 

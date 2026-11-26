@@ -321,14 +321,40 @@ public class Win32WallpaperBridge
         if (hostHwnd != IntPtr.Zero && Win32Interop.IsWindow(hostHwnd))
         {
             var rect = new Win32Interop.RECT(monitor.Bounds.Left, monitor.Bounds.Top, monitor.Bounds.Right, monitor.Bounds.Bottom);
-            Win32Interop.MapWindowPoints(IntPtr.Zero, hostHwnd, ref rect, 2);
-            if (rect.Width > 0 && rect.Height > 0)
+            Marshal.SetLastPInvokeError(0);
+            int mapResult = Win32Interop.MapWindowPoints(IntPtr.Zero, hostHwnd, ref rect, 2);
+            int lastError = Marshal.GetLastWin32Error();
+            if (TryResolveMappedRect(mapResult, lastError, rect, out Rectangle mapped))
             {
-                return new Rectangle(rect.Left, rect.Top, rect.Width, rect.Height);
+                return mapped;
             }
         }
 
         return virtualOffset;
+    }
+
+    internal static bool TryResolveMappedRect(
+        int mapResult,
+        int lastWin32Error,
+        Win32Interop.RECT mappedRect,
+        out Rectangle resolvedRect)
+    {
+        // Per Win32 MapWindowPoints docs: return value 0 with GetLastError() != 0 indicates failure,
+        // whereas return value 0 with GetLastError() == 0 is a valid zero-displacement mapping.
+        if (mapResult == 0 && lastWin32Error != 0)
+        {
+            resolvedRect = Rectangle.Empty;
+            return false;
+        }
+
+        if (mappedRect.Width > 0 && mappedRect.Height > 0)
+        {
+            resolvedRect = new Rectangle(mappedRect.Left, mappedRect.Top, mappedRect.Width, mappedRect.Height);
+            return true;
+        }
+
+        resolvedRect = Rectangle.Empty;
+        return false;
     }
 
     internal static IntPtr ResolveSetParentTarget(IntPtr originalParent)

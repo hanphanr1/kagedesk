@@ -35,15 +35,22 @@ public static class ColorUtil
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static int Div255(int v)
+    {
+        int t = v + 128;
+        return (t + (t >> 8)) >> 8;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int ToPremultiplied(int argb)
     {
         int a = (argb >> 24) & 0xFF;
         if (a == 255) return argb;
         if (a == 0) return 0;
 
-        int r = (((argb >> 16) & 0xFF) * a + 127) / 255;
-        int g = (((argb >> 8) & 0xFF) * a + 127) / 255;
-        int b = ((argb & 0xFF) * a + 127) / 255;
+        int r = Div255(((argb >> 16) & 0xFF) * a);
+        int g = Div255(((argb >> 8) & 0xFF) * a);
+        int b = Div255((argb & 0xFF) * a);
         return (a << 24) | (r << 16) | (g << 8) | b;
     }
 
@@ -57,9 +64,9 @@ public static class ColorUtil
         b = ClampByte(b);
         if (a == 255) return unchecked((int)0xFF000000) | (r << 16) | (g << 8) | b;
 
-        int pr = (r * a + 127) / 255;
-        int pg = (g * a + 127) / 255;
-        int pb = (b * a + 127) / 255;
+        int pr = Div255(r * a);
+        int pg = Div255(g * a);
+        int pb = Div255(b * a);
         return (a << 24) | (pr << 16) | (pg << 8) | pb;
     }
 
@@ -74,9 +81,9 @@ public static class ColorUtil
         int sg = (srcStraightArgb >> 8) & 0xFF;
         int sb = srcStraightArgb & 0xFF;
 
-        int srp = (sr * sa + 127) / 255;
-        int sgp = (sg * sa + 127) / 255;
-        int sbp = (sb * sa + 127) / 255;
+        int srp = Div255(sr * sa);
+        int sgp = Div255(sg * sa);
+        int sbp = Div255(sb * sa);
 
         return BlendPremultipliedOverPremultiplied(dstPArgb, sa, srp, sgp, sbp);
     }
@@ -84,21 +91,21 @@ public static class ColorUtil
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int BlendPremultipliedOverPremultiplied(int dstPArgb, int sa, int srp, int sgp, int sbp)
     {
-        int invSa = 255 - sa;
         int da = (dstPArgb >> 24) & 0xFF;
         if (da == 0)
         {
             return (sa << 24) | (srp << 16) | (sgp << 8) | sbp;
         }
 
+        int invSa = 255 - sa;
         int dr = (dstPArgb >> 16) & 0xFF;
         int dg = (dstPArgb >> 8) & 0xFF;
         int db = dstPArgb & 0xFF;
 
-        int oa = sa + (da * invSa + 127) / 255;
-        int or_ = srp + (dr * invSa + 127) / 255;
-        int og = sgp + (dg * invSa + 127) / 255;
-        int ob = sbp + (db * invSa + 127) / 255;
+        int oa = sa + Div255(da * invSa);
+        int or_ = srp + Div255(dr * invSa);
+        int og = sgp + Div255(dg * invSa);
+        int ob = sbp + Div255(db * invSa);
 
         if (oa > 255) oa = 255;
         if (or_ > oa) or_ = oa;

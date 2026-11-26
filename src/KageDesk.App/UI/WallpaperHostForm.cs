@@ -76,7 +76,11 @@ public class WallpaperHostForm : Form
 
     protected override bool ShowWithoutActivation => true;
 
-    public WallpaperHostForm(ThemePack initialTheme, int targetFps = 15, bool showMixiWhenAllIdle = true)
+    public WallpaperHostForm(
+        ThemePack initialTheme,
+        int targetFps = 15,
+        bool showMixiWhenAllIdle = true,
+        KageDesk.Rendering.Sprites.TeamDramaController? sharedDramaController = null)
     {
         _currentTheme = initialTheme ?? throw new ArgumentNullException(nameof(initialTheme));
         _showMixiWhenAllIdle = showMixiWhenAllIdle;
@@ -90,7 +94,7 @@ public class WallpaperHostForm : Form
             Timestamp: DateTimeOffset.UtcNow);
 
         _buffer = new PixelBuffer(HqWallpaperRenderer.CanvasWidth, HqWallpaperRenderer.CanvasHeight);
-        _renderer = new HqWallpaperRenderer();
+        _renderer = new HqWallpaperRenderer(sharedDramaController);
         _stopwatch = Stopwatch.StartNew();
 
         FormBorderStyle = FormBorderStyle.None;

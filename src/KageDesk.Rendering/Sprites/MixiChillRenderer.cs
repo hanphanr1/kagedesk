@@ -123,21 +123,24 @@ public static class MixiChillRenderer
     /// <summary>
     /// Strict exclusive All-Idle check for Do Mixi Gaming:
     /// Returns true ONLY when DemoScenario == "mixi" OR (showMixiWhenAllIdle == true AND zero agents/bots
-    /// are non-idle AND no handoff/drama is pending or active).
+    /// are non-idle AND no handoff/drama/celebration is pending or active).
     /// </summary>
     public static bool ShouldRenderMixiChillCorner(
         HqState state,
         bool showMixiWhenAllIdle,
         bool hasActiveHandoff = false,
         long lastHandledHandoffSeq = -1,
-        bool hasActiveDrama = false)
+        bool hasActiveDrama = false,
+        bool hasActiveCelebration = false,
+        long lastHandledDramaSeq = -1,
+        long lastHandledCelebrateSeq = -1)
     {
         if (string.Equals(state.DemoScenario, "mixi", StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
 
-        if (!showMixiWhenAllIdle || hasActiveHandoff || hasActiveDrama)
+        if (!showMixiWhenAllIdle || hasActiveHandoff || hasActiveDrama || hasActiveCelebration)
         {
             return false;
         }
@@ -154,12 +157,17 @@ public static class MixiChillRenderer
         var events = state.PendingVisualEvents;
         for (int i = 0; i < events.Count; i++)
         {
-            if (events[i].SequenceId > lastHandledHandoffSeq &&
+            long seq = events[i].SequenceId;
+            if (seq > lastHandledHandoffSeq &&
                 string.Equals(events[i].Type, "handoff", StringComparison.OrdinalIgnoreCase))
             {
                 return false;
             }
-            if (TeamDramaController.IsDramaEventType(events[i].Type))
+            if (seq > lastHandledDramaSeq && TeamDramaController.IsDramaEventType(events[i].Type))
+            {
+                return false;
+            }
+            if (seq > lastHandledCelebrateSeq && TeamDramaController.IsCelebrateEventType(events[i].Type))
             {
                 return false;
             }

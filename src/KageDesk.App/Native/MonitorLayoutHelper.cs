@@ -2,6 +2,14 @@ using System.Drawing;
 
 namespace KageDesk.App.Native;
 
+public enum TaskbarEdge
+{
+    Bottom,
+    Top,
+    Left,
+    Right
+}
+
 public sealed record MonitorDescriptor(
     string DeviceName,
     bool IsPrimary,
@@ -12,7 +20,7 @@ public sealed record MonitorDescriptor(
 
 /// <summary>
 /// Pure, testable multi-monitor resolution, per-monitor DPI lookup, virtual-desktop wallpaper offset,
-/// and per-monitor taskbar-edge docking helper.
+/// and per-monitor 4-edge taskbar docking helper.
 /// </summary>
 public static class MonitorLayoutHelper
 {
@@ -133,8 +141,43 @@ public static class MonitorLayoutHelper
     }
 
     /// <summary>
-    /// Computes clean taskbar-docked bounds for the Taskbar Pet on any monitor, automatically adapting to
-    /// bottom, top, left, or right taskbars while keeping the pet strictly inside that monitor's WorkingArea.
+    /// Derives the active taskbar edge from the delta between monitor Bounds and WorkingArea.
+    /// </summary>
+    public static TaskbarEdge DetectTaskbarEdge(Rectangle monitorBounds, Rectangle workingArea)
+    {
+        int insetTop = Math.Max(0, workingArea.Top - monitorBounds.Top);
+        int insetBottom = Math.Max(0, monitorBounds.Bottom - workingArea.Bottom);
+        int insetLeft = Math.Max(0, workingArea.Left - monitorBounds.Left);
+        int insetRight = Math.Max(0, monitorBounds.Right - workingArea.Right);
+
+        if (insetTop > 0 && insetTop >= insetBottom && insetTop >= insetLeft && insetTop >= insetRight)
+            return TaskbarEdge.Top;
+
+        if (insetLeft > 0 && insetLeft >= insetBottom && insetLeft >= insetRight && insetLeft >= insetTop)
+            return TaskbarEdge.Left;
+
+        if (insetRight > 0 && insetRight >= insetBottom && insetRight >= insetLeft && insetRight >= insetTop)
+            return TaskbarEdge.Right;
+
+        return TaskbarEdge.Bottom;
+    }
+
+    /// <summary>
+    /// Computes physical pixel dimensions of the Taskbar Pet for a given user scale (1x/2x) and window DPI.
+    /// </summary>
+    public static Size ComputeDpiScaledPetSize(int baseWidth, int baseHeight, int petScale, int dpi)
+    {
+        int clampedScale = petScale >= 2 ? 2 : 1;
+        int clampedDpi = dpi is >= 72 and <= 480 ? dpi : 96;
+        int w = (int)Math.Round(baseWidth * clampedScale * (clampedDpi / 96.0));
+        int h = (int)Math.Round(baseHeight * clampedScale * (clampedDpi / 96.0));
+        return new Size(Math.Max(baseWidth, w), Math.Max(baseHeight, h));
+    }
+
+    /// <summary>
+    /// Computes clean taskbar-docked bounds for the Taskbar Pet on any monitor, automatically docking to
+    /// all 4 taskbar edges (Bottom, Top, Left, Right) while keeping the pet strictly inside that monitor's WorkingArea
+    /// and supporting negative X/Y secondary monitor coordinates.
     /// </summary>
     public static Rectangle ComputeTaskbarDockedBounds(
         Rectangle monitorBounds,
@@ -144,13 +187,14 @@ public static class MonitorLayoutHelper
         int? relativeX = null,
         int? legacyAbsoluteX = null)
     {
-        bool topTaskbar = workingArea.Top > monitorBounds.Top && workingArea.Bottom == monitorBounds.Bottom;
-        int top = topTaskbar
+        TaskbarEdge edge = DetectTaskbarEdge(monitorBounds, workingArea);
+
+        int desiredTop = edge == TaskbarEdge.Top
             ? workingArea.Top
             : workingArea.Bottom - formHeight;
 
         int maxTop = Math.Max(workingArea.Top, workingArea.Bottom - formHeight);
-        top = Math.Clamp(top, workingArea.Top, maxTop);
+        int top = Math.Clamp(desiredTop, workingArea.Top, maxTop);
 
         int desiredLeft;
         if (relativeX.HasValue)
@@ -163,7 +207,12 @@ public static class MonitorLayoutHelper
         }
         else
         {
-            desiredLeft = workingArea.Right - formWidth - 16;
+            desiredLeft = edge switch
+            {
+                TaskbarEdge.Left => workingArea.Left,
+                TaskbarEdge.Right => workingArea.Right - formWidth,
+                _ => workingArea.Right - formWidth - 16
+            };
         }
 
         int maxLeft = Math.Max(workingArea.Left, workingArea.Right - formWidth);
@@ -178,6 +227,27 @@ public static class MonitorLayoutHelper
         int dpiPct = (int)Math.Round(monitor.Dpi * 100.0 / 96.0);
         string dpiTag = dpiPct != 100 ? $" @{dpiPct}%" : "";
         return $"Display {displayIndex + 1} ({primaryTag}{monitor.Bounds.Width}x{monitor.Bounds.Height}{dpiTag})";
+    }
+
+    public static int QueryWindowDpi(IntPtr hwnd, int fallbackDpi = 96)
+    {
+        if (hwnd != IntPtr.Zero)
+        {
+            try
+            {
+                uint dpi = Win32Interop.GetDpiForWindow(hwnd);
+                if (dpi is >= 72 and <= 480)
+                {
+                    return (int)dpi;
+                }
+            }
+            catch
+            {
+                // Fallback gracefully on older Windows builds
+            }
+        }
+
+        return fallbackDpi is >= 72 and <= 480 ? fallbackDpi : 96;
     }
 
     public static int QueryMonitorDpi(Rectangle monitorBounds)

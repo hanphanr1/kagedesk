@@ -84,6 +84,12 @@ public sealed class LayeredDibSurface : IDisposable
         ArgumentNullException.ThrowIfNull(source);
         if (scale <= 0) throw new ArgumentOutOfRangeException(nameof(scale));
 
+        if (scale == 1)
+        {
+            CopyFrom(source);
+            return;
+        }
+
         int expectedW = source.Width * scale;
         int expectedH = source.Height * scale;
         if (_width != expectedW || _height != expectedH)
@@ -94,10 +100,30 @@ public sealed class LayeredDibSurface : IDisposable
         int srcW = source.Width;
         int srcH = source.Height;
         int dstW = _width;
+        long rowBytes = (long)dstW * sizeof(int);
 
         fixed (int* src = source.ReadOnlyPixels)
         {
             int* dst = (int*)_bits;
+
+            if (scale == 2)
+            {
+                for (int sy = 0; sy < srcH; sy++)
+                {
+                    int* srcRowPtr = src + sy * srcW;
+                    int* dstRow0 = dst + (sy * 2) * dstW;
+                    ulong* dstRow0Pairs = (ulong*)dstRow0;
+
+                    for (int sx = 0; sx < srcW; sx++)
+                    {
+                        uint px = (uint)srcRowPtr[sx];
+                        dstRow0Pairs[sx] = px | ((ulong)px << 32);
+                    }
+
+                    Buffer.MemoryCopy(dstRow0, dstRow0 + dstW, rowBytes, rowBytes);
+                }
+                return;
+            }
 
             for (int sy = 0; sy < srcH; sy++)
             {
@@ -120,9 +146,76 @@ public sealed class LayeredDibSurface : IDisposable
                     Buffer.MemoryCopy(
                         dst + firstDstRow,
                         dst + (dstBaseY + ry) * dstW,
-                        dstW * sizeof(int),
-                        dstW * sizeof(int));
+                        rowBytes,
+                        rowBytes);
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Zero-allocation nearest-neighbor blit supporting arbitrary per-monitor DPI scaled dimensions
+    /// (e.g. 125%, 150%, 175%, 200% DPI), delegating to fast paths for exact 1x and 2x sizes.
+    /// </summary>
+    public unsafe void BlitNearestNeighborScaledFrom(PixelBuffer source)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(source);
+
+        int srcW = source.Width;
+        int srcH = source.Height;
+        int dstW = _width;
+        int dstH = _height;
+
+        if (dstW == srcW && dstH == srcH)
+        {
+            CopyFrom(source);
+            return;
+        }
+
+        if (dstW == srcW * 2 && dstH == srcH * 2)
+        {
+            BlitNearestNeighborFrom(source, 2);
+            return;
+        }
+
+        // 16.16 fixed-point nearest-neighbor scaling (zero heap allocations)
+        uint stepX = (uint)(((long)srcW << 16) / dstW);
+        uint stepY = (uint)(((long)srcH << 16) / dstH);
+        long rowBytes = (long)dstW * sizeof(int);
+
+        fixed (int* src = source.ReadOnlyPixels)
+        {
+            int* dst = (int*)_bits;
+            int prevSy = -1;
+            int* prevDstRow = null;
+            uint accY = 0;
+
+            for (int dy = 0; dy < dstH; dy++)
+            {
+                int sy = (int)(accY >> 16);
+                if (sy >= srcH) sy = srcH - 1;
+                accY += stepY;
+
+                int* dstRow = dst + dy * dstW;
+                if (sy == prevSy && prevDstRow != null)
+                {
+                    Buffer.MemoryCopy(prevDstRow, dstRow, rowBytes, rowBytes);
+                    continue;
+                }
+
+                int* srcRow = src + sy * srcW;
+                uint accX = 0;
+                for (int dx = 0; dx < dstW; dx++)
+                {
+                    int sx = (int)(accX >> 16);
+                    if (sx >= srcW) sx = srcW - 1;
+                    dstRow[dx] = srcRow[sx];
+                    accX += stepX;
+                }
+
+                prevSy = sy;
+                prevDstRow = dstRow;
             }
         }
     }

@@ -308,6 +308,14 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
                 return;
             }
 
+            if (payload.TtlSeconds.HasValue && (!double.IsFinite(payload.TtlSeconds.Value) || payload.TtlSeconds.Value <= 0))
+            {
+                await WriteJsonAsync(response, 400, new { ok = false, error = "Invalid ttlSeconds: must be a positive finite number" }).ConfigureAwait(false);
+                return;
+            }
+
+            string? clampedMessage = HqStateAggregator.ClampMessage(payload.Message);
+
             if (string.Equals(payload.Type, "handoff", StringComparison.OrdinalIgnoreCase))
             {
                 var fromId = (payload.FromAgentId ?? payload.AgentId)?.Trim();
@@ -346,17 +354,22 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
                     FromAgentId = resolvedFrom,
                     ToAgentId = resolvedTo,
                     FromIsConcreteId = fromIsConcreteId,
-                    ToIsConcreteId = toIsConcreteId
+                    ToIsConcreteId = toIsConcreteId,
+                    Message = clampedMessage,
+                    TtlSeconds = HqStateAggregator.ClampVisualTtl(payload.TtlSeconds, 10.0)
                 };
             }
             else if (string.Equals(payload.Type, "review_changes", StringComparison.OrdinalIgnoreCase) ||
                      string.Equals(payload.Type, "drama", StringComparison.OrdinalIgnoreCase) ||
                      string.Equals(payload.Type, "request_changes", StringComparison.OrdinalIgnoreCase))
             {
-                var fromId = (payload.FromAgentId ?? payload.AgentId)?.Trim();
-                var toId = payload.ToAgentId?.Trim();
-                if (string.IsNullOrEmpty(fromId)) fromId = "kakashi";
-                if (string.IsNullOrEmpty(toId)) toId = "minato";
+                string? rawFrom = (payload.FromAgentId ?? payload.AgentId)?.Trim();
+                string? rawTo = payload.ToAgentId?.Trim();
+                bool fromExplicit = !string.IsNullOrEmpty(rawFrom);
+                bool toExplicit = !string.IsNullOrEmpty(rawTo);
+
+                string fromId = fromExplicit ? rawFrom! : "kakashi";
+                string toId = toExplicit ? rawTo! : "minato";
 
                 if (fromId.Length > 64 || toId.Length > 64 ||
                     !IsValidEndpointId(fromId) || !IsValidEndpointId(toId))
@@ -379,12 +392,83 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
                     return;
                 }
 
+                // Reject arbitrary unresolved aliases (only allow concrete live agents, canonical allowlisted aliases, or intentional omitted defaults)
+                if (fromExplicit && !fromIsConcreteId && !AgentAliasResolver.TryResolveRoleAlias(fromId, out _))
+                {
+                    await WriteJsonAsync(response, 400, new { ok = false, error = $"Unresolved fromAgentId '{fromId}': must match an active agent ID or canonical role alias" }).ConfigureAwait(false);
+                    return;
+                }
+
+                if (toExplicit && !toIsConcreteId && !AgentAliasResolver.TryResolveRoleAlias(toId, out _))
+                {
+                    await WriteJsonAsync(response, 400, new { ok = false, error = $"Unresolved toAgentId '{toId}': must match an active agent ID or canonical role alias" }).ConfigureAwait(false);
+                    return;
+                }
+
                 payload = payload with
                 {
                     FromAgentId = resolvedFrom,
                     ToAgentId = resolvedTo,
                     FromIsConcreteId = fromIsConcreteId,
-                    ToIsConcreteId = toIsConcreteId
+                    ToIsConcreteId = toIsConcreteId,
+                    Message = clampedMessage,
+                    TtlSeconds = HqStateAggregator.ClampVisualTtl(payload.TtlSeconds, 10.0)
+                };
+            }
+            else if (string.Equals(payload.Type, "celebrate", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(payload.Type, "celebration", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(payload.Type, "pr_merged", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(payload.Type, "ci_pass", StringComparison.OrdinalIgnoreCase))
+            {
+                string? rawAgent = payload.AgentId?.Trim();
+                string? resolvedAgent = null;
+                if (!string.IsNullOrEmpty(rawAgent))
+                {
+                    if (!IsValidEndpointId(rawAgent))
+                    {
+                        await WriteJsonAsync(response, 400, new { ok = false, error = "Invalid agentId format for celebration event" }).ConfigureAwait(false);
+                        return;
+                    }
+
+                    HqState snapshot = _aggregator.GetState();
+                    bool matchedConcrete = AgentAliasResolver.TryResolveAgentId(rawAgent, snapshot.Agents, out string? concreteId);
+                    if (!matchedConcrete && !AgentAliasResolver.TryResolveRoleAlias(rawAgent, out _))
+                    {
+                        await WriteJsonAsync(response, 400, new { ok = false, error = $"Unresolved agentId '{rawAgent}' for celebration event" }).ConfigureAwait(false);
+                        return;
+                    }
+                    resolvedAgent = matchedConcrete ? concreteId : rawAgent;
+                }
+
+                payload = payload with
+                {
+                    AgentId = resolvedAgent,
+                    Message = clampedMessage,
+                    TtlSeconds = HqStateAggregator.ClampVisualTtl(payload.TtlSeconds, 8.0)
+                };
+            }
+            else if (string.Equals(payload.Type, "mixi_poke", StringComparison.OrdinalIgnoreCase))
+            {
+                payload = payload with
+                {
+                    Message = clampedMessage,
+                    TtlSeconds = HqStateAggregator.ClampVisualTtl(payload.TtlSeconds, 4.0)
+                };
+            }
+            else
+            {
+                if (!HqStateAggregator.IsKnownHookOrAgentEventType(payload.Type))
+                {
+                    await WriteJsonAsync(response, 400, new { ok = false, error = $"Unknown event type '{payload.Type}'" }).ConfigureAwait(false);
+                    return;
+                }
+
+                payload = payload with
+                {
+                    Message = clampedMessage,
+                    TtlSeconds = payload.TtlSeconds.HasValue
+                        ? HqStateAggregator.ClampEntityTtl(payload.TtlSeconds, 30.0)
+                        : null
                 };
             }
 
