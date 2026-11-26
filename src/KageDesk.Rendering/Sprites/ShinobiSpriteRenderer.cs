@@ -40,11 +40,15 @@ public static class ShinobiSpriteRenderer
         bool isWalking = false,
         bool carryingScroll = false,
         bool facingRight = true,
-        int behaviorVariant = 0)
+        int behaviorVariant = 0,
+        bool panicSprint = false,
+        bool celebrationHop = false,
+        bool musicGroove = false)
     {
         string key = NormalizeSpriteKey(spriteKey);
         int bv = Math.Abs(behaviorVariant) % 3;
         float t = timeSeconds + phaseOffset * 0.43f + bv * 0.19f;
+        float animT = panicSprint ? t * 2.0f : t;
 
         if (state == AgentState.Working && actionKind == AgentActionKind.None)
         {
@@ -172,6 +176,29 @@ public static class ShinobiSpriteRenderer
                 break;
         }
 
+        // Coordinated Squad Celebration hop override
+        if (celebrationHop && state != AgentState.Failed && state != AgentState.NeedsApproval)
+        {
+            jumpY = -(int)(MathF.Abs(MathF.Sin(t * 7.4f)) * 4.5f + 0.5f);
+            armsUp = true;
+            eyesHappy = true;
+            eyesBlink = false;
+        }
+        // Panic Sprint (2x typing speed, frantic micro-shake & panicked eyes)
+        else if (panicSprint)
+        {
+            typingFast = true;
+            breathY = ((int)(animT * 7f) & 1);
+            shakeX = (((int)(animT * 10f) % 4) == 0) ? 1 : 0;
+            eyesPanic = true;
+            eyesBlink = false;
+        }
+        // Subtle head-bob music groove synced to playing media
+        else if (musicGroove && (state == AgentState.Idle || state == AgentState.Working))
+        {
+            headBobY = (((int)(t * 4.5f)) & 1) == 0 ? -1 : 0;
+        }
+
         int x = cx + shakeX;
         int footY = bottomY + jumpY;
 
@@ -288,11 +315,21 @@ public static class ShinobiSpriteRenderer
         }
         else
         {
-            DrawArms(buf, key, x, torsoTop, headTop, armsUp, waveAlt, handsOnHead, typingFast, t, state, variantSeed, actionKind);
+            DrawArms(buf, key, x, torsoTop, headTop, armsUp, waveAlt, handsOnHead, typingFast, animT, state, variantSeed, actionKind);
         }
 
         // 5. Head, Face, Eyes, Hair
         DrawHeadAndHair(buf, key, x, headTop, state, eyesBlink, eyesHappy, eyesPanic, t, variantSeed, eyeScan, actionKind);
+
+        // Forehead sweat drop during Panic Sprint
+        if (panicSprint)
+        {
+            int dropY = headTop + 1 + (((int)(animT * 6f)) % 3);
+            int sweatBlue = ColorUtil.FromRgb(125, 211, 252);
+            buf.SetPixel(x + 5, dropY, sweatBlue);
+            buf.FillRect(x + 5, dropY + 1, 2, 2, sweatBlue);
+            buf.SetPixel(x + 5, dropY + 1, EyeWhite);
+        }
 
         // 6. Action-specific and character props (with subtle behaviorVariant animations)
         if (state == AgentState.Working)
@@ -2559,6 +2596,66 @@ public static class ShinobiSpriteRenderer
         buf.SetPixel(cx, y + h + 1, borderRgb);
 
         PixelFont.DrawTextCentered(buf, cx, y + 3, label, textRgb, PixelFontSize.Small);
+    }
+
+    /// <summary>
+    /// Draws a compact 5-bar animated pixel music equalizer widget (11x8 px) with zero allocations.
+    /// Shared across both Wallpaper HQ desks and Taskbar Pet desks when media playback is active.
+    /// </summary>
+    public static void DrawMusicEqualizer(PixelBuffer buf, int x, int y, float timeSeconds, int seed = 0)
+    {
+        int bg = ColorUtil.FromRgb(14, 18, 30);
+        int border = ColorUtil.FromRgb(56, 189, 248);
+        buf.FillRect(x, y, 13, 8, Outline);
+        buf.FillRect(x + 1, y + 1, 11, 6, bg);
+        buf.SetPixel(x, y, border);
+        buf.SetPixel(x + 12, y, border);
+
+        for (int b = 0; b < 5; b++)
+        {
+            float wave = MathF.Sin(timeSeconds * (6.5f + b * 1.1f) + seed * 1.3f + b * 0.9f);
+            int barH = 1 + (int)((wave * 0.5f + 0.5f) * 4.9f);
+            int barCol = barH >= 5
+                ? ColorUtil.FromRgb(244, 114, 182)
+                : (barH >= 3 ? ColorUtil.FromRgb(250, 204, 21) : ColorUtil.FromRgb(34, 211, 238));
+            buf.FillRect(x + 2 + b * 2, y + 7 - barH, 1, barH, barCol);
+        }
+    }
+
+    /// <summary>
+    /// Draws warm glowing Night-mode desk lamp and cozy amber monitor/desk underglow.
+    /// Shared across both Wallpaper workstations and Taskbar Pet mini-desks.
+    /// </summary>
+    public static void DrawNightDeskLamp(PixelBuffer buf, int cx, int deskY, float timeSeconds, bool miniDesk = false)
+    {
+        int warmGold = ColorUtil.FromRgb(251, 191, 36);
+        int warmBulb = ColorUtil.FromRgb(254, 249, 195);
+        int standCol = ColorUtil.FromRgb(120, 90, 62);
+        int pulse = 32 + (int)(MathF.Sin(timeSeconds * 2.3f + cx * 0.05f) * 6f);
+
+        if (miniDesk)
+        {
+            // Cozy amber desk & monitor underglow for Taskbar Pet mini-desk at Night
+            buf.BlendRect(cx - 16, deskY - 6, 32, 5, warmGold, pulse);
+            buf.BlendRect(cx + 7, deskY - 17, 10, 9, warmGold, pulse);
+            buf.FillRect(cx + 10, deskY - 14, 4, 3, Outline);
+            buf.FillRect(cx + 11, deskY - 13, 2, 1, warmBulb);
+            buf.FillRect(cx + 11, deskY - 11, 2, 3, standCol);
+        }
+        else
+        {
+            // Warm desk lamp on right edge of Wallpaper workstation + soft amber desk pool (fast zero-alloc)
+            int lx = cx + 21;
+            int ly = deskY - 11;
+            buf.BlendRect(lx - 6, ly - 4, 17, 14, warmGold, pulse);
+            buf.BlendRect(lx - 3, ly - 1, 11, 8, warmBulb, pulse + 14);
+            buf.BlendRect(cx - 16, deskY - 2, 38, 4, warmGold, pulse - 6);
+            buf.FillRect(lx, ly, 5, 3, Outline);
+            buf.FillRect(lx + 1, ly + 1, 3, 1, warmGold);
+            buf.FillRect(lx + 1, ly + 2, 3, 1, warmBulb);
+            buf.FillRect(lx + 2, ly + 3, 1, 4, standCol);
+            buf.FillRect(lx + 1, ly + 7, 3, 1, standCol);
+        }
     }
 
     public static string NormalizeSpriteKey(string? spriteKey)

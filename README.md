@@ -1,6 +1,6 @@
 # KageDesk
 
-**Ultra-lightweight native Windows Live Wallpaper & transparent Taskbar Pixel Agent HQ for AI coding agents — ~16 MB private RAM, <0.8% CPU, 0% Chromium**
+**Ultra-lightweight native Windows Live Wallpaper & transparent Taskbar Pixel Agent HQ for coding agents — ~16 MB private RAM, <0.8% CPU, 0% Chromium**
 
 [![CI](https://github.com/hanphanr1/kagedesk/actions/workflows/ci.yml/badge.svg)](https://github.com/hanphanr1/kagedesk/actions/workflows/ci.yml)
 [![.NET 8](https://img.shields.io/badge/.NET-8.0-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/en-us/download/dotnet/8.0)
@@ -11,30 +11,32 @@
 | :---: | :---: |
 | ![Shinobi HQ Working](docs/previews/shinobi-hq-working.png) | ![Taskbar Pet Approval](docs/previews/pet-overlay-approve.png) |
 
-## KageDesk v2.1.0 — Living HQ Showcase
+## KageDesk v2.2.0 — Interactive HQ & Live Studio
 
 ![KageDesk Living HQ Demo](docs/previews/kagedesk-demo.gif)
 
-KageDesk v2.1.0 turns your Windows desktop and taskbar into a live pixel-art command center for your terminal sessions and multi-worktree pipelines. Watch workers type at desks, step out and walk across the rug delivering glowing scrolls during live handoffs, track real-time elapsed timers on long tasks, unwind with Do Mixi All-Idle Chill Mode when every workspace is quiet, celebrate completed builds with 8-bit retro chimes, wave urgent approval banners, and record lightweight animated GIFs — all rendered natively in pure C# / Win32 GDI without Electron, WebView2, or browser runtimes.
+KageDesk v2.2.0 turns your Windows desktop and taskbar into an interactive pixel-art command center for your terminal sessions and multi-worktree pipelines. Watch workers type at desks, toss glowing red review scrolls across desks during `REQUEST_CHANGES` drama, celebrate task finishes and CI passes with coordinated pixel confetti, poke Do Mixi in All-Idle Chill Mode for animated Vietnamese streamer speech bubbles, sync subtle head-bobs and equalizer bars to now-playing audio, follow real-time Dawn/Day/Dusk/Night lighting with warm desk lamps, drag the Taskbar Pet cleanly across multiple monitors, and install local CLI hooks in one click — all rendered natively in pure C# / Win32 GDI without Electron, WebView2, or browser runtimes.
 
-### Highlights in v2.1.0
-- **Do Mixi All-Idle Chill Mode**: Exclusive 2-monitor chill corner on both the live wallpaper and taskbar strip with 5 rotating idle activities (noodles, YouTube, gaming, streaming, karaoke), automatically stepping aside the moment any session becomes active or a handoff begins.
-- **8-Character & 5-Desk-Rig Variety**: Distinct, stable pixel-art character sprites (`dj-synth`, `neko-dev`, `cyber-hacker`, `ronin-dev`, `astro-dev`, `wizard-dev`, `mecha-droid`, `street-gamer`) and custom desk rigs across concurrent terminal sessions.
-- **Living Taskbar Scroll Handoffs**: Smooth foreground walk-and-deliver animations across the taskbar pet strip with accurate foreground click hit-testing and graceful walk-back when slots shift.
-- **Responsive Activity Detection**: Streaming I/O and nested tool-child tracking with PID-reuse-safe process ancestry verification and consistent polling latency.
+### Highlights in v2.2.0
+- **Interactive Do Mixi Poking & Quick Activity Picker**: Left-click Do Mixi on either the Live Wallpaper or Taskbar Pet to trigger a startled bounce, heart/spark emote, 8-bit chirp, and crisp Vietnamese pixel speech bubble (`"DANG LAM BAT MI!"`, `"LEN NHAC DI ANH EM!"`, `"BO TOC MIXIGAMING!"`, and more). Right-click directly on Do Mixi on the Taskbar Pet to pin any of the 5 chill activities (`Auto Cycle`, `An mi`, `Coi YouTube`, `Choi game`, `Noi chuyen stream`, `Hat karaoke`) immediately.
+- **Team Drama & Squad Celebration (Wallpaper + Taskbar Pet Parity)**: Review rejections (`REQUEST_CHANGES` / `review_changes`) animate Kakashi tossing a glowing red scroll to Minato, triggering a 6-second Panic Sprint with flying pixel sweat drops and 2x typing sparks. Task completions and CI passes trigger a synchronized 3-second squad hop with falling pixel confetti particles and optional 8-bit fanfare.
+- **1-Click Safe CLI Hook Installer & Live Session Log Watcher**: Run `KageDesk.exe --setup-hooks` (or use System Tray → `Settings`) to safely merge hooks for Claude Code, Codex, and OpenCode with automatic timestamped `*.kagedesk.bak` backups, atomic `File.Replace` writes, and idempotent `--uninstall-hooks` cleanup. The companion `SessionLogActivityCollector` watches local session logs using debounced `FileSystemWatcher` + bounded `<= 8 KB` tail reads, deriving only non-sensitive canonical states/actions without retaining prompt text or secrets.
+- **Multi-Monitor Support & Per-Monitor Taskbar Docking**: Pick independent displays for Live Wallpaper and Taskbar Pet from System Tray → `Monitor`, drag the Taskbar Pet smoothly across monitors onto any monitor's taskbar edge with per-monitor DPI awareness, and recover cleanly on `DisplaySettingsChanged` if an external screen disconnects.
+- **Single-Instance Wake-Up UX**: Relaunching `KageDesk.exe` while already running cleanly signals the active instance to pulse/surface the Taskbar Pet (even in `auto-hide` mode) and display a helpful tray balloon without stealing window focus.
+- **Now-Playing Media Sync & Automatic Real-Time Day/Night Cycle**: `Weather & Time → Auto` shifts automatically across Dawn (`05:00`), Day (`09:00`), Dusk (`17:00`), and Night (`20:00`) with moon/stars and warm desk lamps. Native Core Audio peak detection (`< 0.1%` CPU, zero capture) drives pixel equalizer bars and subtle head-bob grooves on both Wallpaper and Taskbar Pet.
 
 ---
 
 ## Real Measured Performance
 
-Measured on Windows 11 (Intel Core i5-1145G7) during sustained animated wallpaper + taskbar overlay soak benchmarks (`KageDesk.exe --benchmark`):
+Measured on Windows 11 during sustained animated wallpaper + taskbar overlay soak benchmarks (`KageDesk.exe --benchmark`):
 
 | Metric | Measured Result | Notes |
 | :--- | :--- | :--- |
-| **Private RAM** | **~16–22 MB** | Working Set ~55–57 MB; **0 Electron, 0 WebView2, 0 Chromium** |
+| **Private RAM** | **~16–22 MB** | Steady-state `< 35 MB` Private RAM; **0 Electron, 0 WebView2, 0 Chromium** |
 | **CPU Usage** | **~0.5% active** | **0.0% wallpaper CPU/GPU** when occluded by maximized or fullscreen apps |
-| **Frame Render Time** | **~0.6–0.7 ms/frame** | Persistent 32bpp `CreateDIBSection` + pinned `PixelBuffer` (`PixelFormat.Format32bppPArgb`) |
-| **GDI Handle Delta** | **0** (`5 -> 5`) | Zero GDI/USER handle leaks across soak and rapid 1x/2x scale switches |
+| **Frame Render Time** | **< 1.2 ms/frame** | Zero per-frame hot-path heap allocations (`0 B/frame` steady-state), fixed-size struct particle pools |
+| **GDI Handle Delta** | **0** | Zero GDI/USER handle leaks across soak and rapid 1x/2x scale switches |
 
 ---
 
@@ -136,36 +138,40 @@ dotnet build KageDesk.sln -c Release
 
 | Flag | Description |
 | :--- | :--- |
-| *(no args)* | Starts the full Live Wallpaper + Taskbar Pet Overlay + System Tray Studio |
+| *(no args)* | Starts the full Live Wallpaper + Taskbar Pet Overlay + System Tray Studio (or wakes up the running instance if already open) |
 | `--no-wallpaper` | Runs only the transparent Taskbar Pet Overlay and tray controller |
-| `--record-gif [path] [--theme <id>] [--scenario <id>] [--scale 1\|2]` | Records a 6-second auto-choreographed showcase or scenario loop (`showcase`, `handoff`, `working`, `approve`, `done`, `fail`, `clone`) to GIF89a with transparent diff compression |
-| `--snapshot <dir>` | Headlessly renders all 9 crisp nearest-neighbor preview PNGs into `<dir>` |
+| `--setup-hooks` | Safely installs KageDesk hooks for Claude Code, Codex, and OpenCode with timestamped `*.kagedesk.bak` backups |
+| `--uninstall-hooks` | Cleanly removes KageDesk-managed hook entries while preserving all other user settings |
+| `--record-gif [path] [--theme <id>] [--scenario <id>] [--scale 1\|2]` | Records a 6-second auto-choreographed showcase or scenario loop (`showcase`, `handoff`, `drama`, `celebrate`, `working`, `approve`, `done`, `fail`, `clone`, `variety`, `mixi`) to GIF89a |
+| `--snapshot <dir>` | Headlessly renders crisp nearest-neighbor preview PNGs into `<dir>` |
 | `--benchmark <seconds> [--out <file>]` | Runs a headless rendering & GDI/RAM soak benchmark for `<seconds>` and optionally writes a JSON/text report |
+| `--version` / `-v` | Prints the KageDesk version and exits |
+| `--help` / `-h` | Prints CLI usage information and exits |
 
 ### System Tray Studio Controls
 
 Right-click the KageDesk tray icon (or right-click the Taskbar Pet strip) for live controls:
 - **Live Wallpaper** toggle & active desktop topology status
-- **Taskbar Pets**: `Always Chill`, `Auto-Hide on Idle`, `Off`, `1x (384px)` / `2x (768px)` HiDPI scale, drag horizontally along the taskbar, and **Reset Position to Right**
+- **Taskbar Pets**: `Always Chill`, `Auto-Hide on Idle`, `Off`, `Do Mixi Idle Mode`, `1x (384px)` / `2x (768px)` HiDPI scale, drag smoothly across monitors along the taskbar, and **Reset Position to Right**
+- **Monitor**: independent `Wallpaper Monitor` and `Taskbar Pet Monitor` selectors with automatic fallback on display changes
 - **Theme Packs**: instant live switching (`Shinobi HQ`, `Cyber Bunker`, `Cozy Lo-Fi`), **Reload Themes**, and **Open Themes Folder**
-- **Weather**: `Auto`, `Dawn`, `Day`, `Sunset`, `MidnightRain`, `StormAlert`
-- **Demo Studio**: one-click triggers for `Trigger Working Agents`, `Trigger Living Handoff`, `Trigger Needs Approval`, `Trigger Done (Celebration)`, `Trigger Failure Alert`, `Trigger 4 Clones`, `Export 6s Demo GIF...`, and `Reset to Live Orca`
-- **Settings**: `Sound Effects (8-bit)` toggle, `Auto-Pause Wallpaper When Covered`, `Hide Pets in Fullscreen Game (DND)`, optional `Process Agent Collector`, optional `GitHub CI Collector`, and `Launch on Windows Startup`
+- **Weather & Time**: `Auto (Real-Time Day/Night)`, `Dawn`, `Day`, `Sunset`, `MidnightRain`, `StormAlert`
+- **Demo Studio**: one-click triggers for `Trigger Working Agents`, `Trigger Living Handoff`, `Trigger Review Drama (Kakashi → Minato)`, `Trigger Squad Celebration`, `Trigger Needs Approval`, `Trigger Done (Celebration)`, `Trigger Failure Alert`, `Trigger Multi-Terminal Variety`, `Do Mixi Chill Mode`, `Export 6s Demo GIF...`, and `Reset to Live Orca`
+- **Settings**: `Sound Effects (8-bit)`, `Now-Playing Media Sync`, `Auto-Pause Wallpaper When Covered`, `Hide Pets in Fullscreen Game (DND)`, `Process Agent Collector`, `Live Session Log Watcher`, `GitHub CI Collector`, `Install CLI Hooks`, `Remove CLI Hooks`, and `Launch on Windows Startup`
 
 ---
 
-## Connecting Any Agent (Orca, Antigravity, OMP, Claude Code, Codex, CI)
+## Connecting Any Agent (Orca, OMP, Claude Code, Codex, OpenCode, CI)
 
 ### 1. Zero-Config Orca Discovery
-When Orca is installed on `PATH`, KageDesk automatically polls live agent activity, worktrees, bots, and account quotas via:
-- `orca worktree ps`
-- `orca bot list`
-- `orca bot item list`
-- `orca account list`
+When Orca is installed on `PATH`, KageDesk automatically polls live agent activity, worktrees, and account quotas via the Orca CLI (`orca worktree ps`, `orca account list`, and workspace activity snapshots).
 
-No configuration or hooks are required for Orca sessions.
+No manual configuration is required for Orca sessions.
 
-### 2. Local HTTP Event Bridge (`127.0.0.1:4319`)
+### 2. 1-Click Hook Installer & Live Session Log Watcher
+Run `KageDesk.exe --setup-hooks` or use **Settings → Install CLI Hooks** in the tray menu to wire Claude Code, Codex, and OpenCode with automatic timestamped backups (`*.kagedesk.bak`) and atomic config updates. The built-in `SessionLogActivityCollector` also watches local CLI transcript folders via bounded `<= 8 KB` tail reads to provide immediate state transitions while never retaining raw prompt text or secrets.
+
+### 3. Local HTTP Event Bridge (`127.0.0.1:4319`)
 Any local agent, CLI runner, or CI hook can push real-time status updates to `http://127.0.0.1:4319/api/event`:
 
 - **Authentication**: Protected by a per-install 256-bit hex token stored at `%APPDATA%\KageDesk\bridge.token` with strict current-user-only NTFS ACLs. Pass it in the `X-KageDesk-Token` header.
@@ -173,10 +179,12 @@ Any local agent, CLI runner, or CI hook can push real-time status updates to `ht
   - `GET /api/health` — unauthenticated health/telemetry probe (`ok`, `version`, `workingSetMb`, `uptimeSec`, `activeTheme`, `agentCount`)
   - `GET /api/state` — token-protected allowlisted state DTO
   - `POST /api/event` — token-protected event ingestion (`type`, `state`, `agentId`, `name`, `role`, `toolName`, `message`, `repo`, `buildStatus`, `accountProvider`, `accountName`, `quotaPercent`, `fromAgentId`, `toAgentId`)
-    - **Living Handoffs**: send `{"type": "handoff", "fromAgentId": "minato", "toAgentId": "tsunade"}` to trigger a shinobi scroll handoff walk with Hiraishin sparks
-  - `POST /api/demo/{working|approve|done|fail|clone|handoff|clear}` — token-protected Demo Studio triggers
+    - **Living Handoffs**: send `{"type": "handoff", "fromAgentId": "minato", "toAgentId": "tsunade"}` to trigger a shinobi scroll handoff walk
+    - **Review Drama**: send `{"type": "review_changes", "fromAgentId": "kakashi", "toAgentId": "minato"}` to toss a glowing red review scroll and trigger Minato's Panic Sprint
+    - **Squad Celebration**: send `{"type": "celebrate"}` (or push `state: "Done"`) to launch coordinated hops and pixel confetti
+  - `POST /api/demo/{working|approve|done|fail|clone|handoff|drama|celebrate|variety|mixi|clear}` — token-protected Demo Studio triggers
 
-### 3. Ready-to-Use Hook Scripts & Claude Code Templates
+### 4. Ready-to-Use Hook Scripts & Claude Code Templates
 
 Emit events directly from PowerShell or Bash (the scripts auto-read `%APPDATA%\KageDesk\bridge.token` and strip UTF-8 BOMs cleanly):
 
@@ -201,9 +209,9 @@ Both wire `PreToolUse` (`tool_start`), `PostToolUse` (`tool_done`), `Notificatio
 
 ## Architecture & Security
 
-- **Dual Desktop Wallpaper Topology**: Supports both **Windows 10 / Win11 <= 23H2 Classic `WorkerW`** and **Windows 11 24H2 / 25H2 Raised Desktop (`Progman` + `SHELLDLL_DefView`)**. Verifies Explorer PID ownership, verifies `GetAncestor(GA_PARENT)` and `GWL_STYLE`/`GWL_EXSTYLE` readback on both rollback and detach, never modifies Windows OS wallpaper registry/SPI settings on detach, and automatically recovers when Explorer restarts (`TaskbarCreated`).
-- **Monitor-Aware Auto-Pause & Game DND**: Tracks DWM extended frame bounds and cloaked state on the primary monitor to pause wallpaper rendering at 0% CPU/GPU when covered, plus `SHQueryUserNotificationState` fullscreen DND to hide taskbar pets during games or presentations.
-- **Zero-Allocation Native Rendering**: Fixed-size pinned `PixelBuffer` canvases — **`384x216` wallpaper** (nearest-neighbor blit; 2x previews at `768x432`) and **`384x128` taskbar pets** (2x HiDPI / previews at `768x256`). The pet overlay specifically renders through a persistent 32bpp `CreateDIBSection` + `UpdateLayeredWindow` path for crisp per-pixel alpha with zero GDI leaks.
+- **Dual Desktop Wallpaper Topology & Multi-Monitor Offsets**: Supports both **Windows 10 / Win11 <= 23H2 Classic `WorkerW`** and **Windows 11 24H2 / 25H2 Raised Desktop (`Progman` + `SHELLDLL_DefView`)** across arbitrary virtual-desktop monitor coordinates (including negative left/top monitors). Verifies Explorer PID ownership, verifies `GetAncestor(GA_PARENT)` and `GWL_STYLE`/`GWL_EXSTYLE` readback on both rollback and detach, never modifies Windows OS wallpaper registry/SPI settings on detach, and automatically recovers when Explorer restarts (`TaskbarCreated`) or displays change (`DisplaySettingsChanged`).
+- **Monitor-Aware Auto-Pause & Game DND**: Tracks DWM extended frame bounds and cloaked state on the selected wallpaper monitor to pause wallpaper rendering at 0% CPU/GPU when covered, plus `SHQueryUserNotificationState` fullscreen DND to hide taskbar pets during games or presentations.
+- **Zero-Allocation Native Rendering**: Fixed-size pinned `PixelBuffer` canvases — **`384x216` wallpaper** (nearest-neighbor blit; 2x previews at `768x432`) and **`384x128` taskbar pets** (2x HiDPI / previews at `768x256`). The pet overlay renders through a persistent 32bpp `CreateDIBSection` + `UpdateLayeredWindow` path for crisp per-pixel alpha with zero GDI leaks and fixed-size struct particle pools.
 - **Defense-in-Depth Local Bridge**:
   - Strictly bound to `127.0.0.1` loopback with remote address verification, 32 KB body cap (including chunked streams), 16-request concurrency cap, and slow-client read-timeout aborts.
   - Zero-TOCTOU token verification inspects the raw binary NTFS security descriptor (`RawSecurityDescriptor`), enforcing protected DACL inheritance, owner SID match, and current-user-only Allow `CommonAce` entries — failing closed and regenerating on mismatch.

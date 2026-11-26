@@ -23,6 +23,7 @@ public class Win32WallpaperBridge
     private bool _lastRollbackVerified;
     private DesktopTopology _currentTopology = DesktopTopology.None;
     private string _statusReason = "Not attached";
+    private string? _targetMonitorDeviceName;
 
     public bool IsAttached => _isAttached;
     public bool LastRollbackVerified => _lastRollbackVerified;
@@ -30,15 +31,17 @@ public class Win32WallpaperBridge
     public IntPtr AttachedHwnd => _attachedHwnd;
     public DesktopTopology CurrentTopology => _currentTopology;
     public string StatusReason => _statusReason;
+    public string? TargetMonitorDeviceName => _targetMonitorDeviceName;
 
     public bool IsAttachedHostAlive()
     {
         return _attachedHwnd != IntPtr.Zero && Win32Interop.IsWindow(_attachedHwnd);
     }
 
-    public bool AttachWallpaper(Form form)
+    public bool AttachWallpaper(Form form, string? targetMonitorDeviceName = null)
     {
         ArgumentNullException.ThrowIfNull(form);
+        _targetMonitorDeviceName = targetMonitorDeviceName;
         if (_isAttached) return true;
 
         IntPtr formHandle = form.Handle;
@@ -199,17 +202,15 @@ public class Win32WallpaperBridge
             return false;
         }
 
-        Rectangle bounds = Screen.PrimaryScreen?.Bounds ?? new Rectangle(0, 0, 1920, 1080);
-        var rect = new Win32Interop.RECT(bounds.Left, bounds.Top, bounds.Right, bounds.Bottom);
-        Win32Interop.MapWindowPoints(IntPtr.Zero, targetWorkerW, ref rect, 2);
+        Rectangle targetRect = ComputeHostClientRect(targetWorkerW, _targetMonitorDeviceName);
 
         bool posOk = Win32Interop.SetWindowPos(
             formHandle,
             Win32Interop.HWND_BOTTOM,
-            rect.Left,
-            rect.Top,
-            rect.Width,
-            rect.Height,
+            targetRect.Left,
+            targetRect.Top,
+            targetRect.Width,
+            targetRect.Height,
             Win32Interop.SWP_NOACTIVATE | Win32Interop.SWP_SHOWWINDOW);
 
         if (!posOk)
@@ -263,18 +264,16 @@ public class Win32WallpaperBridge
             return false;
         }
 
-        Rectangle bounds = Screen.PrimaryScreen?.Bounds ?? new Rectangle(0, 0, 1920, 1080);
-        var rect = new Win32Interop.RECT(bounds.Left, bounds.Top, bounds.Right, bounds.Bottom);
-        Win32Interop.MapWindowPoints(IntPtr.Zero, progman, ref rect, 2);
+        Rectangle targetRect = ComputeHostClientRect(progman, _targetMonitorDeviceName);
 
         // Place directly below SHELLDLL_DefView
         bool posOk = Win32Interop.SetWindowPos(
             formHandle,
             defViewHwnd,
-            rect.Left,
-            rect.Top,
-            rect.Width,
-            rect.Height,
+            targetRect.Left,
+            targetRect.Top,
+            targetRect.Width,
+            targetRect.Height,
             Win32Interop.SWP_NOACTIVATE | Win32Interop.SWP_SHOWWINDOW);
 
         if (!posOk)
@@ -291,6 +290,45 @@ public class Win32WallpaperBridge
         _currentTopology = DesktopTopology.RaisedDesktopWin11;
         _statusReason = "Active (Raised-Desktop Win11 24H2+)";
         return true;
+    }
+
+    public bool RepositionForMonitor(string? targetMonitorDeviceName)
+    {
+        _targetMonitorDeviceName = targetMonitorDeviceName;
+        if (!_isAttached || _attachedHwnd == IntPtr.Zero || _hostHwnd == IntPtr.Zero ||
+            !Win32Interop.IsWindow(_attachedHwnd) || !Win32Interop.IsWindow(_hostHwnd))
+        {
+            return false;
+        }
+
+        Rectangle targetRect = ComputeHostClientRect(_hostHwnd, _targetMonitorDeviceName);
+        return Win32Interop.SetWindowPos(
+            _attachedHwnd,
+            IntPtr.Zero,
+            targetRect.Left,
+            targetRect.Top,
+            targetRect.Width,
+            targetRect.Height,
+            Win32Interop.SWP_NOZORDER | Win32Interop.SWP_NOACTIVATE | Win32Interop.SWP_SHOWWINDOW);
+    }
+
+    private static Rectangle ComputeHostClientRect(IntPtr hostHwnd, string? targetMonitorDeviceName)
+    {
+        var monitor = MonitorLayoutHelper.ResolveMonitorFromSystem(targetMonitorDeviceName);
+        Rectangle virtualScreen = SystemInformation.VirtualScreen;
+        Rectangle virtualOffset = MonitorLayoutHelper.ComputeWallpaperVirtualOffset(monitor.Bounds, virtualScreen);
+
+        if (hostHwnd != IntPtr.Zero && Win32Interop.IsWindow(hostHwnd))
+        {
+            var rect = new Win32Interop.RECT(monitor.Bounds.Left, monitor.Bounds.Top, monitor.Bounds.Right, monitor.Bounds.Bottom);
+            Win32Interop.MapWindowPoints(IntPtr.Zero, hostHwnd, ref rect, 2);
+            if (rect.Width > 0 && rect.Height > 0)
+            {
+                return new Rectangle(rect.Left, rect.Top, rect.Width, rect.Height);
+            }
+        }
+
+        return virtualOffset;
     }
 
     internal static IntPtr ResolveSetParentTarget(IntPtr originalParent)

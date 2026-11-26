@@ -376,13 +376,13 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
 
     private static IReadOnlyList<RawToolhelpEntry>? CaptureWin32RawSnapshot()
     {
+        var rawEntries = new List<RawToolhelpEntry>(256);
         IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1))
         {
             return null;
         }
 
-        var rawEntries = new List<RawToolhelpEntry>(256);
         try
         {
             var entry = new PROCESSENTRY32W();

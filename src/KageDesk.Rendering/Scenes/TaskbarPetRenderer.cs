@@ -42,8 +42,10 @@ public sealed class TaskbarPetRenderer
     private readonly List<PetHitRegion> _hitRegions = new(16);
     private readonly ParticleSystem _particles = new();
     private readonly ActorMotionSystem _motionSystem = new();
+    private readonly TeamDramaController _dramaController = new();
     private readonly SlotBinding[] _slotBindings = new SlotBinding[6];
     private readonly AgentSnapshot[] _workingScratch = new AgentSnapshot[6];
+    private readonly AgentSnapshot[] _celebrateScratch = new AgentSnapshot[4];
     private readonly AgentSnapshot[] _idleScratch = new AgentSnapshot[2];
     private int _idleTerminalCount = 0;
     private AgentSnapshot? _idlePrimaryNonProcess = null;
@@ -60,6 +62,8 @@ public sealed class TaskbarPetRenderer
     }
 
     private readonly WorkingCacheItem[] _cachedWorkingItems = new WorkingCacheItem[6];
+    private readonly string?[] _cachedCelebrateAgentIds = new string?[4];
+    private readonly string?[] _cachedCelebrateActionIds = new string?[4];
     private string? _cachedSingleWorkingFocusActionId;
     private string? _cachedSingleWorkingShortName;
     private string? _cachedIdlePrimaryActionId;
@@ -77,13 +81,16 @@ public sealed class TaskbarPetRenderer
 
     public IReadOnlyList<PetHitRegion> HitRegions => _hitRegions;
     public bool IsHandoffActive => _motionSystem.IsHandoffActive;
+    public bool IsDramaActive => _dramaController.IsDramaActive;
+    public bool IsCelebrationActive => _dramaController.IsCelebrationActive;
     public ActorMotionSystem MotionSystem => _motionSystem;
     public bool IsMixiChillActive { get; private set; }
     public MixiChillActivity? ActiveMixiActivity { get; private set; }
     public string? ActiveAlertAgentId { get; private set; }
     public AgentState? ActiveAlertAgentState { get; private set; }
 
-    public bool HasUnconsumedHandoffEvent(HqState state) => _motionSystem.HasUnconsumedHandoffEvent(state);
+    public bool HasUnconsumedHandoffEvent(HqState state) =>
+        _motionSystem.HasUnconsumedHandoffEvent(state) || _dramaController.HasActiveOrPendingVisualDrama(state);
 
     public PetHitRegion? HitTest(int px, int py)
     {
@@ -101,11 +108,14 @@ public sealed class TaskbarPetRenderer
     {
         _particles.Reset();
         _motionSystem.Reset();
+        _dramaController.Reset();
         _lastTime = -1f;
         _emitAccum = 0f;
         _lastRenderedState = null;
         _lastStripCount = 0;
         Array.Clear(_cachedWorkingItems);
+        Array.Clear(_cachedCelebrateAgentIds);
+        Array.Clear(_cachedCelebrateActionIds);
         IsMixiChillActive = false;
         ActiveMixiActivity = null;
         ActiveAlertAgentId = null;
@@ -120,7 +130,8 @@ public sealed class TaskbarPetRenderer
         bool showIdleChill = true,
         DateTimeOffset? nowOverride = null,
         bool showMixiWhenAllIdle = true,
-        IReadOnlyDictionary<string, AgentState>? dismissedAlerts = null)
+        IReadOnlyDictionary<string, AgentState>? dismissedAlerts = null,
+        SceneEffectsState effects = default)
     {
         if (buf.Width < CanvasWidth || buf.Height < CanvasHeight)
         {
@@ -137,6 +148,8 @@ public sealed class TaskbarPetRenderer
 
         float dt = _lastTime < 0f ? 0.033f : Math.Clamp(timeSeconds - _lastTime, 0f, 0.2f);
         _lastTime = timeSeconds;
+
+        bool isNight = state.Weather == EffectiveWeather.MidnightRain;
 
         buf.ClearTransparent();
         _hitRegions.Clear();
@@ -157,15 +170,17 @@ public sealed class TaskbarPetRenderer
         if (string.Equals(state.DemoScenario, "mixi", StringComparison.OrdinalIgnoreCase))
         {
             if (_motionSystem.IsHandoffActive) _motionSystem.Reset();
-            RenderMixiChillMode(buf, timeSeconds);
+            RenderMixiChillMode(buf, timeSeconds, isNight, effects);
             _particles.Update(dt);
             _particles.Render(buf);
+            DrawWakeUpPulse(buf, timeSeconds, effects.WakeUpPulseRemainingSeconds);
             return _hitRegions;
         }
 
         AgentSnapshot? approvalAgent = null;
         AgentSnapshot? failedAgent = null;
         AgentSnapshot? doneAgent = null;
+        int doneCount = 0;
         int workingCount = 0;
         int totalWorking = 0;
 
@@ -185,9 +200,10 @@ public sealed class TaskbarPetRenderer
             {
                 failedAgent = ag;
             }
-            else if (ag.State == AgentState.Done && doneAgent == null)
+            else if (ag.State == AgentState.Done)
             {
-                doneAgent = ag;
+                if (doneAgent == null) doneAgent = ag;
+                if (doneCount < 4) _celebrateScratch[doneCount++] = ag;
             }
             else if (ag.State == AgentState.Working)
             {
@@ -217,9 +233,6 @@ public sealed class TaskbarPetRenderer
                 EnsureAgentInStrip(activeFrom, activeTo, ref stripCount);
                 EnsureAgentInStrip(activeTo, activeFrom, ref stripCount);
 
-                // Preserve sender's slot index when still within strip bounds; when the strip shrinks
-                // (e.g. 2->1 slots), RevalidateActiveMotions rebinds the sender by concrete ID to slot 0
-                // so it smoothly walks back instead of abruptly canceling.
                 int pinnedIdx = _motionSystem.ActiveHandoffStationIndex;
                 if (pinnedIdx >= 0 && pinnedIdx < stripCount)
                 {
@@ -236,8 +249,7 @@ public sealed class TaskbarPetRenderer
             }
         }
 
-        // Phase 2: Only after existing motion revalidation, check for a new unconsumed handoff event
-        // and prioritize BOTH of its endpoints into the visible strip BEFORE consuming it.
+        // Phase 2: Check for new unconsumed handoff event and prioritize BOTH endpoints into visible strip
         bool hasNewResolvableHandoff = false;
         if (!_motionSystem.IsHandoffActive && approvalAgent == null && failedAgent == null)
         {
@@ -254,8 +266,40 @@ public sealed class TaskbarPetRenderer
                     break;
                 }
 
-                // Endpoints cannot be resolved in the current snapshot: mark consumed so it does not stall Mixi/auto-hide
                 _motionSystem.MarkHandoffEventHandled(pendingHandoff.SequenceId);
+            }
+        }
+
+        // Phase 2b: Check for active/pending review_changes drama event and prioritize Kakashi & Minato into visible strip!
+        bool dramaMode = false;
+        if (approvalAgent == null && failedAgent == null)
+        {
+            if (_dramaController.IsDramaActive)
+            {
+                AgentSnapshot? dramaFrom = ResolveHandoffAgentInSnapshot(_dramaController.DramaFromAgentId ?? "kakashi", agents, _dramaController.DramaFromIsConcreteId);
+                AgentSnapshot? dramaTo = ResolveHandoffAgentInSnapshot(_dramaController.DramaToAgentId ?? "minato", agents, _dramaController.DramaToIsConcreteId);
+                if (dramaFrom != null && dramaTo != null)
+                {
+                    EnsureAgentInStrip(dramaFrom, dramaTo, ref stripCount);
+                    EnsureAgentInStrip(dramaTo, dramaFrom, ref stripCount);
+                    dramaMode = true;
+                }
+            }
+            else if (_dramaController.TryGetPendingDramaEvent(state, out var pendingDrama))
+            {
+                AgentSnapshot? dramaFrom = ResolveHandoffAgentInSnapshot(pendingDrama.AgentId ?? "kakashi", agents, pendingDrama.FromIsConcreteId);
+                AgentSnapshot? dramaTo = ResolveHandoffAgentInSnapshot(pendingDrama.TargetAgentId ?? "minato", agents, pendingDrama.ToIsConcreteId);
+                if (dramaFrom != null && dramaTo != null &&
+                    !string.Equals(dramaFrom.Id, dramaTo.Id, StringComparison.OrdinalIgnoreCase))
+                {
+                    EnsureAgentInStrip(dramaFrom, dramaTo, ref stripCount);
+                    EnsureAgentInStrip(dramaTo, dramaFrom, ref stripCount);
+                    dramaMode = true;
+                }
+                else
+                {
+                    _dramaController.MarkDramaEventHandled(pendingDrama.SequenceId);
+                }
             }
         }
 
@@ -267,7 +311,7 @@ public sealed class TaskbarPetRenderer
             _motionSystem.RevalidateActiveMotions(ReadOnlySpan<SlotBinding>.Empty, rugOffsetY: 4);
         }
 
-        // Detect state changes, strip count changes, OR same-count slot reorders (e.g. sender unpinning after handoff)
+        // Detect state changes, strip count changes, OR same-count slot reorders
         bool stateOrStripChanged = !ReferenceEquals(state, _lastRenderedState) || stripCount != _lastStripCount;
         if (!stateOrStripChanged)
         {
@@ -289,6 +333,8 @@ public sealed class TaskbarPetRenderer
             RefreshStripCaches(agents, stripCount, totalWorking);
         }
 
+        bool isSquadCelebrationDemo = string.Equals(state.DemoScenario, "celebrate", StringComparison.OrdinalIgnoreCase);
+
         if (approvalAgent != null)
         {
             RenderApprovalMode(buf, approvalAgent, timeSeconds);
@@ -297,32 +343,46 @@ public sealed class TaskbarPetRenderer
         {
             RenderFailedMode(buf, failedAgent, timeSeconds, emitTick);
         }
-        else if (handoffMode && stripCount > 0)
+        else if ((handoffMode || dramaMode) && stripCount > 0)
         {
-            RenderWorkingMode(buf, state, stripCount, Math.Max(totalWorking, stripCount), dt, timeSeconds, emitTick, consumeNewHandoffs: hasNewResolvableHandoff);
+            RenderWorkingMode(buf, state, stripCount, Math.Max(totalWorking, stripCount), dt, timeSeconds, emitTick, consumeNewHandoffs: hasNewResolvableHandoff, isNight: isNight, effects: effects);
+        }
+        else if (isSquadCelebrationDemo || (doneCount > 1))
+        {
+            RenderSquadCelebrationMode(buf, state, doneCount, dt, timeSeconds, emitTick, isNight, effects);
         }
         else if (doneAgent != null)
         {
+            _dramaController.Update(dt, timeSeconds, state, ReadOnlySpan<SlotBinding>.Empty, _particles, CanvasWidth, 140, CanvasWidth - 10, 20, emitTick);
             RenderDoneMode(buf, doneAgent, timeSeconds, emitTick);
         }
         else if (stripCount > 0)
         {
-            RenderWorkingMode(buf, state, stripCount, totalWorking, dt, timeSeconds, emitTick, consumeNewHandoffs: false);
+            RenderWorkingMode(buf, state, stripCount, totalWorking, dt, timeSeconds, emitTick, consumeNewHandoffs: false, isNight: isNight, effects: effects);
         }
         else if (showIdleChill)
         {
-            if (MixiChillRenderer.ShouldRenderMixiChillCorner(state, showMixiWhenAllIdle, _motionSystem.IsHandoffActive, _motionSystem.LastHandledHandoffSeq))
+            _dramaController.Update(dt, timeSeconds, state, ReadOnlySpan<SlotBinding>.Empty, _particles, CanvasWidth, 160, CanvasWidth - 10, 20, emitTick);
+            if (_dramaController.IsCelebrationActive && agents.Count > 0)
             {
-                RenderMixiChillMode(buf, timeSeconds);
+                int celCount = Math.Min(4, agents.Count);
+                for (int i = 0; i < celCount; i++) _celebrateScratch[i] = agents[i];
+                RenderSquadCelebrationMode(buf, state, celCount, dt, timeSeconds, emitTick, isNight, effects);
+            }
+            else if (MixiChillRenderer.ShouldRenderMixiChillCorner(state, showMixiWhenAllIdle, _motionSystem.IsHandoffActive, _motionSystem.LastHandledHandoffSeq, _dramaController.IsDramaActive))
+            {
+                RenderMixiChillMode(buf, timeSeconds, isNight, effects);
             }
             else
             {
-                RenderIdleChillMode(buf, state, timeSeconds, emitTick);
+                RenderIdleChillMode(buf, state, timeSeconds, emitTick, isNight, effects);
             }
         }
 
+        _dramaController.DrawOverlays(buf, timeSeconds);
         _particles.Update(dt);
         _particles.Render(buf);
+        DrawWakeUpPulse(buf, timeSeconds, effects.WakeUpPulseRemainingSeconds);
 
         return _hitRegions;
     }
@@ -666,6 +726,96 @@ public sealed class TaskbarPetRenderer
 
     internal string? LastRenderedIdlePrimarySprite { get; private set; }
 
+    private void RenderSquadCelebrationMode(
+        PixelBuffer buf,
+        HqState state,
+        int count,
+        float dt,
+        float timeSeconds,
+        bool emitTick,
+        bool isNight,
+        SceneEffectsState effects)
+    {
+        if (count <= 0)
+        {
+            count = Math.Min(4, state.Agents.Count);
+            for (int i = 0; i < count; i++) _celebrateScratch[i] = state.Agents[i];
+        }
+        if (count <= 0) return;
+
+        int spacing = count == 2 ? 64 : 46;
+        const int rightmostX = 346;
+        int minX = Math.Max(12, rightmostX - (count - 1) * spacing - 24);
+
+        _dramaController.Update(
+            dt,
+            timeSeconds,
+            state,
+            ReadOnlySpan<SlotBinding>.Empty,
+            _particles,
+            CanvasWidth,
+            confettiMinX: minX,
+            confettiMaxX: CanvasWidth - 10,
+            confettiTopY: 16,
+            emitTick: emitTick);
+
+        if (emitTick && _particles.ActiveCount < 48)
+        {
+            _particles.EmitCelebrationConfettiShower(minX, CanvasWidth - 10, 16, 8);
+        }
+
+        for (int i = 0; i < count; i++)
+        {
+            AgentSnapshot ag = _celebrateScratch[i];
+            int cx = rightmostX - i * spacing;
+            string sprite = ShinobiSpriteRenderer.NormalizeSpriteKey(ag.SpriteKey);
+
+            if (isNight)
+            {
+                buf.BlendRect(cx - 14, GroundY - 5, 28, 4, ColorGold, 30);
+            }
+
+            if (effects.IsMediaPlaying)
+            {
+                ShinobiSpriteRenderer.DrawMusicEqualizer(buf, cx - 22, GroundY - 9, timeSeconds, seed: i);
+            }
+
+            ShinobiSpriteRenderer.DrawCharacter(
+                buf,
+                sprite,
+                AgentState.Done,
+                cx,
+                GroundY,
+                timeSeconds,
+                phaseOffset: i,
+                behaviorVariant: ag.BehaviorVariant,
+                celebrationHop: true);
+
+            int hitCx = Math.Clamp(cx, 18, CanvasWidth - 18);
+            if (!string.Equals(_cachedCelebrateAgentIds[i], ag.Id, StringComparison.OrdinalIgnoreCase))
+            {
+                _cachedCelebrateAgentIds[i] = ag.Id;
+                _cachedCelebrateActionIds[i] = $"agent:{ag.Id}";
+            }
+            _hitRegions.Add(new PetHitRegion(_cachedCelebrateActionIds[i]!, hitCx - 16, GroundY - 34, 32, 36, ag.Name));
+        }
+
+        // Crisp celebratory emerald/gold banner pill above the hopping squad
+        ReadOnlySpan<char> banner = "SQUAD CELEBRATION!".AsSpan();
+        int pillW = Math.Min(150, PixelFont.MeasureWidth(banner, PixelFontSize.Small) + 22);
+        int pillH = 17;
+        int groupCenterX = rightmostX - ((count - 1) * spacing) / 2;
+        int pillX = Math.Clamp(groupCenterX - pillW / 2, 8, CanvasWidth - pillW - 6);
+        int pillY = GroundY - 56;
+        int borderCol = (((int)(timeSeconds * 8f)) & 1) == 0 ? ColorEmerald : ColorGold;
+
+        buf.BlendRect(pillX + 1, pillY + 1, pillW, pillH, ColorOutline, 135);
+        buf.DrawPixelCard(pillX, pillY, pillW, pillH, ColorEmeraldCardBg, borderCol, ColorUtil.WithAlpha(ColorWhite, 42));
+        buf.FillRect(pillX + 6, pillY + 6, 4, 4, ColorGold);
+        PixelFont.DrawTextTruncated(buf, pillX + 14, pillY + 6, pillW - 18, banner, ColorWhite, PixelFontSize.Small);
+        _hitRegions.Add(new PetHitRegion("open_orca", pillX, pillY, pillW, pillH, "Open Orca"));
+    }
+
     private void RenderWorkingMode(
         PixelBuffer buf,
         HqState state,
@@ -674,13 +824,15 @@ public sealed class TaskbarPetRenderer
         float dt,
         float timeSeconds,
         bool emitTick,
-        bool consumeNewHandoffs)
+        bool consumeNewHandoffs,
+        bool isNight,
+        SceneEffectsState effects)
     {
         int spacing = stripCount == 2 ? 68 : (stripCount <= 4 ? 48 : 38);
         const int rightmostX = 346;
         const int deskCharY = GroundY - 6;
 
-        // 1. Bind visible slots into ActorMotionSystem (rugOffsetY: 4 keeps feet at GroundY-2=122, zero clipping!)
+        // 1. Bind visible slots into ActorMotionSystem & TeamDramaController
         BuildStripSlotBindings(stripCount);
 
         _motionSystem.Update(
@@ -695,8 +847,20 @@ public sealed class TaskbarPetRenderer
             enableAmbientStroll: false,
             consumeNewHandoffs: consumeNewHandoffs);
 
-        // 2. Pass 1: Stationary / behind-desk characters + ALL mini-desks (sender desk stays intact while away!)
-        // Hit regions are emitted in exact frame draw order: behind-desk actors first, foreground walking/delivering actors LAST.
+        int confettiMinX = Math.Max(12, rightmostX - (stripCount - 1) * spacing - 24);
+        _dramaController.Update(
+            dt,
+            timeSeconds,
+            state,
+            _slotBindings.AsSpan(0, stripCount),
+            _particles,
+            CanvasWidth,
+            confettiMinX: confettiMinX,
+            confettiMaxX: CanvasWidth - 10,
+            confettiTopY: 16,
+            emitTick: emitTick);
+
+        // 2. Pass 1: Stationary / behind-desk characters + ALL mini-desks
         for (int i = 0; i < stripCount; i++)
         {
             AgentSnapshot ag = _workingScratch[i];
@@ -704,6 +868,7 @@ public sealed class TaskbarPetRenderer
             string sprite = ShinobiSpriteRenderer.NormalizeSpriteKey(ag.SpriteKey);
             AgentActionKind actionKind = _cachedWorkingItems[i].ActionKind;
             ref readonly var motion = ref _motionSystem.GetMotion(i);
+            bool panicSprint = _dramaController.IsSlotInPanicSprint(ag.Id, sprite);
 
             if (motion.BehindDesk)
             {
@@ -721,7 +886,10 @@ public sealed class TaskbarPetRenderer
                     isWalking: isStepping,
                     carryingScroll: motion.CarryingScroll,
                     facingRight: motion.FacingRight,
-                    behaviorVariant: ag.BehaviorVariant);
+                    behaviorVariant: ag.BehaviorVariant,
+                    panicSprint: panicSprint,
+                    celebrationHop: _dramaController.IsCelebrationActive,
+                    musicGroove: effects.IsMediaPlaying && !panicSprint);
             }
 
             ShinobiSpriteRenderer.DrawMiniTaskbarDesk(
@@ -734,6 +902,16 @@ public sealed class TaskbarPetRenderer
                 actionKind: actionKind,
                 deskRig: ag.DeskRig,
                 behaviorVariant: ag.BehaviorVariant);
+
+            if (isNight)
+            {
+                ShinobiSpriteRenderer.DrawNightDeskLamp(buf, cx, GroundY, timeSeconds, miniDesk: true);
+            }
+
+            if (effects.IsMediaPlaying)
+            {
+                ShinobiSpriteRenderer.DrawMusicEqualizer(buf, cx - 18, GroundY - 12, timeSeconds, seed: i);
+            }
 
             if (motion.BehindDesk)
             {
@@ -748,8 +926,7 @@ public sealed class TaskbarPetRenderer
             }
         }
 
-        // 3. Pass 2: Walking / Delivering foreground actors + Minato golden Hiraishin afterimages + delivery sparkle
-        // Emitting foreground hit regions LAST guarantees reverse-order hit-testing always picks the visibly foreground sender.
+        // 3. Pass 2: Walking / Delivering foreground actors + Minato golden Hiraishin afterimages
         for (int i = 0; i < stripCount; i++)
         {
             ref readonly var motion = ref _motionSystem.GetMotion(i);
@@ -761,13 +938,13 @@ public sealed class TaskbarPetRenderer
             int actorY = deskCharY + motion.OffsetY;
             string sprite = ShinobiSpriteRenderer.NormalizeSpriteKey(ag.SpriteKey);
             AgentActionKind actionKind = _cachedWorkingItems[i].ActionKind;
+            bool panicSprint = _dramaController.IsSlotInPanicSprint(ag.Id, sprite);
 
             if (motion.IsFlashTrail && motion.State is ActorMotionState.WalkingToTarget or ActorMotionState.WalkingBack)
             {
                 int trailDir = motion.FacingRight ? -1 : 1;
                 DrawHiraishinAfterimage(buf, actorX + trailDir * 16, actorY, 58);
                 DrawHiraishinAfterimage(buf, actorX + trailDir * 8, actorY, 118);
-                // Crisp golden Hiraishin horizontal speed streaks
                 buf.BlendRect(actorX + trailDir * 14 - 4, actorY - 14, 10, 1, ColorAmberBright, 165);
                 buf.BlendRect(actorX + trailDir * 10 - 3, actorY - 9, 8, 1, ColorGold, 190);
             }
@@ -786,7 +963,10 @@ public sealed class TaskbarPetRenderer
                 isWalking: isWalking,
                 carryingScroll: motion.CarryingScroll,
                 facingRight: motion.FacingRight,
-                behaviorVariant: ag.BehaviorVariant);
+                behaviorVariant: ag.BehaviorVariant,
+                panicSprint: panicSprint,
+                celebrationHop: _dramaController.IsCelebrationActive,
+                musicGroove: effects.IsMediaPlaying && !panicSprint);
 
             if (motion.State == ActorMotionState.Delivering)
             {
@@ -799,10 +979,15 @@ public sealed class TaskbarPetRenderer
             _hitRegions.Add(new PetHitRegion(_cachedWorkingItems[i].HitRegionAction, hitCx - 18, GroundY - 36, 36, 38, ag.Name));
         }
 
-        // 4. Status pill (gold accent when a living handoff is active, else cyan working pill)
+        // 4. Status pill (crimson drama pill, gold handoff pill, or cyan working pill)
+        bool dramaActive = _dramaController.IsDramaActive;
         bool handoffActive = _motionSystem.IsHandoffActive;
         ReadOnlySpan<char> pillText;
-        if (handoffActive)
+        if (dramaActive)
+        {
+            pillText = (_dramaController.IsRedScrollFlying ? "REQUEST CHANGES!" : "PANIC SPRINT • FIX PR!").AsSpan();
+        }
+        else if (handoffActive)
         {
             int fromIdx = _motionSystem.ActiveHandoffStationIndex;
             string fromName = (fromIdx >= 0 && fromIdx < stripCount && !string.IsNullOrEmpty(_cachedWorkingItems[fromIdx].ShortName))
@@ -871,11 +1056,11 @@ public sealed class TaskbarPetRenderer
         int pillH = 18;
         int groupCenterX = rightmostX - ((stripCount - 1) * spacing) / 2;
         int pillX = Math.Clamp(groupCenterX - pillW / 2, 8, CanvasWidth - pillW - 6);
-        int pillY = GroundY - 58;
+        int pillY = dramaActive ? GroundY - 76 : GroundY - 58;
 
-        int pillBg = handoffActive ? ColorAmberCardBg : ColorCyanCardBg;
-        int pillBorder = handoffActive ? ColorAmberBright : ColorCyan;
-        int ledCol = handoffActive ? ColorGold : ColorCyan;
+        int pillBg = dramaActive ? ColorCrimsonCardBg : (handoffActive ? ColorAmberCardBg : ColorCyanCardBg);
+        int pillBorder = dramaActive ? ColorCrimson : (handoffActive ? ColorAmberBright : ColorCyan);
+        int ledCol = dramaActive ? ColorCrimson : (handoffActive ? ColorGold : ColorCyan);
 
         buf.BlendRect(pillX + 1, pillY + 1, pillW, pillH, ColorOutline, 130);
         buf.DrawPixelCard(pillX, pillY, pillW, pillH, pillBg, pillBorder, ColorUtil.WithAlpha(ColorWhite, 40));
@@ -884,7 +1069,7 @@ public sealed class TaskbarPetRenderer
         buf.BlendRect(pillX + 7, pillY + 7, 4, 4, ledCol, ledAlpha);
         PixelFont.DrawTextTruncated(buf, pillX + 15, pillY + 6, pillW - 21, pillText, ColorWhite, PixelFontSize.Small);
 
-        bool singleProcess = !handoffActive && stripCount == 1 &&
+        bool singleProcess = !handoffActive && !dramaActive && stripCount == 1 &&
             string.Equals(_workingScratch[0].Source, "process", StringComparison.OrdinalIgnoreCase);
         string actionId = singleProcess
             ? (_cachedSingleWorkingFocusActionId ?? (HasVerifiedProcessIdentity(_workingScratch[0])
@@ -900,7 +1085,6 @@ public sealed class TaskbarPetRenderer
 
     private static void DrawHiraishinAfterimage(PixelBuffer buf, int cx, int bottomY, int alpha)
     {
-        // Translucent golden Minato Hiraishin flash silhouette (spiky hair + Hokage cloak + boots)
         buf.BlendRect(cx - 4, bottomY - 22, 8, 8, ColorAmberBright, alpha);
         buf.BlendRect(cx - 2, bottomY - 24, 4, 2, ColorGold, alpha);
         buf.BlendRect(cx - 6, bottomY - 14, 12, 9, ColorGold, alpha);
@@ -919,12 +1103,20 @@ public sealed class TaskbarPetRenderer
         buf.SetPixel(cx, cy, ColorWhite);
     }
 
-    private void RenderMixiChillMode(PixelBuffer buf, float timeSeconds)
+    private void RenderMixiChillMode(PixelBuffer buf, float timeSeconds, bool isNight, SceneEffectsState effects)
     {
         const int mixiCx = 330;
         const int mixiGroundY = GroundY - 2; // 122 -> spans y = 76..122, x = 290..368 (zero clipping!)
 
-        MixiChillActivity activity = MixiChillRenderer.DrawChillCorner(buf, mixiCx, mixiGroundY, timeSeconds);
+        MixiChillActivity activity = MixiChillRenderer.DrawChillCorner(
+            buf,
+            mixiCx,
+            mixiGroundY,
+            timeSeconds,
+            activityOverride: effects.PinnedMixiActivity,
+            isStartled: effects.IsMixiStartled,
+            isMediaPlaying: effects.IsMediaPlaying,
+            isNightMode: isNight);
         IsMixiChillActive = true;
         ActiveMixiActivity = activity;
 
@@ -943,17 +1135,35 @@ public sealed class TaskbarPetRenderer
         buf.BlendRect(pillX + 6, pillY + 6, 4, 4, ColorAmberBright, dotAlpha);
         PixelFont.DrawTextTruncated(buf, pillX + 13, pillY + 5, pillW - 18, badgeText, ColorWhite, PixelFontSize.Small);
 
+        // Interactive poke speech bubble rendered cleanly above badge (y = 30..48 -> zero clipping!)
+        if (effects.HasActiveMixiSpeech)
+        {
+            MixiChillRenderer.DrawPokeSpeechBubble(
+                buf,
+                anchorX: 342,
+                anchorY: 48,
+                effects.MixiSpeechText.AsSpan(),
+                effects.MixiPokeElapsedSeconds,
+                CanvasWidth,
+                CanvasHeight);
+        }
+
         // Clickable hit region covering the Do Mixi Gaming chill corner & badge
         int hitLeft = Math.Min(pillX, mixiCx - 40);
         int hitRight = Math.Min(CanvasWidth, Math.Max(pillX + pillW, mixiCx + 38));
         _hitRegions.Add(new PetHitRegion("agent:mixi-chill", hitLeft, pillY, hitRight - hitLeft, mixiGroundY - pillY + 2, badgeText));
     }
 
-    private void RenderIdleChillMode(PixelBuffer buf, HqState state, float timeSeconds, bool emitTick)
+    private void RenderIdleChillMode(
+        PixelBuffer buf,
+        HqState state,
+        float timeSeconds,
+        bool emitTick,
+        bool isNight,
+        SceneEffectsState effects)
     {
         const int primaryX = 346;
 
-        // Always draw the EXACT sprite of the idle primary agent matching its bound hit target
         string primarySprite = _idlePrimaryNonProcess != null
             ? ShinobiSpriteRenderer.NormalizeSpriteKey(_idlePrimaryNonProcess.SpriteKey)
             : "kakashi";
@@ -963,9 +1173,27 @@ public sealed class TaskbarPetRenderer
 
         LastRenderedIdlePrimarySprite = primarySprite;
 
-        // Draw primary idle agent
-        ShinobiSpriteRenderer.DrawCharacter(buf, primarySprite, AgentState.Idle, primaryX, GroundY, timeSeconds, behaviorVariant: primaryVariant);
+        if (isNight)
+        {
+            buf.BlendRect(primaryX - 18, GroundY - 5, 36, 4, ColorGold, 30);
+        }
+
+        ShinobiSpriteRenderer.DrawCharacter(
+            buf,
+            primarySprite,
+            AgentState.Idle,
+            primaryX,
+            GroundY,
+            timeSeconds,
+            behaviorVariant: primaryVariant,
+            celebrationHop: _dramaController.IsCelebrationActive,
+            musicGroove: effects.IsMediaPlaying);
         _hitRegions.Add(new PetHitRegion(primaryActionId, primaryX - 16, GroundY - 30, 32, 32, primaryName));
+
+        if (effects.IsMediaPlaying)
+        {
+            ShinobiSpriteRenderer.DrawMusicEqualizer(buf, primaryX - 24, GroundY - 10, timeSeconds, seed: 3);
+        }
 
         if (primarySprite == "shikamaru")
         {
@@ -981,7 +1209,22 @@ public sealed class TaskbarPetRenderer
             string tSprite = ShinobiSpriteRenderer.NormalizeSpriteKey(tAg.SpriteKey);
             string actionId = _cachedIdleTerminalActionIds[i] ?? $"agent:{tAg.Id}";
 
-            ShinobiSpriteRenderer.DrawCharacter(buf, tSprite, AgentState.Idle, tx, GroundY, timeSeconds, phaseOffset: i + 1, behaviorVariant: tAg.BehaviorVariant);
+            if (isNight)
+            {
+                buf.BlendRect(tx - 14, GroundY - 5, 28, 4, ColorGold, 26);
+            }
+
+            ShinobiSpriteRenderer.DrawCharacter(
+                buf,
+                tSprite,
+                AgentState.Idle,
+                tx,
+                GroundY,
+                timeSeconds,
+                phaseOffset: i + 1,
+                behaviorVariant: tAg.BehaviorVariant,
+                celebrationHop: _dramaController.IsCelebrationActive,
+                musicGroove: effects.IsMediaPlaying);
             _hitRegions.Add(new PetHitRegion(actionId, tx - 16, GroundY - 30, 32, 32, tAg.Name));
         }
 
@@ -1013,6 +1256,17 @@ public sealed class TaskbarPetRenderer
             PixelFont.DrawTextCentered(buf, bX + bW / 2, bY + 5, idleCaption, ColorUtil.FromRgb(203, 213, 225), PixelFontSize.Small);
             PixelFont.DrawTextCentered(buf, bX + bW / 2, bY + 13, "HQ IDLE", ColorSlate, PixelFontSize.Small);
         }
+    }
+
+    private static void DrawWakeUpPulse(PixelBuffer buf, float timeSeconds, float remainingSeconds)
+    {
+        if (remainingSeconds <= 0f) return;
+
+        int pulseAlpha = 140 + (int)(MathF.Sin(timeSeconds * 10f) * 90f);
+        int ringCol = (((int)(timeSeconds * 8f)) & 1) == 0 ? ColorGold : ColorCyan;
+        int col = ColorUtil.WithAlpha(ringCol, Math.Clamp(pulseAlpha, 60, 240));
+        // Clean glowing highlight pill around the right taskbar pet dock area
+        buf.DrawOutlineRect(274, 46, 106, 80, col, thickness: 2);
     }
 
     private static string ShortenName(string name, string? id = null)

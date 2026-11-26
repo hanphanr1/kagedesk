@@ -38,7 +38,7 @@ public class LocalEventBridgeTests
         var root = doc.RootElement;
 
         Assert.True(root.GetProperty("ok").GetBoolean());
-        Assert.Equal("2.1.0", root.GetProperty("version").GetString());
+        Assert.Equal("2.2.0", root.GetProperty("version").GetString());
         Assert.Equal("shinobi-hq", root.GetProperty("activeTheme").GetString());
         Assert.True(root.GetProperty("workingSetMb").GetDouble() > 0);
         Assert.True(root.TryGetProperty("uptimeSec", out _));

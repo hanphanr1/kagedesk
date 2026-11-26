@@ -23,4 +23,10 @@ public class AppConfig
     public bool LaunchOnStartup { get; set; } = false;
     public bool SoundEnabled { get; set; } = true;
     public bool ShowMixiWhenAllIdle { get; set; } = true;
+    public string? PinnedMixiActivity { get; set; } = null;
+    public string WallpaperMonitorDeviceName { get; set; } = "";
+    public string PetMonitorDeviceName { get; set; } = "";
+    public int? PetRelativeX { get; set; } = null;
+    public bool EnableMediaSync { get; set; } = true;
+    public bool EnableSessionLogWatcher { get; set; } = true;
 }

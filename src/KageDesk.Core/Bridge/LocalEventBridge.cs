@@ -185,7 +185,7 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
             await WriteJsonAsync(response, 200, new
             {
                 ok = true,
-                version = "2.1.0",
+                version = "2.2.0",
                 workingSetMb = Math.Round(workingSet, 2),
                 uptimeSec = Math.Round(uptime, 1),
                 activeTheme = activeTheme,
@@ -327,6 +327,44 @@ public class LocalEventBridge : IDisposable, IAsyncDisposable
                 }
 
                 // Capture ONE snapshot and resolve BOTH endpoints with strict 2-pass priority
+                HqState snapshot = _aggregator.GetState();
+                if (AgentAliasResolver.AreSameCanonicalEndpoint(
+                    fromId,
+                    toId,
+                    snapshot,
+                    out string resolvedFrom,
+                    out string resolvedTo,
+                    out bool fromIsConcreteId,
+                    out bool toIsConcreteId))
+                {
+                    await WriteJsonAsync(response, 400, new { ok = false, error = "fromAgentId and toAgentId cannot resolve to the same agent endpoint" }).ConfigureAwait(false);
+                    return;
+                }
+
+                payload = payload with
+                {
+                    FromAgentId = resolvedFrom,
+                    ToAgentId = resolvedTo,
+                    FromIsConcreteId = fromIsConcreteId,
+                    ToIsConcreteId = toIsConcreteId
+                };
+            }
+            else if (string.Equals(payload.Type, "review_changes", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(payload.Type, "drama", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(payload.Type, "request_changes", StringComparison.OrdinalIgnoreCase))
+            {
+                var fromId = (payload.FromAgentId ?? payload.AgentId)?.Trim();
+                var toId = payload.ToAgentId?.Trim();
+                if (string.IsNullOrEmpty(fromId)) fromId = "kakashi";
+                if (string.IsNullOrEmpty(toId)) toId = "minato";
+
+                if (fromId.Length > 64 || toId.Length > 64 ||
+                    !IsValidEndpointId(fromId) || !IsValidEndpointId(toId))
+                {
+                    await WriteJsonAsync(response, 400, new { ok = false, error = "Invalid endpoint ID format: must be 1-64 characters matching ^[A-Za-z0-9_.:-]+$" }).ConfigureAwait(false);
+                    return;
+                }
+
                 HqState snapshot = _aggregator.GetState();
                 if (AgentAliasResolver.AreSameCanonicalEndpoint(
                     fromId,

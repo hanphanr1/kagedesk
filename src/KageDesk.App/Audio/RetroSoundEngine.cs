@@ -8,7 +8,10 @@ public enum SoundKind
     Approval,
     Done,
     Fail,
-    Handoff
+    Handoff,
+    MixiChirp,
+    Drama,
+    Celebrate
 }
 
 public sealed class RetroSoundEngine : IDisposable
@@ -168,6 +171,9 @@ public sealed class RetroSoundEngine : IDisposable
             SoundKind.Done => GenerateDone(sampleRate),
             SoundKind.Fail => GenerateFail(sampleRate),
             SoundKind.Handoff => GenerateHandoff(sampleRate),
+            SoundKind.MixiChirp => GenerateMixiChirp(sampleRate),
+            SoundKind.Drama => GenerateDrama(sampleRate),
+            SoundKind.Celebrate => GenerateCelebrate(sampleRate),
             _ => Array.Empty<float>()
         };
 
@@ -299,6 +305,101 @@ public sealed class RetroSoundEngine : IDisposable
             if (t < 0.006f) env *= (t / 0.006f);
 
             buf[i] = val * env;
+        }
+
+        return buf;
+    }
+
+    private static float[] GenerateMixiChirp(int sampleRate)
+    {
+        // Playful crisp 8-bit poke chirp: A5 (880Hz) -> D6 (1174.66Hz), 95ms, soft volume
+        float duration = 0.095f;
+        int totalSamples = (int)(sampleRate * duration);
+        float[] buf = new float[totalSamples];
+
+        float split = duration * 0.42f;
+        float phase = 0f;
+
+        for (int i = 0; i < totalSamples; i++)
+        {
+            float t = (float)i / sampleRate;
+            float freq = t < split ? 880.0f : 1174.66f;
+            phase += (2f * MathF.PI * freq) / sampleRate;
+
+            float s = MathF.Sin(phase);
+            float sq = s >= 0f ? 0.55f : -0.55f;
+            float val = sq * 0.35f + s * 0.65f;
+
+            float env = MathF.Exp(-t * 24f) * 0.24f;
+            if (t < 0.005f) env *= (t / 0.005f);
+            buf[i] = val * env;
+        }
+
+        return buf;
+    }
+
+    private static float[] GenerateDrama(int sampleRate)
+    {
+        // Sharp 2-note shinobi review-reject alert: E5 (659.25Hz) -> Bb4 (466.16Hz), 150ms
+        float duration = 0.150f;
+        int totalSamples = (int)(sampleRate * duration);
+        float[] buf = new float[totalSamples];
+
+        float split = duration * 0.48f;
+        float phase = 0f;
+
+        for (int i = 0; i < totalSamples; i++)
+        {
+            float t = (float)i / sampleRate;
+            float freq = t < split ? 659.25f : 466.16f;
+            phase += (2f * MathF.PI * freq) / sampleRate;
+
+            float s = MathF.Sin(phase);
+            float sq = s >= 0f ? 0.6f : -0.6f;
+            float val = sq * 0.5f + s * 0.5f;
+
+            float env = MathF.Exp(-t * 14f) * 0.26f;
+            if (t < 0.008f) env *= (t / 0.008f);
+            buf[i] = val * env;
+        }
+
+        return buf;
+    }
+
+    private static float[] GenerateCelebrate(int sampleRate)
+    {
+        // Cheerful 4-note 8-bit victory fanfare: C5 -> E5 -> G5 -> C6, 280ms
+        float duration = 0.280f;
+        int totalSamples = (int)(sampleRate * duration);
+        float[] buf = new float[totalSamples];
+
+        float noteLen = duration / 4f;
+        float phase = 0f;
+
+        for (int i = 0; i < totalSamples; i++)
+        {
+            float t = (float)i / sampleRate;
+            int idx = Math.Min(3, (int)(t / noteLen));
+            float freq = idx switch
+            {
+                0 => 523.25f,
+                1 => 659.25f,
+                2 => 783.99f,
+                _ => 1046.50f
+            };
+
+            phase += (2f * MathF.PI * freq) / sampleRate;
+            float s = MathF.Sin(phase);
+            float pulse = s > 0f ? 0.55f : -0.55f;
+            float val = pulse * 0.4f + s * 0.6f;
+
+            float noteT = t - idx * noteLen;
+            float noteEnv = 1f;
+            if (noteT < 0.006f) noteEnv = noteT / 0.006f;
+            else if (noteT > noteLen - 0.012f) noteEnv = Math.Max(0f, (noteLen - noteT) / 0.012f);
+
+            float globalEnv = (1f - (t / duration) * 0.25f) * 0.26f;
+            buf[i] = val * noteEnv * globalEnv;
         }
 
         return buf;

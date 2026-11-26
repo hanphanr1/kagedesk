@@ -38,6 +38,7 @@ public class HqStateAggregator
 
     private readonly Dictionary<string, AgentSnapshot> _orcaAgents = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, (AgentSnapshot Agent, DateTimeOffset ExpiresAt)> _pushedAgents = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, (AgentSnapshot Agent, DateTimeOffset ExpiresAt)> _sessionLogAgents = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, AgentSnapshot> _processAgents = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, AccountInfo> _orcaAccounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, (AccountInfo Account, DateTimeOffset ExpiresAt)> _pushedAccounts = new(StringComparer.OrdinalIgnoreCase);
@@ -56,6 +57,8 @@ public class HqStateAggregator
 
     private string? _demoScenario;
     private bool _demoHandoffEmitted;
+    private bool _demoDramaEmitted;
+    private bool _demoCelebrateEmitted;
     private DateTimeOffset _demoAnchorTime;
     private HqState _currentState;
 
@@ -113,11 +116,13 @@ public class HqStateAggregator
             {
                 _demoScenario = null;
                 _demoHandoffEmitted = false;
+                _demoDramaEmitted = false;
+                _demoCelebrateEmitted = false;
             }
             else
             {
                 var lower = scenario.Trim().ToLowerInvariant();
-                if (lower is not ("working" or "approve" or "done" or "fail" or "clone" or "handoff" or "variety" or "mixi"))
+                if (lower is not ("working" or "approve" or "done" or "fail" or "clone" or "handoff" or "variety" or "mixi" or "drama" or "celebrate"))
                 {
                     throw new ArgumentException($"Unknown demo scenario: '{scenario}'", nameof(scenario));
                 }
@@ -126,6 +131,8 @@ public class HqStateAggregator
                 {
                     _demoScenario = lower;
                     _demoHandoffEmitted = false;
+                    _demoDramaEmitted = false;
+                    _demoCelebrateEmitted = false;
                     _demoAnchorTime = _timeProvider();
                 }
             }
@@ -257,6 +264,45 @@ public class HqStateAggregator
         DisableAndClearProcessAgents();
     }
 
+    public void UpdateSessionLogActivity(IReadOnlyList<AgentSnapshot> agents, double ttlSeconds = 60.0)
+    {
+        HqState? toEmit = null;
+        lock (_lock)
+        {
+            var now = _timeProvider();
+            var expiresAt = now.AddSeconds(Math.Max(5.0, ttlSeconds));
+
+            _sessionLogAgents.Clear();
+            foreach (var a in agents)
+            {
+                _sessionLogAgents[a.Id] = (a, expiresAt);
+            }
+
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
+        }
+    }
+
+    public void ClearSessionLogActivity()
+    {
+        HqState? toEmit = null;
+        lock (_lock)
+        {
+            if (_sessionLogAgents.Count == 0) return;
+            _sessionLogAgents.Clear();
+            toEmit = RecalculateStateLocked();
+        }
+
+        if (toEmit != null)
+        {
+            StateChanged?.Invoke(this, toEmit);
+        }
+    }
+
     public void UpdateCiBuilds(IReadOnlyList<BuildInfo> builds)
     {
         HqState? toEmit = null;
@@ -379,6 +425,53 @@ public class HqStateAggregator
                     toId,
                     payload.FromIsConcreteId,
                     payload.ToIsConcreteId));
+                toEmit = RecalculateStateLocked();
+            }
+            else if (string.Equals(payload.Type, "review_changes", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(payload.Type, "drama", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(payload.Type, "request_changes", StringComparison.OrdinalIgnoreCase))
+            {
+                var fromId = !string.IsNullOrWhiteSpace(payload.FromAgentId)
+                    ? payload.FromAgentId
+                    : (!string.IsNullOrWhiteSpace(payload.AgentId) ? payload.AgentId : "kakashi");
+                var toId = !string.IsNullOrWhiteSpace(payload.ToAgentId) ? payload.ToAgentId : "minato";
+                var seq = Interlocked.Increment(ref _sequenceCounter);
+                _visualEvents.Add(new HqEvent(
+                    seq,
+                    "review_changes",
+                    payload.Message ?? $"Review REQUEST_CHANGES from {fromId} to {toId}",
+                    now,
+                    fromId,
+                    payload.TtlSeconds ?? 10.0,
+                    toId,
+                    payload.FromIsConcreteId,
+                    payload.ToIsConcreteId));
+                toEmit = RecalculateStateLocked();
+            }
+            else if (string.Equals(payload.Type, "celebrate", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(payload.Type, "pr_merged", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(payload.Type, "ci_pass", StringComparison.OrdinalIgnoreCase))
+            {
+                var seq = Interlocked.Increment(ref _sequenceCounter);
+                _visualEvents.Add(new HqEvent(
+                    seq,
+                    "celebrate",
+                    payload.Message ?? "Squad celebration!",
+                    now,
+                    payload.AgentId,
+                    payload.TtlSeconds ?? 8.0));
+                toEmit = RecalculateStateLocked();
+            }
+            else if (string.Equals(payload.Type, "mixi_poke", StringComparison.OrdinalIgnoreCase))
+            {
+                var seq = Interlocked.Increment(ref _sequenceCounter);
+                _visualEvents.Add(new HqEvent(
+                    seq,
+                    "mixi_poke",
+                    payload.Message ?? "Do Mixi poked!",
+                    now,
+                    "mixi-chill",
+                    payload.TtlSeconds ?? 4.0));
                 toEmit = RecalculateStateLocked();
             }
             else
@@ -578,13 +671,19 @@ public class HqStateAggregator
             _pushedBuilds.Remove(k);
         }
 
+        var expiredSessionLogs = _sessionLogAgents.Where(kv => now > kv.Value.ExpiresAt).Select(kv => kv.Key).ToList();
+        foreach (var k in expiredSessionLogs)
+        {
+            _sessionLogAgents.Remove(k);
+        }
+
         // If Demo scenario active, construct demo state
         if (!string.IsNullOrEmpty(_demoScenario))
         {
             return ApplyDemoScenarioLocked(_demoScenario, now);
         }
 
-        // 3. Merge agents: live orca agents + active pushed agents + process agents
+        // 3. Merge agents: live orca agents + active pushed agents + process agents (with instant session-log override)
         var mergedAgents = new Dictionary<string, AgentSnapshot>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var a in _orcaAgents.Values)
@@ -593,10 +692,54 @@ public class HqStateAggregator
         foreach (var (_, val) in _pushedAgents)
             mergedAgents[val.Agent.Id] = val.Agent;
 
+        var matchedSessionLogKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         foreach (var a in _processAgents.Values)
         {
-            if (!mergedAgents.ContainsKey(a.Id))
-                mergedAgents[a.Id] = a;
+            if (mergedAgents.ContainsKey(a.Id))
+                continue;
+
+            var effectiveAgent = a;
+            foreach (var (slKey, (slAgent, _)) in _sessionLogAgents)
+            {
+                if (MatchesSessionProvider(effectiveAgent, slAgent))
+                {
+                    effectiveAgent = effectiveAgent with
+                    {
+                        State = slAgent.State,
+                        ToolName = slAgent.ToolName ?? effectiveAgent.ToolName,
+                        LastActivityAt = slAgent.LastActivityAt ?? effectiveAgent.LastActivityAt,
+                        UpdatedAt = slAgent.UpdatedAt ?? effectiveAgent.UpdatedAt
+                    };
+                    matchedSessionLogKeys.Add(slKey);
+                    break;
+                }
+            }
+
+            mergedAgents[effectiveAgent.Id] = effectiveAgent;
+        }
+
+        // Include fresh session-log providers that don't yet have a matching process or pushed agent
+        foreach (var (slKey, (slAgent, _)) in _sessionLogAgents)
+        {
+            if (matchedSessionLogKeys.Contains(slKey))
+                continue;
+
+            bool alreadyRepresented = false;
+            foreach (var existing in mergedAgents.Values)
+            {
+                if (string.Equals(existing.Id, slAgent.Id, StringComparison.OrdinalIgnoreCase) ||
+                    MatchesSessionProvider(existing, slAgent))
+                {
+                    alreadyRepresented = true;
+                    break;
+                }
+            }
+
+            if (!alreadyRepresented)
+            {
+                mergedAgents[slAgent.Id] = slAgent;
+            }
         }
 
         // 4. Celebration window & relaxation / pruning
@@ -774,19 +917,56 @@ public class HqStateAggregator
             }
         }
 
-        // Approval raised
+        // Approval raised, Done celebration, & Review REQUEST_CHANGES drama detection
         var prevAgentMap = prevAgents.ToDictionary(a => a.Id, StringComparer.OrdinalIgnoreCase);
+        bool anyDoneTransition = false;
         foreach (var ag in currentAgents)
         {
+            prevAgentMap.TryGetValue(ag.Id, out var prev);
+
             if (ag.State == AgentState.NeedsApproval)
             {
-                var wasNeedsApproval = prevAgentMap.TryGetValue(ag.Id, out var prev) && prev.State == AgentState.NeedsApproval;
+                var wasNeedsApproval = prev != null && prev.State == AgentState.NeedsApproval;
                 if (!wasNeedsApproval)
                 {
                     var seq = Interlocked.Increment(ref _sequenceCounter);
                     _visualEvents.Add(new HqEvent(seq, "ApprovalRaised", $"{ag.Name} needs approval: {ag.QuestionPrompt ?? "Pending question"}", now, ag.Id, 15.0));
                 }
             }
+
+            if (ag.State == AgentState.Done && (prev == null || prev.State != AgentState.Done))
+            {
+                anyDoneTransition = true;
+            }
+
+            // Detect Orca/hook Reviewer issuing REQUEST_CHANGES -> trigger Kakashi->Minato drama
+            bool isReviewer = ag.Role == AgentRole.Reviewer ||
+                              string.Equals(ag.SpriteKey, "kakashi", StringComparison.OrdinalIgnoreCase);
+            if (isReviewer && HasReviewRejectMarker(ag) && (prev == null || !HasReviewRejectMarker(prev)))
+            {
+                var coder = currentAgents.FirstOrDefault(a =>
+                    a.Role == AgentRole.Coder ||
+                    string.Equals(a.SpriteKey, "minato", StringComparison.OrdinalIgnoreCase));
+                string toId = coder?.Id ?? "minato";
+                bool toConcrete = coder != null;
+                var seq = Interlocked.Increment(ref _sequenceCounter);
+                _visualEvents.Add(new HqEvent(
+                    seq,
+                    "review_changes",
+                    $"{ag.Name} requested changes from {coder?.Name ?? "Minato"}",
+                    now,
+                    ag.Id,
+                    10.0,
+                    toId,
+                    FromIsConcreteId: true,
+                    ToIsConcreteId: toConcrete));
+            }
+        }
+
+        if (anyDoneTransition)
+        {
+            var seq = Interlocked.Increment(ref _sequenceCounter);
+            _visualEvents.Add(new HqEvent(seq, "celebrate", "Task completed! Squad celebration!", now, null, 6.0));
         }
 
         // Build pass / fail transitions
@@ -866,6 +1046,43 @@ public class HqStateAggregator
                 }
             }
         }
+    }
+
+    private static bool MatchesSessionProvider(AgentSnapshot candidate, AgentSnapshot sessionAgent)
+    {
+        string provider = sessionAgent.Id.StartsWith("session:", StringComparison.OrdinalIgnoreCase)
+            ? sessionAgent.Id.Substring("session:".Length)
+            : sessionAgent.Name;
+
+        if (string.IsNullOrWhiteSpace(provider)) return false;
+
+        string name = candidate.Name ?? string.Empty;
+        if (name.Equals(provider, StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith(provider + " ", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(candidate.Id) &&
+            candidate.Id.Contains(provider, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool HasReviewRejectMarker(AgentSnapshot agent)
+    {
+        return ContainsRejectToken(agent.LastMessage) || ContainsRejectToken(agent.TaskTitle);
+    }
+
+    private static bool ContainsRejectToken(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        return text.Contains("REQUEST_CHANGES", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("CHANGES_REQUESTED", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("REQUEST CHANGES", StringComparison.OrdinalIgnoreCase);
     }
 
     private IReadOnlyList<AccountInfo> GetMergedAccountsLocked(DateTimeOffset now)
@@ -968,6 +1185,35 @@ public class HqStateAggregator
                     _visualEvents.Add(new HqEvent(handoffSeq, "handoff", "Scroll handoff from Minato to Tsunade", anchor, "demo-coder", 10.0, "demo-tester"));
                 }
                 break;
+
+            case "drama":
+                var dramaAnchor = _demoAnchorTime == default ? now : _demoAnchorTime;
+                agents.Add(new AgentSnapshot("demo-leader", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Idle, IsBotHome: true, Source: "orca"));
+                agents.Add(new AgentSnapshot("demo-coder", "Minato (Senior Coder)", AgentRole.Coder, "minato", AgentState.Working, ToolName: "code", TaskTitle: "Fixing review feedback", IsBotHome: true, Source: "orca", WorkStartedAt: dramaAnchor.AddSeconds(-30)));
+                agents.Add(new AgentSnapshot("demo-tester", "Tsunade (QA Lead)", AgentRole.Tester, "tsunade", AgentState.Idle, IsBotHome: true, Source: "orca"));
+                agents.Add(new AgentSnapshot("demo-reviewer", "Kakashi (Code Reviewer)", AgentRole.Reviewer, "kakashi", AgentState.Working, ToolName: "review", TaskTitle: "REQUEST_CHANGES on PR #22", IsBotHome: true, Source: "orca", WorkStartedAt: dramaAnchor.AddSeconds(-10)));
+                if (!_demoDramaEmitted)
+                {
+                    _demoDramaEmitted = true;
+                    var dramaSeq = Interlocked.Increment(ref _sequenceCounter);
+                    _visualEvents.Add(new HqEvent(dramaSeq, "review_changes", "Kakashi threw REQUEST_CHANGES scroll to Minato!", dramaAnchor, "demo-reviewer", 10.0, "demo-coder", FromIsConcreteId: true, ToIsConcreteId: true));
+                }
+                break;
+
+            case "celebrate":
+                var celAnchor = _demoAnchorTime == default ? now : _demoAnchorTime;
+                agents.Add(new AgentSnapshot("demo-leader", "Shikamaru (Team Leader)", AgentRole.Leader, "shikamaru", AgentState.Done, TaskTitle: "PR merged!", UpdatedAt: celAnchor, IsBotHome: true, Source: "orca"));
+                agents.Add(new AgentSnapshot("demo-coder", "Minato (Senior Coder)", AgentRole.Coder, "minato", AgentState.Done, TaskTitle: "CI passed!", UpdatedAt: celAnchor, IsBotHome: true, Source: "orca"));
+                agents.Add(new AgentSnapshot("demo-tester", "Tsunade (QA Lead)", AgentRole.Tester, "tsunade", AgentState.Done, TaskTitle: "All tests green!", UpdatedAt: celAnchor, IsBotHome: true, Source: "orca"));
+                agents.Add(new AgentSnapshot("demo-reviewer", "Kakashi (Code Reviewer)", AgentRole.Reviewer, "kakashi", AgentState.Done, TaskTitle: "LGTM approved!", UpdatedAt: celAnchor, IsBotHome: true, Source: "orca"));
+                builds.Add(new BuildInfo("demo-pass", "kagedesk", "CI", "main", "Release v2.2", "completed", "success", UpdatedAt: celAnchor));
+                if (!_demoCelebrateEmitted)
+                {
+                    _demoCelebrateEmitted = true;
+                    var celSeq = Interlocked.Increment(ref _sequenceCounter);
+                    _visualEvents.Add(new HqEvent(celSeq, "celebrate", "Squad celebration! CI green & PR merged!", celAnchor, null, 8.0));
+                }
+                break;
         }
 
         var weather = ComputeEffectiveWeather(_config.WeatherMode, builds, now);
@@ -1065,9 +1311,10 @@ public class HqStateAggregator
             return HqMood.Busy;
         }
 
-        // 4. Celebrating (Done or BuildPassed)
+        // 4. Celebrating (Done, BuildPassed, or celebrate)
         if (agents.Any(a => a.State == AgentState.Done) ||
-            visualEvents.Any(e => string.Equals(e.Type, "BuildPassed", StringComparison.OrdinalIgnoreCase)))
+            visualEvents.Any(e => string.Equals(e.Type, "BuildPassed", StringComparison.OrdinalIgnoreCase) ||
+                                  string.Equals(e.Type, "celebrate", StringComparison.OrdinalIgnoreCase)))
         {
             return HqMood.Celebrating;
         }

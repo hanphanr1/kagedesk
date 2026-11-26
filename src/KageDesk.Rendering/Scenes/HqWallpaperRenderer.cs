@@ -56,6 +56,7 @@ public sealed class HqWallpaperRenderer
         ComputeExtraStationPriority(b).CompareTo(ComputeExtraStationPriority(a));
     private readonly ParticleSystem _particles = new();
     private readonly ActorMotionSystem _motionSystem = new();
+    private readonly TeamDramaController _dramaController = new();
     private readonly char[] _fmtScratch = new char[48];
 
     private ThemePack? _cachedTheme;
@@ -63,6 +64,8 @@ public sealed class HqWallpaperRenderer
     private readonly int[] _cachedBackdropNoExtra = new int[CanvasWidth * CanvasHeight];
     private readonly int[] _cachedBackdropWithExtra = new int[CanvasWidth * CanvasHeight];
     private ThemePack? _backdropTheme;
+    private EffectiveWeather _backdropWeatherNoExtra;
+    private EffectiveWeather _backdropWeatherWithExtra;
     private bool _backdropNoExtraValid;
     private bool _backdropWithExtraValid;
 
@@ -81,11 +84,16 @@ public sealed class HqWallpaperRenderer
 
     public bool IsMixiChillActive { get; private set; }
     public MixiChillActivity? ActiveMixiActivity { get; private set; }
+    public bool IsDramaActive => _dramaController.IsDramaActive;
+    public bool IsCelebrationActive => _dramaController.IsCelebrationActive;
+    public TeamDramaController DramaController => _dramaController;
+    public (int X, int Y, int Width, int Height)? MixiHitBounds { get; private set; }
 
     public void ResetEffects()
     {
         _particles.Reset();
         _motionSystem.Reset();
+        _dramaController.Reset();
         _lastTime = -1f;
         _emitAccum = 0f;
         _lastCloneCount = 0;
@@ -93,6 +101,7 @@ public sealed class HqWallpaperRenderer
         _lastShowMixiCorner = false;
         IsMixiChillActive = false;
         ActiveMixiActivity = null;
+        MixiHitBounds = null;
     }
 
     public void Render(
@@ -101,7 +110,8 @@ public sealed class HqWallpaperRenderer
         ThemePack theme,
         float timeSeconds,
         DateTimeOffset? nowOverride = null,
-        bool showMixiWhenAllIdle = true)
+        bool showMixiWhenAllIdle = true,
+        SceneEffectsState effects = default)
     {
         if (buf.Width < CanvasWidth || buf.Height < CanvasHeight)
         {
@@ -123,11 +133,14 @@ public sealed class HqWallpaperRenderer
         float dt = _lastTime < 0f ? 0.033f : Math.Clamp(timeSeconds - _lastTime, 0f, 0.2f);
         _lastTime = timeSeconds;
 
+        bool isNight = state.Weather == EffectiveWeather.MidnightRain;
+
         bool showMixiCorner = MixiChillRenderer.ShouldRenderMixiChillCorner(
             state,
             showMixiWhenAllIdle,
             _motionSystem.IsHandoffActive,
-            _motionSystem.LastHandledHandoffSeq);
+            _motionSystem.LastHandledHandoffSeq,
+            _dramaController.IsDramaActive);
         IsMixiChillActive = showMixiCorner;
 
         int extraCount;
@@ -167,8 +180,8 @@ public sealed class HqWallpaperRenderer
             }
         }
 
-        // 1. Walls & Floor & Rug
-        DrawRoomBackdrop(buf, timeSeconds, hasSecondZone);
+        // 1. Walls & Floor & Rug (with baked real-time Day/Dawn/Dusk/Night room lighting tint)
+        DrawRoomBackdrop(buf, timeSeconds, hasSecondZone, state.Weather);
 
         // 2. Top Wall Boards & Weather Window
         DrawAccountsBoard(buf, state, timeSeconds);
@@ -179,7 +192,7 @@ public sealed class HqWallpaperRenderer
         DrawThemeProps(buf, timeSeconds, hasSecondZone);
 
         // 4. Emit & Update Particles (zero-alloc)
-        UpdateStationParticles(dt, extraCount, coreDeskY, extraDeskY, state);
+        bool emitTick = UpdateStationParticles(dt, extraCount, coreDeskY, extraDeskY, state);
 
         int slotCount = 4 + extraCount;
         for (int i = 0; i < 4; i++)
@@ -198,7 +211,7 @@ public sealed class HqWallpaperRenderer
             _slotBindings[i] = default;
         }
 
-        // 4b. Update zero-allocation ActorMotionSystem for handoffs & ambient life
+        // 4b. Update zero-allocation ActorMotionSystem & TeamDramaController
         _motionSystem.Update(
             dt,
             timeSeconds,
@@ -210,36 +223,110 @@ public sealed class HqWallpaperRenderer
             rugOffsetY: 22,
             enableAmbientStroll: !showMixiCorner);
 
+        _dramaController.Update(
+            dt,
+            timeSeconds,
+            state,
+            _slotBindings.AsSpan(0, slotCount),
+            _particles,
+            CanvasWidth,
+            confettiMinX: 14,
+            confettiMaxX: CanvasWidth - 14,
+            confettiTopY: 18,
+            emitTick: emitTick);
+
         // 5. Row 1: 4 Core Character Workstations
         for (int i = 0; i < 4; i++)
         {
-            DrawWorkstation(buf, ref _coreSlots[i], CoreStationCentersX[i], coreDeskY, timeSeconds, i, now);
+            DrawWorkstation(
+                buf,
+                ref _coreSlots[i],
+                CoreStationCentersX[i],
+                coreDeskY,
+                timeSeconds,
+                i,
+                now,
+                isNight,
+                effects.IsMediaPlaying,
+                _dramaController.IsCelebrationActive);
         }
 
         // 6. Row 2: Exclusive All-Idle Do Mixi Gaming Chill Corner OR Dynamic External Workstations
         if (showMixiCorner)
         {
-            MixiChillActivity activity = MixiChillRenderer.DrawChillCorner(buf, cx: 192, groundY: 191, timeSeconds);
+            MixiChillActivity activity = MixiChillRenderer.DrawChillCorner(
+                buf,
+                cx: 192,
+                groundY: 191,
+                timeSeconds,
+                activityOverride: effects.PinnedMixiActivity,
+                isStartled: effects.IsMixiStartled,
+                isMediaPlaying: effects.IsMediaPlaying,
+                isNightMode: isNight);
             ActiveMixiActivity = activity;
+            MixiHitBounds = (150, 140, 82, 66);
             DrawMixiChillNameplate(buf, cx: 192, y: 194, activity);
+
+            if (effects.HasActiveMixiSpeech)
+            {
+                MixiChillRenderer.DrawPokeSpeechBubble(
+                    buf,
+                    anchorX: 208,
+                    anchorY: 152,
+                    effects.MixiSpeechText.AsSpan(),
+                    effects.MixiPokeElapsedSeconds,
+                    CanvasWidth,
+                    CanvasHeight);
+            }
         }
         else
         {
             ActiveMixiActivity = null;
+            MixiHitBounds = null;
             for (int i = 0; i < extraCount; i++)
             {
                 int cx = GetExtraStationCenterX(i, extraCount);
-                DrawWorkstation(buf, ref _extraSlots[i], cx, extraDeskY, timeSeconds, i + 4, now);
+                DrawWorkstation(
+                    buf,
+                    ref _extraSlots[i],
+                    cx,
+                    extraDeskY,
+                    timeSeconds,
+                    i + 4,
+                    now,
+                    isNight,
+                    effects.IsMediaPlaying,
+                    _dramaController.IsCelebrationActive);
             }
         }
 
-        // 7. Render Active Particles on top
+        // 7. Render Active Team Drama Overlays (red scroll arc) & Particles on top
+        _dramaController.DrawOverlays(buf, timeSeconds);
         _particles.Render(buf);
 
         // 8. Approval Spotlight & Pulsing Amber Border
         if (anyApproval)
         {
             DrawApprovalSpotlight(buf, approvalAlertX, approvalAlertY, timeSeconds);
+        }
+    }
+
+    private static void ApplyTimeOfDayRoomLighting(PixelBuffer buf, EffectiveWeather weather)
+    {
+        switch (weather)
+        {
+            case EffectiveWeather.Dawn:
+                // Soft warm rose-amber dawn light near top window wall
+                buf.BlendRect(0, 0, CanvasWidth, 74, ColorUtil.FromRgb(253, 186, 116), 14);
+                break;
+            case EffectiveWeather.Sunset:
+                // Warm golden-hour dusk wash across upper wall
+                buf.BlendRect(0, 0, CanvasWidth, 84, ColorUtil.FromRgb(251, 146, 60), 18);
+                break;
+            case EffectiveWeather.MidnightRain:
+                // Cozy deep midnight ambient shade (so warm desk lamps pop cleanly!)
+                buf.BlendRect(0, 0, CanvasWidth, CanvasHeight, ColorUtil.FromRgb(6, 10, 26), 28);
+                break;
         }
     }
 
@@ -450,7 +537,8 @@ public sealed class HqWallpaperRenderer
     private static int ResolveCoreSlotIndex(AgentSnapshot ag)
     {
         if (ag.Role == AgentRole.Clone || ag.Role == AgentRole.External) return -1;
-        if (string.Equals(ag.Source, "process", StringComparison.OrdinalIgnoreCase)) return -1;
+        if (string.Equals(ag.Source, "process", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(ag.Source, "session-log", StringComparison.OrdinalIgnoreCase)) return -1;
 
         string key = ShinobiSpriteRenderer.NormalizeSpriteKey(ag.SpriteKey);
         if (key == "shikamaru" || ag.Role == AgentRole.Leader) return 0;
@@ -473,35 +561,37 @@ public sealed class HqWallpaperRenderer
         };
     }
 
-    private void DrawRoomBackdrop(PixelBuffer buf, float timeSeconds, bool hasExtraRow)
+    private void DrawRoomBackdrop(PixelBuffer buf, float timeSeconds, bool hasExtraRow, EffectiveWeather weather)
     {
         if (buf.Width == CanvasWidth && buf.Height == CanvasHeight)
         {
             if (hasExtraRow)
             {
-                if (_backdropWithExtraValid && ReferenceEquals(_backdropTheme, _cachedTheme))
+                if (_backdropWithExtraValid && ReferenceEquals(_backdropTheme, _cachedTheme) && _backdropWeatherWithExtra == weather)
                 {
                     _cachedBackdropWithExtra.AsSpan().CopyTo(buf.Pixels);
                 }
                 else
                 {
-                    DrawRoomBackdropCore(buf, hasExtraRow: true);
+                    DrawRoomBackdropCore(buf, hasExtraRow: true, weather);
                     buf.ReadOnlyPixels.CopyTo(_cachedBackdropWithExtra);
                     _backdropWithExtraValid = true;
+                    _backdropWeatherWithExtra = weather;
                     _backdropTheme = _cachedTheme;
                 }
             }
             else
             {
-                if (_backdropNoExtraValid && ReferenceEquals(_backdropTheme, _cachedTheme))
+                if (_backdropNoExtraValid && ReferenceEquals(_backdropTheme, _cachedTheme) && _backdropWeatherNoExtra == weather)
                 {
                     _cachedBackdropNoExtra.AsSpan().CopyTo(buf.Pixels);
                 }
                 else
                 {
-                    DrawRoomBackdropCore(buf, hasExtraRow: false);
+                    DrawRoomBackdropCore(buf, hasExtraRow: false, weather);
                     buf.ReadOnlyPixels.CopyTo(_cachedBackdropNoExtra);
                     _backdropNoExtraValid = true;
+                    _backdropWeatherNoExtra = weather;
                     _backdropTheme = _cachedTheme;
                 }
             }
@@ -509,7 +599,7 @@ public sealed class HqWallpaperRenderer
         else
         {
             // Bypass the exact-size backdrop cache for non-matching or oversized buffers
-            DrawRoomBackdropCore(buf, hasExtraRow);
+            DrawRoomBackdropCore(buf, hasExtraRow, weather);
         }
 
         if (_palette.SkylineStyle == "cyber")
@@ -523,7 +613,7 @@ public sealed class HqWallpaperRenderer
         }
     }
 
-    private void DrawRoomBackdropCore(PixelBuffer buf, bool hasExtraRow)
+    private void DrawRoomBackdropCore(PixelBuffer buf, bool hasExtraRow, EffectiveWeather weather)
     {
         // Upper wall (y: 0..71)
         buf.FillVerticalGradient(0, 0, CanvasWidth, 72, _palette.WallTop, _palette.WallBottom);
@@ -619,6 +709,9 @@ public sealed class HqWallpaperRenderer
             buf.FillRect(rugX + 2, rugY + rugH - 6, 4, 4, gold);
             buf.FillRect(rugX + rugW - 6, rugY + rugH - 6, 4, 4, gold);
         }
+
+        // Bake real-time Dawn/Dusk/Night room lighting into the cached backdrop (0 cost per frame!)
+        ApplyTimeOfDayRoomLighting(buf, weather);
     }
 
     private void DrawAccountsBoard(PixelBuffer buf, HqState state, float timeSeconds)
@@ -1245,7 +1338,7 @@ public sealed class HqWallpaperRenderer
         }
     }
 
-    private void UpdateStationParticles(float dt, int extraCount, int coreDeskY, int extraDeskY, HqState state)
+    private bool UpdateStationParticles(float dt, int extraCount, int coreDeskY, int extraDeskY, HqState state)
     {
         // Trigger Ninja Poof burst whenever clones newly appear or CloneSpawned event is active
         bool cloneEvent = false;
@@ -1268,10 +1361,12 @@ public sealed class HqWallpaperRenderer
         }
         _lastCloneCount = extraCount;
 
+        bool emitTick = false;
         _emitAccum += dt;
         if (_emitAccum >= 0.14f)
         {
             _emitAccum = 0f;
+            emitTick = true;
             for (int i = 0; i < 4; i++)
             {
                 EmitForSlot(ref _coreSlots[i], CoreStationCentersX[i], coreDeskY);
@@ -1283,6 +1378,7 @@ public sealed class HqWallpaperRenderer
         }
 
         _particles.Update(dt);
+        return emitTick;
     }
 
     private void EmitForSlot(ref StationSlot slot, int cx, int deskY)
@@ -1349,7 +1445,17 @@ public sealed class HqWallpaperRenderer
         return new NameplateLayout(totalW, h, x, y, nameAvail, bx, badgeW, h - 2);
     }
 
-    private void DrawWorkstation(PixelBuffer buf, ref StationSlot slot, int cx, int deskY, float timeSeconds, int stationIdx, DateTimeOffset now)
+    private void DrawWorkstation(
+        PixelBuffer buf,
+        ref StationSlot slot,
+        int cx,
+        int deskY,
+        float timeSeconds,
+        int stationIdx,
+        DateTimeOffset now,
+        bool isNight,
+        bool isMediaPlaying,
+        bool isCelebrationActive)
     {
         AgentActionKind actionKind = slot.ActionKind;
         ref readonly var motion = ref _motionSystem.GetMotion(stationIdx);
@@ -1360,6 +1466,7 @@ public sealed class HqWallpaperRenderer
         bool isWalking = motion.State is ActorMotionState.StepOut or ActorMotionState.WalkingToTarget or ActorMotionState.WalkingBack or ActorMotionState.StepBack or ActorMotionState.IdleStroll;
         bool carryingScroll = motion.CarryingScroll;
         bool facingRight = motion.FacingRight;
+        bool panicSprint = _dramaController.IsSlotInPanicSprint(slot.AgentId, slot.SpriteKey);
 
         // Character sits behind desk with full face & upper outfit clearly visible above desk & monitors (or steps out/walks)
         ShinobiSpriteRenderer.DrawCharacter(
@@ -1376,7 +1483,10 @@ public sealed class HqWallpaperRenderer
             isWalking: isWalking,
             carryingScroll: carryingScroll,
             facingRight: facingRight,
-            behaviorVariant: slot.BehaviorVariant);
+            behaviorVariant: slot.BehaviorVariant,
+            panicSprint: panicSprint,
+            celebrationHop: isCelebrationActive,
+            musicGroove: isMediaPlaying && !panicSprint);
 
         // Desk & interactive station props
         ShinobiSpriteRenderer.DrawDesk(
@@ -1391,6 +1501,18 @@ public sealed class HqWallpaperRenderer
             actionKind: actionKind,
             deskRig: slot.DeskRig,
             behaviorVariant: slot.BehaviorVariant);
+
+        // Night mode warm glowing desk lamp on workstation
+        if (isNight)
+        {
+            ShinobiSpriteRenderer.DrawNightDeskLamp(buf, cx, deskY, timeSeconds, miniDesk: false);
+        }
+
+        // Media Sync animated pixel equalizer widget on active/occupied desks
+        if (isMediaPlaying && (slot.State == AgentState.Working || slot.Occupied))
+        {
+            ShinobiSpriteRenderer.DrawMusicEqualizer(buf, cx - 28, deskY - 9, timeSeconds, seed: stationIdx);
+        }
 
         // Floating status bubble above head (for alert/done/fail)
         int bubbleY = deskY - 22;

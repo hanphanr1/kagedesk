@@ -8,11 +8,13 @@ public class UiDispatcherForm : Form
     private static readonly uint WmTaskbarCreated = Win32Interop.RegisterWindowMessage("TaskbarCreated");
 
     public event Action? TaskbarCreated;
+    public event Action? WakeUpRequested;
 
     protected override bool ShowWithoutActivation => true;
 
     public UiDispatcherForm()
     {
+        Text = SingleInstanceWakeUp.DispatcherWindowTitle;
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
@@ -36,6 +38,10 @@ public class UiDispatcherForm : Form
         if (m.Msg == (int)WmTaskbarCreated && WmTaskbarCreated != 0)
         {
             TaskbarCreated?.Invoke();
+        }
+        else if (SingleInstanceWakeUp.IsWakeUpMessage(m.Msg))
+        {
+            WakeUpRequested?.Invoke();
         }
         base.WndProc(ref m);
     }

@@ -24,6 +24,8 @@ public class WallpaperHostForm : Form
     private bool _disposed;
 
     public bool ShowMixiWhenAllIdle => _showMixiWhenAllIdle;
+    public bool IsMixiChillActive => _renderer.IsMixiChillActive;
+    public Func<SceneEffectsState>? GetSceneEffects { get; set; }
 
     public bool IsAttached
     {
@@ -57,6 +59,7 @@ public class WallpaperHostForm : Form
     }
 
     public event Action? TaskbarRecreated;
+    public event Action? MixiPoked;
 
     public void StopRendering()
     {
@@ -133,12 +136,46 @@ public class WallpaperHostForm : Form
 
     internal ReadOnlySpan<int> CurrentFramePixels => _buffer.ReadOnlyPixels;
 
+    public bool HitTestMixi(int clientX, int clientY)
+    {
+        if (!_renderer.IsMixiChillActive || _renderer.MixiHitBounds is not { } bounds)
+        {
+            return false;
+        }
+
+        int cw = Math.Max(1, ClientSize.Width);
+        int ch = Math.Max(1, ClientSize.Height);
+        int canvasX = (int)((long)clientX * HqWallpaperRenderer.CanvasWidth / cw);
+        int canvasY = (int)((long)clientY * HqWallpaperRenderer.CanvasHeight / ch);
+
+        return canvasX >= bounds.X &&
+               canvasX < bounds.X + bounds.Width &&
+               canvasY >= bounds.Y &&
+               canvasY < bounds.Y + bounds.Height;
+    }
+
+    public void SimulateMouseDown(int x, int y, MouseButtons button = MouseButtons.Left)
+    {
+        OnMouseDown(new MouseEventArgs(button, 1, x, y, 0));
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button == MouseButtons.Left && HitTestMixi(e.X, e.Y))
+        {
+            MixiPoked?.Invoke();
+            RenderFrameNow();
+        }
+    }
+
     public void RenderFrameNow()
     {
         if (_disposed) return;
 
         float timeSeconds = (float)_stopwatch.Elapsed.TotalSeconds;
-        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds, DateTimeOffset.UtcNow, _showMixiWhenAllIdle);
+        SceneEffectsState effects = GetSceneEffects?.Invoke() ?? default;
+        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds, DateTimeOffset.UtcNow, _showMixiWhenAllIdle, effects);
         Invalidate();
     }
 
@@ -153,7 +190,8 @@ public class WallpaperHostForm : Form
         if (_isPaused || _disposed || (!Visible && !_isAttached)) return;
 
         float timeSeconds = (float)_stopwatch.Elapsed.TotalSeconds;
-        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds, DateTimeOffset.UtcNow, _showMixiWhenAllIdle);
+        SceneEffectsState effects = GetSceneEffects?.Invoke() ?? default;
+        _renderer.Render(_buffer, _currentState, _currentTheme, timeSeconds, DateTimeOffset.UtcNow, _showMixiWhenAllIdle, effects);
         Invalidate();
     }
 

@@ -4,6 +4,7 @@ using KageDesk.App.Native;
 using KageDesk.Core.Models;
 using KageDesk.Rendering.Canvas;
 using KageDesk.Rendering.Scenes;
+using KageDesk.Rendering.Sprites;
 
 namespace KageDesk.App.UI;
 
@@ -22,21 +23,33 @@ public class PetOverlayForm : Form
     private int _scale = 2;
     private string _idleMode = "chill"; // "chill" | "auto-hide" | "off"
     private bool _showMixiWhenAllIdle = true;
+    private string? _monitorDeviceName;
+    private int? _petRelativeX;
     private int? _petX;
     private bool _isPaused;
     private bool _isHiddenByDndOrLock;
     private bool _disposed;
 
     private bool _isDragging;
-    private int _dragStartX;
+    private int _dragStartCursorX;
+    private int _dragStartWindowLeft;
+    private float _wakeUpPulseUntilSeconds = -1f;
+    private ContextMenuStrip? _activeMixiMenu;
     private readonly Dictionary<string, AgentState> _dismissedAlerts = new(StringComparer.OrdinalIgnoreCase);
 
     public int PetScale => _scale;
     public int? PetX => _petX;
+    public string? MonitorDeviceName => _monitorDeviceName;
+    public int? PetRelativeX => _petRelativeX;
     public string IdleMode => _idleMode;
     public bool ShowMixiWhenAllIdle => _showMixiWhenAllIdle;
     public bool IsHandoffActive => _renderer.IsHandoffActive;
+    public bool IsDramaActive => _renderer.IsDramaActive;
+    public bool IsCelebrationActive => _renderer.IsCelebrationActive;
     public bool IsMixiChillActive => _renderer.IsMixiChillActive;
+    public bool IsWakeUpPulseActive => _wakeUpPulseUntilSeconds > (float)_stopwatch.Elapsed.TotalSeconds;
+    public Func<SceneEffectsState>? GetSceneEffects { get; set; }
+
     public bool IsHiddenByDndOrLock
     {
         get => _isHiddenByDndOrLock;
@@ -49,7 +62,10 @@ public class PetOverlayForm : Form
     }
 
     public event Action<int>? PetPositionChanged;
+    public event Action<string, int, int>? PetPlacementChanged;
     public event Action<AgentSnapshot>? AgentClicked;
+    public event Action? MixiPoked;
+    public event Action<MixiChillActivity?>? MixiActivityPinned;
     public ContextMenuStrip? StudioContextMenu { get; set; }
 
     protected override bool ShowWithoutActivation => true;
@@ -71,10 +87,14 @@ public class PetOverlayForm : Form
         int? initialPetX = null,
         string idleMode = "chill",
         int targetFps = 15,
-        bool showMixiWhenAllIdle = true)
+        bool showMixiWhenAllIdle = true,
+        string? monitorDeviceName = null,
+        int? initialRelativeX = null)
     {
         _currentTheme = initialTheme ?? throw new ArgumentNullException(nameof(initialTheme));
         _scale = Math.Clamp(initialScale, 1, 2);
+        _monitorDeviceName = string.IsNullOrWhiteSpace(monitorDeviceName) ? null : monitorDeviceName.Trim();
+        _petRelativeX = initialRelativeX;
         _petX = initialPetX;
         _idleMode = idleMode;
         _showMixiWhenAllIdle = showMixiWhenAllIdle;
@@ -184,7 +204,44 @@ public class PetOverlayForm : Form
     public void SetPetX(int? x)
     {
         _petX = x;
+        _petRelativeX = null;
         UpdateWindowBounds();
+    }
+
+    public void SetMonitorAndPosition(string? deviceName, int? relativeX = null, int? legacyAbsoluteX = null)
+    {
+        _monitorDeviceName = string.IsNullOrWhiteSpace(deviceName) ||
+                             string.Equals(deviceName.Trim(), "primary", StringComparison.OrdinalIgnoreCase)
+            ? null
+            : deviceName.Trim();
+        _petRelativeX = relativeX;
+        _petX = legacyAbsoluteX;
+        UpdateWindowBounds();
+        if (Visible && !_isPaused && !_isHiddenByDndOrLock)
+        {
+            RenderAndPresent();
+        }
+    }
+
+    public void HandleDisplaySettingsChanged()
+    {
+        if (_disposed) return;
+
+        UpdateWindowBounds();
+        if (Visible && !_isPaused && !_isHiddenByDndOrLock)
+        {
+            RenderAndPresent();
+        }
+    }
+
+    public void TriggerWakeUpPulse(float durationSeconds = 3.0f)
+    {
+        if (_disposed) return;
+
+        float now = (float)_stopwatch.Elapsed.TotalSeconds;
+        _wakeUpPulseUntilSeconds = now + Math.Clamp(durationSeconds, 0.5f, 8.0f);
+        UpdateWindowBounds();
+        ApplyEffectiveVisibility();
     }
 
     public void ApplyRenderState(HqState state, ThemePack theme, bool petPaused, bool petHiddenByDndOrLock)
@@ -250,6 +307,12 @@ public class PetOverlayForm : Form
 
     internal bool ShouldStayVisibleInAutoHide()
     {
+        // Stay visible during single-instance wake-up pulse
+        if (IsWakeUpPulseActive)
+        {
+            return true;
+        }
+
         // Stay visible when Do Mixi All-Idle Chill Mode is enabled or explicitly demoed
         if (_showMixiWhenAllIdle ||
             string.Equals(_currentState.DemoScenario, "mixi", StringComparison.OrdinalIgnoreCase))
@@ -257,8 +320,11 @@ public class PetOverlayForm : Form
             return true;
         }
 
-        // Stay visible ONLY while a living handoff is actively walking or an unconsumed handoff is pending
-        if (_renderer.IsHandoffActive || _renderer.HasUnconsumedHandoffEvent(_currentState))
+        // Stay visible ONLY while a living handoff, review drama, or celebration is active or pending
+        if (_renderer.IsHandoffActive ||
+            _renderer.IsDramaActive ||
+            _renderer.IsCelebrationActive ||
+            _renderer.HasUnconsumedHandoffEvent(_currentState))
         {
             return true;
         }
@@ -308,14 +374,16 @@ public class PetOverlayForm : Form
     {
         int w = TaskbarPetRenderer.CanvasWidth * _scale;
         int h = TaskbarPetRenderer.CanvasHeight * _scale;
-        Rectangle workArea = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1920, 1040);
+        var monitor = MonitorLayoutHelper.ResolveMonitorFromSystem(_monitorDeviceName);
+        Rectangle docked = MonitorLayoutHelper.ComputeTaskbarDockedBounds(
+            monitor.Bounds,
+            monitor.WorkingArea,
+            w,
+            h,
+            _petRelativeX,
+            _petX);
 
-        int top = workArea.Bottom - h;
-        int maxLeft = Math.Max(workArea.Left, workArea.Right - w);
-        int left = _petX ?? (workArea.Right - w - 16);
-        left = Math.Clamp(left, workArea.Left, maxLeft);
-
-        SetBounds(left, top, w, h);
+        SetBounds(docked.Left, docked.Top, docked.Width, docked.Height);
     }
 
     private void OnRenderTick(object? sender, EventArgs e)
@@ -340,6 +408,15 @@ public class PetOverlayForm : Form
         float timeSeconds = (float)_stopwatch.Elapsed.TotalSeconds;
         bool showIdle = _idleMode != "off";
 
+        SceneEffectsState effects = GetSceneEffects?.Invoke() ?? default;
+        float localPulse = _wakeUpPulseUntilSeconds > timeSeconds
+            ? _wakeUpPulseUntilSeconds - timeSeconds
+            : 0f;
+        if (localPulse > effects.WakeUpPulseRemainingSeconds)
+        {
+            effects = effects with { WakeUpPulseRemainingSeconds = localPulse };
+        }
+
         _renderer.Render(
             _petBuffer,
             _currentState,
@@ -348,7 +425,8 @@ public class PetOverlayForm : Form
             showIdle,
             DateTimeOffset.UtcNow,
             _showMixiWhenAllIdle,
-            _dismissedAlerts);
+            _dismissedAlerts,
+            effects);
 
         if (_scale == 1)
         {
@@ -362,21 +440,111 @@ public class PetOverlayForm : Form
         _dibSurface.UpdateLayeredWindow(Handle, Left, Top);
     }
 
+    internal ContextMenuStrip BuildMixiQuickMenu(MixiChillActivity? currentPinned)
+    {
+        var menu = new ContextMenuStrip();
+
+        var autoItem = new ToolStripMenuItem("Auto Cycle (5 Activities)", null, (_, _) =>
+        {
+            MixiActivityPinned?.Invoke(null);
+        })
+        {
+            Checked = !currentPinned.HasValue
+        };
+        menu.Items.Add(autoItem);
+        menu.Items.Add(new ToolStripSeparator());
+
+        (string Label, MixiChillActivity Activity)[] activities =
+        {
+            ("\u0102n m\u00ec (Eating Noodles)", MixiChillActivity.EatingNoodles),
+            ("Coi YouTube", MixiChillActivity.WatchingYouTube),
+            ("Ch\u01a1i game", MixiChillActivity.Gaming),
+            ("N\u00f3i chuy\u1ec7n stream", MixiChillActivity.StreamingTalk),
+            ("H\u00e1t karaoke", MixiChillActivity.SingingKaraoke)
+        };
+
+        for (int i = 0; i < activities.Length; i++)
+        {
+            var entry = activities[i];
+            var item = new ToolStripMenuItem(entry.Label, null, (_, _) =>
+            {
+                MixiActivityPinned?.Invoke(entry.Activity);
+            })
+            {
+                Checked = currentPinned == entry.Activity
+            };
+            menu.Items.Add(item);
+        }
+
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(new ToolStripMenuItem("Poke \u0110\u1ed9 Mixi!", null, (_, _) =>
+        {
+            MixiPoked?.Invoke();
+            RenderAndPresent();
+        }));
+
+        if (StudioContextMenu != null)
+        {
+            menu.Items.Add(new ToolStripMenuItem("KageDesk Studio Menu...", null, (_, _) =>
+            {
+                StudioContextMenu?.Show(Cursor.Position);
+            }));
+        }
+
+        return menu;
+    }
+
+    private void ShowMixiQuickMenu(Point screenLocation)
+    {
+        DisposeActiveMixiMenu();
+
+        MixiChillActivity? currentPinned = GetSceneEffects?.Invoke().PinnedMixiActivity;
+        _activeMixiMenu = BuildMixiQuickMenu(currentPinned);
+        _activeMixiMenu.Closed += (_, _) =>
+        {
+            if (!_disposed && IsHandleCreated)
+            {
+                BeginInvoke(new Action(DisposeActiveMixiMenu));
+            }
+        };
+        _activeMixiMenu.Show(screenLocation);
+    }
+
+    private void DisposeActiveMixiMenu()
+    {
+        if (_activeMixiMenu != null)
+        {
+            for (int i = _activeMixiMenu.Items.Count - 1; i >= 0; i--)
+            {
+                _activeMixiMenu.Items[i].Dispose();
+            }
+            _activeMixiMenu.Dispose();
+            _activeMixiMenu = null;
+        }
+    }
+
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
 
+        int unscaledX = e.X / _scale;
+        int unscaledY = e.Y / _scale;
+
         if (e.Button == MouseButtons.Right)
         {
+            if (FindHitRegion(unscaledX, unscaledY) is { } rightHit &&
+                string.Equals(rightHit.ActionId, "agent:mixi-chill", StringComparison.OrdinalIgnoreCase))
+            {
+                ShowMixiQuickMenu(Cursor.Position);
+                return;
+            }
+
             StudioContextMenu?.Show(Cursor.Position);
             return;
         }
 
         if (e.Button == MouseButtons.Left)
         {
-            int unscaledX = e.X / _scale;
-            int unscaledY = e.Y / _scale;
-
             if (FindHitRegion(unscaledX, unscaledY) is { } hit)
             {
                 if (hit.ActionId == "open_orca")
@@ -417,21 +585,33 @@ public class PetOverlayForm : Form
                 {
                     string agentId = hit.ActionId["agent:".Length..];
                     var agent = _currentState.Agents.FirstOrDefault(a => a.Id == agentId);
-                    if (agent == null && string.Equals(agentId, "mixi-chill", StringComparison.OrdinalIgnoreCase))
+                    if (string.Equals(agentId, "mixi-chill", StringComparison.OrdinalIgnoreCase))
                     {
-                        var activity = _renderer.ActiveMixiActivity ?? KageDesk.Rendering.Sprites.MixiChillActivity.EatingNoodles;
-                        string activityLabel = KageDesk.Rendering.Sprites.MixiChillRenderer.GetFullBadge(activity);
-                        agent = new AgentSnapshot(
-                            Id: "mixi-chill",
-                            Name: "Do Mixi Gaming",
-                            Role: AgentRole.Clone,
-                            SpriteKey: "mixi",
-                            State: AgentState.Idle,
-                            TaskTitle: $"Chill Mode: {activityLabel}",
-                            Source: "idle-chill"
-                        );
+                        MixiPoked?.Invoke();
+                        RenderAndPresent();
+
+                        if (AgentClicked != null)
+                        {
+                            if (agent == null)
+                            {
+                                var activity = _renderer.ActiveMixiActivity ?? MixiChillActivity.EatingNoodles;
+                                string activityLabel = MixiChillRenderer.GetFullBadge(activity);
+                                agent = new AgentSnapshot(
+                                    Id: "mixi-chill",
+                                    Name: "Do Mixi Gaming",
+                                    Role: AgentRole.Clone,
+                                    SpriteKey: "mixi",
+                                    State: AgentState.Idle,
+                                    TaskTitle: $"Chill Mode: {activityLabel}",
+                                    Source: "idle-chill"
+                                );
+                            }
+                            AgentClicked.Invoke(agent);
+                        }
+                        return;
                     }
-                    else if (agent == null)
+
+                    if (agent == null)
                     {
                         agent = new AgentSnapshot(
                             Id: agentId,
@@ -455,9 +635,10 @@ public class PetOverlayForm : Form
                 }
             }
 
-            // Start horizontal dragging
+            // Start multi-monitor taskbar dragging
             _isDragging = true;
-            _dragStartX = e.X;
+            _dragStartCursorX = Cursor.Position.X;
+            _dragStartWindowLeft = Left;
         }
     }
 
@@ -467,16 +648,23 @@ public class PetOverlayForm : Form
 
         if (_isDragging)
         {
-            int deltaX = e.X - _dragStartX;
-            int newLeft = Left + deltaX;
+            Point cursorPos = Cursor.Position;
+            var monitors = MonitorLayoutHelper.GetConnectedMonitors();
+            var targetMonitor = MonitorLayoutHelper.ResolveMonitorAtPoint(monitors, cursorPos);
 
-            Rectangle workArea = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1920, 1040);
-            int maxLeft = Math.Max(workArea.Left, workArea.Right - Width);
-            newLeft = Math.Clamp(newLeft, workArea.Left, maxLeft);
+            int desiredLeft = _dragStartWindowLeft + (cursorPos.X - _dragStartCursorX);
+            Rectangle docked = MonitorLayoutHelper.ComputeTaskbarDockedBounds(
+                targetMonitor.Bounds,
+                targetMonitor.WorkingArea,
+                Width,
+                Height,
+                relativeX: null,
+                legacyAbsoluteX: desiredLeft);
 
-            if (newLeft != Left)
+            if (docked.Left != Left || docked.Top != Top)
             {
-                Left = newLeft;
+                Left = docked.Left;
+                Top = docked.Top;
                 _dibSurface.UpdateLayeredWindow(Handle, Left, Top);
             }
         }
@@ -495,7 +683,15 @@ public class PetOverlayForm : Form
         if (_isDragging)
         {
             _isDragging = false;
+            var monitors = MonitorLayoutHelper.GetConnectedMonitors();
+            var centerPt = new Point(Left + Width / 2, Top + Height / 2);
+            var targetMonitor = MonitorLayoutHelper.ResolveMonitorAtPoint(monitors, centerPt);
+
+            _monitorDeviceName = targetMonitor.IsPrimary ? null : targetMonitor.DeviceName;
+            _petRelativeX = Left - targetMonitor.WorkingArea.Left;
             _petX = Left;
+
+            PetPlacementChanged?.Invoke(targetMonitor.DeviceName, _petRelativeX.Value, Left);
             PetPositionChanged?.Invoke(Left);
         }
     }
@@ -557,6 +753,7 @@ public class PetOverlayForm : Form
 
         if (disposing)
         {
+            DisposeActiveMixiMenu();
             _renderTimer.Stop();
             _renderTimer.Dispose();
             _petBuffer.Dispose();

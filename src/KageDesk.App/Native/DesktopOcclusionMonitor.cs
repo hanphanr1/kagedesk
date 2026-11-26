@@ -29,6 +29,7 @@ public class DesktopOcclusionMonitor : IDisposable
     public bool IsWallpaperOccluded => _isWallpaperOccluded;
     public bool IsFullscreenGame => _isFullscreenGame;
     public bool IsSessionLocked => _isSessionLocked;
+    public string? TargetMonitorDeviceName { get; set; }
 
     public event EventHandler? OcclusionStateChanged;
 
@@ -95,9 +96,9 @@ public class DesktopOcclusionMonitor : IDisposable
 
         try
         {
-            Screen primaryScreen = Screen.PrimaryScreen ?? Screen.AllScreens[0];
-            Rectangle workArea = primaryScreen.WorkingArea;
-            Rectangle fullBounds = primaryScreen.Bounds;
+            MonitorDescriptor monitor = MonitorLayoutHelper.ResolveMonitorFromSystem(TargetMonitorDeviceName);
+            Rectangle workArea = monitor.WorkingArea;
+            Rectangle fullBounds = monitor.Bounds;
 
             // 1. Query User Notification State
             var quns = Win32Interop.QUERY_USER_NOTIFICATION_STATE.QUNS_ACCEPTS_NOTIFICATIONS;

@@ -21,6 +21,7 @@ public enum MixiChillActivity
 public static class MixiChillRenderer
 {
     public const float ActivityDurationSeconds = 8.0f;
+    public const float PokeBubbleDurationSeconds = 3.5f;
 
     private static readonly int Outline = ColorUtil.FromRgb(14, 16, 24);
     private static readonly int SkinBase = ColorUtil.FromRgb(245, 206, 168);
@@ -53,12 +54,51 @@ public static class MixiChillRenderer
     private static readonly int Magenta = ColorUtil.FromRgb(236, 72, 153);
     private static readonly int Silver = ColorUtil.FromRgb(203, 213, 225);
 
+    public static readonly string[] PokeLines =
+    {
+        "ĐANG LÀM BÁT MÌ!",
+        "LÊN NHẠC ĐI ANH EM!",
+        "CƠM NƯỚC GÌ CHƯA NGƯỜI ĐẸP?",
+        "LÀM TÍ KHÔNG CÁC EM?",
+        "CHILL TÝ THÔI ÔNG GIÁO!",
+        "BỘ TỘC MIXIGAMING!"
+    };
+
     public static MixiChillActivity GetActivityForTime(float timeSeconds)
     {
         float clamped = MathF.Max(0f, timeSeconds);
         int index = ((int)(clamped / ActivityDurationSeconds)) % 5;
         return (MixiChillActivity)index;
     }
+
+    public static MixiChillActivity? ParsePinnedActivity(string? configValue)
+    {
+        if (string.IsNullOrWhiteSpace(configValue) ||
+            string.Equals(configValue.Trim(), "auto", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        return configValue.Trim().ToLowerInvariant() switch
+        {
+            "noodles" or "anmi" or "eatingnoodles" => MixiChillActivity.EatingNoodles,
+            "youtube" or "watchingyoutube" => MixiChillActivity.WatchingYouTube,
+            "gaming" or "game" => MixiChillActivity.Gaming,
+            "stream" or "streaming" or "streamingtalk" => MixiChillActivity.StreamingTalk,
+            "karaoke" or "singingkaraoke" => MixiChillActivity.SingingKaraoke,
+            _ => null
+        };
+    }
+
+    public static string ToConfigValue(MixiChillActivity? activity) => activity switch
+    {
+        MixiChillActivity.EatingNoodles => "noodles",
+        MixiChillActivity.WatchingYouTube => "youtube",
+        MixiChillActivity.Gaming => "gaming",
+        MixiChillActivity.StreamingTalk => "stream",
+        MixiChillActivity.SingingKaraoke => "karaoke",
+        _ => "auto"
+    };
 
     public static string GetShortBadge(MixiChillActivity activity) => activity switch
     {
@@ -83,20 +123,21 @@ public static class MixiChillRenderer
     /// <summary>
     /// Strict exclusive All-Idle check for Do Mixi Gaming:
     /// Returns true ONLY when DemoScenario == "mixi" OR (showMixiWhenAllIdle == true AND zero agents/bots
-    /// are non-idle AND no handoff is pending or active).
+    /// are non-idle AND no handoff/drama is pending or active).
     /// </summary>
     public static bool ShouldRenderMixiChillCorner(
         HqState state,
         bool showMixiWhenAllIdle,
         bool hasActiveHandoff = false,
-        long lastHandledHandoffSeq = -1)
+        long lastHandledHandoffSeq = -1,
+        bool hasActiveDrama = false)
     {
         if (string.Equals(state.DemoScenario, "mixi", StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
 
-        if (!showMixiWhenAllIdle || hasActiveHandoff)
+        if (!showMixiWhenAllIdle || hasActiveHandoff || hasActiveDrama)
         {
             return false;
         }
@@ -118,6 +159,10 @@ public static class MixiChillRenderer
             {
                 return false;
             }
+            if (TeamDramaController.IsDramaEventType(events[i].Type))
+            {
+                return false;
+            }
         }
 
         return true;
@@ -132,24 +177,54 @@ public static class MixiChillRenderer
         int cx,
         int groundY,
         float timeSeconds,
-        MixiChillActivity? activityOverride = null)
+        MixiChillActivity? activityOverride = null,
+        bool isStartled = false,
+        bool isMediaPlaying = false,
+        bool isNightMode = false)
     {
-        MixiChillActivity activity = activityOverride ?? GetActivityForTime(timeSeconds);
+        // When media is playing and user hasn't pinned an activity, bias smoothly toward SingingKaraoke / vibing
+        MixiChillActivity activity = activityOverride ??
+            (isMediaPlaying
+                ? (((int)(timeSeconds / ActivityDurationSeconds) % 3) != 0
+                    ? MixiChillActivity.SingingKaraoke
+                    : GetActivityForTime(timeSeconds))
+                : GetActivityForTime(timeSeconds));
         bool wearsHeadset = activity is MixiChillActivity.Gaming or MixiChillActivity.StreamingTalk;
 
-        // 0. Soft ground shadow + subtle RGB streamer ambient underglow
+        // 0. Soft ground shadow + subtle RGB streamer ambient underglow (+ Night warm lamp aura)
         int rgbGlow = GetRgbCycle(timeSeconds, 0);
         buf.BlendRect(cx - 39, groundY - 2, 75, 3, ColorUtil.FromRgb(8, 10, 18), 115);
         buf.BlendRect(cx - 38, groundY - 12, 43, 4, rgbGlow, 34);
+        if (isNightMode)
+        {
+            int warmAmber = ColorUtil.FromRgb(251, 191, 36);
+            int pulse = 34 + (int)(MathF.Sin(timeSeconds * 2.4f) * 7f);
+            buf.BlendRect(cx - 42, groundY - 26, 20, 16, warmAmber, pulse);
+            buf.BlendRect(cx - 40, groundY - 6, 78, 5, warmAmber, 28);
+        }
 
         // 1. Dual-Monitor Streamer Desk (left/center-left)
         DrawDualMonitorDesk(buf, cx, groundY, timeSeconds, activity, headsetOnDesk: !wearsHeadset);
+
+        // Night mode mini warm desk lamp + Media Sync equalizer bars on streamer desk
+        if (isNightMode)
+        {
+            int lx = cx - 39;
+            int ly = groundY - 22;
+            buf.FillRect(lx, ly, 4, 3, Outline);
+            buf.FillRect(lx + 1, ly + 1, 2, 1, GoldLight);
+            buf.FillRect(lx + 1, ly + 3, 2, 4, ChairHighlight);
+        }
+        if (isMediaPlaying)
+        {
+            ShinobiSpriteRenderer.DrawMusicEqualizer(buf, cx - 18, groundY - 20, timeSeconds, seed: 7);
+        }
 
         // 2. Tall Black & Crimson Racing Gaming Chair (right, angled 3/4 facing monitors)
         DrawRacingGamingChair(buf, cx, groundY);
 
         // 3. Do Mixi Gaming Character seated 3/4 cross-legged (ngoi xeo bat chan len ghe)
-        DrawMixiCharacter(buf, cx, groundY, timeSeconds, activity, wearsHeadset);
+        DrawMixiCharacter(buf, cx, groundY, timeSeconds, activity, wearsHeadset, isStartled, isMediaPlaying);
 
         // 4. Boom Mic Arm (in foreground between desk and Mixi so it reads cleanly)
         DrawBoomMicArm(buf, cx, groundY, timeSeconds, activity);
@@ -157,7 +232,90 @@ public static class MixiChillRenderer
         // 5. Activity Foreground FX (steam, music notes, speech waves, gaming sparks)
         DrawActivityEffects(buf, cx, groundY, timeSeconds, activity);
 
+        // 6. Startled heart/spark pop emote during poke reaction
+        if (isStartled)
+        {
+            DrawPokeHeartSparkEmote(buf, cx + 22, groundY - 43, timeSeconds);
+        }
+
         return activity;
+    }
+
+    /// <summary>
+    /// Draws a crisp pixel-art speech bubble above Do Mixi Gaming for ~3.5 seconds when poked.
+    /// Guaranteed zero heap allocations and strict bounds clamping for both Wallpaper (384x216)
+    /// and Taskbar Pet (384x128).
+    /// </summary>
+    public static void DrawPokeSpeechBubble(
+        PixelBuffer buf,
+        int anchorX,
+        int anchorY,
+        ReadOnlySpan<char> line,
+        float elapsedSeconds,
+        int canvasWidth,
+        int canvasHeight)
+    {
+        if (line.IsEmpty || elapsedSeconds < 0f || elapsedSeconds >= 3.5f)
+            return;
+
+        // Crisp pop-in bounce during first 0.25s
+        int bounceY = elapsedSeconds < 0.25f
+            ? -(int)((1f - elapsedSeconds / 0.25f) * 3f + 0.5f)
+            : 0;
+
+        int textW = PixelFont.MeasureWidth(line, PixelFontSize.Small);
+        int bubbleW = Math.Clamp(textW + 12, 54, Math.Min(196, canvasWidth - 10));
+        const int bubbleH = 15;
+
+        int bx = Math.Clamp(anchorX - bubbleW / 2, 4, canvasWidth - bubbleW - 4);
+        int by = Math.Clamp(anchorY - bubbleH + bounceY, 2, canvasHeight - bubbleH - 6);
+
+        int bgCol = ColorUtil.FromRgb(24, 16, 30);
+        int borderCol = elapsedSeconds < 0.5f ? Gold : CrimsonBright;
+        int textCol = ColorUtil.FromRgb(254, 249, 195);
+
+        // Subtle drop shadow
+        buf.BlendRect(bx + 1, by + 1, bubbleW, bubbleH, Outline, 150);
+        buf.DrawPixelCard(bx, by, bubbleW, bubbleH, bgCol, borderCol, ColorUtil.WithAlpha(EyeWhite, 42));
+
+        // Speech tail pointing down toward Mixi's head
+        int tailX = Math.Clamp(anchorX, bx + 6, bx + bubbleW - 8);
+        buf.FillRect(tailX - 2, by + bubbleH - 1, 5, 2, bgCol);
+        buf.SetPixel(tailX - 2, by + bubbleH, borderCol);
+        buf.SetPixel(tailX + 2, by + bubbleH, borderCol);
+        buf.FillRect(tailX - 1, by + bubbleH + 1, 3, 1, bgCol);
+        buf.SetPixel(tailX - 1, by + bubbleH + 1, borderCol);
+        buf.SetPixel(tailX + 1, by + bubbleH + 1, borderCol);
+        buf.SetPixel(tailX, by + bubbleH + 2, borderCol);
+
+        PixelFont.DrawTextTruncated(buf, bx + 6, by + 5, bubbleW - 10, line, textCol, PixelFontSize.Small);
+
+        // Tiny pixel heart emote beside bubble for first 1.0s
+        if (elapsedSeconds < 1.0f)
+        {
+            int hx = bx + bubbleW - 8;
+            int hy = Math.Max(1, by - 4 - (int)(elapsedSeconds * 3f));
+            DrawTinyPixelHeart(buf, hx, hy, CrimsonBright);
+        }
+    }
+
+    private static void DrawPokeHeartSparkEmote(PixelBuffer buf, int cx, int cy, float timeSeconds)
+    {
+        DrawTinyPixelHeart(buf, cx - 8, cy, CrimsonBright);
+        int sp = ((int)(timeSeconds * 14f) & 1);
+        buf.SetPixel(cx + 4, cy + 1 - sp, Gold);
+        buf.SetPixel(cx + 3, cy + 2 - sp, GoldLight);
+        buf.SetPixel(cx + 5, cy + 2 - sp, GoldLight);
+        buf.SetPixel(cx + 4, cy + 3 - sp, Gold);
+    }
+
+    private static void DrawTinyPixelHeart(PixelBuffer buf, int x, int y, int color)
+    {
+        buf.SetPixel(x + 1, y, color);
+        buf.SetPixel(x + 3, y, color);
+        buf.FillRect(x, y + 1, 5, 1, color);
+        buf.FillRect(x + 1, y + 2, 3, 1, color);
+        buf.SetPixel(x + 2, y + 3, color);
     }
 
     private static void DrawDualMonitorDesk(
@@ -474,7 +632,9 @@ public static class MixiChillRenderer
         int groundY,
         float timeSeconds,
         MixiChillActivity activity,
-        bool wearsHeadset)
+        bool wearsHeadset,
+        bool isStartled = false,
+        bool isMediaPlaying = false)
     {
         // Motion offsets by activity
         int leanX = 0;
@@ -513,6 +673,20 @@ public static class MixiChillRenderer
                 bobY = (swayStep & 1) == 1 ? -1 : 0;
                 mouthOpen = ((int)(timeSeconds * 5f) % 3) != 0;
                 break;
+        }
+
+        if (isMediaPlaying && !isStartled)
+        {
+            // Subtle rhythmic music groove head-bob synced to beat
+            bobY += (((int)(timeSeconds * 4.5f)) & 1) == 0 ? -1 : 0;
+        }
+
+        if (isStartled)
+        {
+            // Playful 0.5s startled hop/bounce reaction!
+            bobY = -2;
+            mouthOpen = true;
+            isLaughing = false;
         }
 
         int bx = cx + 19 + leanX; // Body anchor on gaming chair

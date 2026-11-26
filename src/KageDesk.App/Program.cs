@@ -1,5 +1,7 @@
 using KageDesk.App.Native;
 using KageDesk.App.Services;
+using KageDesk.Core.Config;
+using KageDesk.Core.Hooks;
 using KageDesk.Core.Themes;
 using KageDesk.Rendering.Export;
 using KageDesk.Rendering.Snapshots;
@@ -8,14 +10,95 @@ namespace KageDesk.App;
 
 internal static class Program
 {
+    public const string AppVersion = "2.2.0";
     private const string SingleInstanceMutexName = @"Local\KageDesk_SingleInstance_Mutex";
+
+    internal static bool IsOneShotCliCommand(string[] args)
+    {
+        if (args == null || args.Length == 0) return false;
+        string cmd = args[0];
+        return string.Equals(cmd, "--benchmark", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(cmd, "--snapshot", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(cmd, "--record-gif", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(cmd, "--setup-hooks", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(cmd, "--uninstall-hooks", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(cmd, "--version", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(cmd, "-v", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(cmd, "--help", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(cmd, "-h", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(cmd, "/?", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static int HandleHookCommand(bool install, string? userProfileDir = null, string? appDataDir = null, int? bridgePort = null)
+    {
+        int port = bridgePort ?? new ConfigStore().Load().LocalBridgePort;
+        var installer = new HookInstaller(userProfileDir: userProfileDir, appDataDir: appDataDir, bridgePort: port);
+        var summary = install ? installer.InstallAll() : installer.UninstallAll();
+
+        Console.WriteLine($"[KageDesk] {(install ? "Installing" : "Removing")} CLI hooks (bridge port {port}):");
+        foreach (var r in summary.Results)
+        {
+            string backupNote = !string.IsNullOrEmpty(r.BackupPath) ? $" (backup: {r.BackupPath})" : "";
+            Console.WriteLine($"  - {r.Target}: {r.Status} \u2014 {r.Message}{backupNote}");
+        }
+
+        return summary.AllSucceeded ? 0 : 1;
+    }
+
+    internal static int HandleVersionCommand()
+    {
+        Console.WriteLine($"KageDesk {AppVersion}");
+        return 0;
+    }
+
+    internal static int HandleHelpCommand()
+    {
+        Console.WriteLine($"KageDesk {AppVersion} \u2014 Native Windows Pixel-Art Desktop HQ & Taskbar Pet");
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  KageDesk.exe [--no-wallpaper]");
+        Console.WriteLine("  KageDesk.exe --setup-hooks           Safely install hooks for Claude Code, Codex, and OpenCode");
+        Console.WriteLine("  KageDesk.exe --uninstall-hooks       Cleanly remove KageDesk hooks only");
+        Console.WriteLine("  KageDesk.exe --benchmark [sec]       Run headless render & resource benchmark");
+        Console.WriteLine("  KageDesk.exe --snapshot [dir]        Export PNG preview snapshots");
+        Console.WriteLine("  KageDesk.exe --record-gif [options]  Export a 6-second animated showcase GIF");
+        Console.WriteLine("  KageDesk.exe --version | -v          Print version and exit");
+        Console.WriteLine("  KageDesk.exe --help | -h             Print this help message and exit");
+        return 0;
+    }
 
     [STAThread]
     private static int Main(string[] args)
     {
-        // 1. Process CLI Arguments
+        // 1. One-shot CLI Commands (run without acquiring GUI Single-Instance Mutex)
         if (args.Length > 0)
         {
+            if (string.Equals(args[0], "--version", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(args[0], "-v", StringComparison.OrdinalIgnoreCase))
+            {
+                Win32Interop.AttachConsole(Win32Interop.ATTACH_PARENT_PROCESS);
+                return HandleVersionCommand();
+            }
+
+            if (string.Equals(args[0], "--help", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(args[0], "-h", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(args[0], "/?", StringComparison.OrdinalIgnoreCase))
+            {
+                Win32Interop.AttachConsole(Win32Interop.ATTACH_PARENT_PROCESS);
+                return HandleHelpCommand();
+            }
+
+            if (string.Equals(args[0], "--setup-hooks", StringComparison.OrdinalIgnoreCase))
+            {
+                Win32Interop.AttachConsole(Win32Interop.ATTACH_PARENT_PROCESS);
+                return HandleHookCommand(install: true);
+            }
+
+            if (string.Equals(args[0], "--uninstall-hooks", StringComparison.OrdinalIgnoreCase))
+            {
+                Win32Interop.AttachConsole(Win32Interop.ATTACH_PARENT_PROCESS);
+                return HandleHookCommand(install: false);
+            }
+
             if (string.Equals(args[0], "--benchmark", StringComparison.OrdinalIgnoreCase))
             {
                 Win32Interop.AttachConsole(Win32Interop.ATTACH_PARENT_PROCESS);
@@ -65,8 +148,8 @@ internal static class Program
         using var mutex = new Mutex(true, SingleInstanceMutexName, out bool isNewInstance);
         if (!isNewInstance)
         {
-            // Activate existing instance if possible
-            WindowFocuser.TryFocusOrca();
+            // Signal the running KageDesk instance to briefly pulse Taskbar Pet & show tray balloon
+            SingleInstanceWakeUp.TrySignalRunningInstance();
             return 0;
         }
 
@@ -116,7 +199,7 @@ internal static class Program
 
         var validScenarios = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            "showcase", "working", "handoff", "approve", "done", "fail", "clone", "variety", "mixi"
+            "showcase", "working", "handoff", "drama", "celebrate", "approve", "done", "fail", "clone", "variety", "mixi"
         };
 
         for (int i = 1; i < args.Length; i++)
@@ -193,7 +276,7 @@ internal static class Program
 
         if (!validScenarios.Contains(scenario))
         {
-            Console.Error.WriteLine($"[KageDesk] Error: Unknown scenario '{scenario}'. Valid scenarios: showcase, working, handoff, approve, done, fail, clone, variety, mixi.");
+            Console.Error.WriteLine($"[KageDesk] Error: Unknown scenario '{scenario}'. Valid scenarios: showcase, working, handoff, drama, celebrate, approve, done, fail, clone, variety, mixi.");
             return 2;
         }
 

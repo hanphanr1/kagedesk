@@ -11,7 +11,8 @@ public enum ParticleKind : byte
     Poof,
     Steam,
     Rain,
-    Bubble
+    Bubble,
+    Sweat
 }
 
 public struct Particle
@@ -30,7 +31,7 @@ public struct Particle
 
 public sealed class ParticleSystem
 {
-    public const int MaxParticles = 128;
+    public const int MaxParticles = 256;
 
     private readonly Particle[] _pool = new Particle[MaxParticles];
     private int _cursor;
@@ -122,6 +123,20 @@ public sealed class ParticleSystem
         }
     }
 
+    public void EmitSweatDrops(float x, float y, int count = 2)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            float dir = (i & 1) == 0 ? -1f : 1f;
+            float vx = dir * (14f + NextFloat() * 14f);
+            float vy = -16f - NextFloat() * 14f;
+            int color = (i & 1) == 0
+                ? ColorUtil.FromRgb(125, 211, 252)
+                : ColorUtil.FromRgb(224, 242, 254);
+            Emit(ParticleKind.Sweat, x + dir * 4f, y, vx, vy, 0.45f + NextFloat() * 0.2f, color, 2);
+        }
+    }
+
     public void EmitConfetti(float x, float y, int count = 6)
     {
         for (int i = 0; i < count; i++)
@@ -131,6 +146,20 @@ public sealed class ParticleSystem
             int color = ConfettiColors[NextInt(ConfettiColors.Length)];
             byte sz = (byte)(NextInt(2) + 1);
             Emit(ParticleKind.Confetti, x + (NextFloat() - 0.5f) * 14f, y, vx, vy, 0.9f + NextFloat() * 0.6f, color, sz);
+        }
+    }
+
+    public void EmitCelebrationConfettiShower(int minX, int maxX, int topY, int count = 10)
+    {
+        int span = Math.Max(16, maxX - minX);
+        for (int i = 0; i < count; i++)
+        {
+            float x = minX + NextFloat() * span;
+            float vx = (NextFloat() - 0.5f) * 18f;
+            float vy = 10f + NextFloat() * 22f;
+            int color = ConfettiColors[NextInt(ConfettiColors.Length)];
+            byte sz = (byte)(NextInt(2) + 1);
+            Emit(ParticleKind.Confetti, x, topY + NextFloat() * 8f, vx, vy, 1.4f + NextFloat() * 0.9f, color, sz);
         }
     }
 
@@ -254,7 +283,8 @@ public sealed class ParticleSystem
                     p.Vx *= (1f - 1.2f * dtSeconds);
                     break;
                 case ParticleKind.Spark:
-                    p.Vy += 42f * dtSeconds;
+                case ParticleKind.Sweat:
+                    p.Vy += 48f * dtSeconds;
                     break;
                 case ParticleKind.Poof:
                     p.Vx *= (1f - 2.6f * dtSeconds);
@@ -304,6 +334,13 @@ public sealed class ParticleSystem
                 int col = ColorUtil.WithAlpha(p.Color, alpha);
                 buf.BlendPixel(px, py, col);
                 buf.BlendPixel(px - 1, py + 2, col);
+            }
+            else if (p.Kind == ParticleKind.Sweat)
+            {
+                // Crisp 2x3 pixel teardrop sweat drop with bright white specular
+                buf.BlendPixel(px, py, p.Color, alpha);
+                buf.BlendRect(px, py + 1, 2, 2, p.Color, alpha);
+                buf.BlendPixel(px, py + 1, ColorUtil.FromRgb(248, 250, 252), alpha);
             }
             else if (p.Kind == ParticleKind.Poof)
             {

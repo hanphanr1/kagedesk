@@ -27,10 +27,14 @@ public class TrayController : IDisposable
     public Func<bool>? IsWallpaperAttached { get; set; }
     public Func<string>? GetWallpaperStatus { get; set; }
 
+    public Func<IReadOnlyList<MonitorDescriptor>>? GetConnectedMonitors { get; set; }
+
     public Action<string>? OnThemeChanged { get; set; }
     public Action? OnReloadThemes { get; set; }
     public Action<WeatherMode>? OnWeatherChanged { get; set; }
     public Action<bool>? OnWallpaperToggled { get; set; }
+    public Action<string?>? OnWallpaperMonitorChanged { get; set; }
+    public Action<string?>? OnPetMonitorChanged { get; set; }
     public Action<string>? OnPetModeChanged { get; set; }
     public Action<int>? OnPetScaleChanged { get; set; }
     public Action? OnResetPetPosition { get; set; }
@@ -38,8 +42,12 @@ public class TrayController : IDisposable
     public Action<bool>? OnAutoPauseToggled { get; set; }
     public Action<bool>? OnGameDndToggled { get; set; }
     public Action<bool>? OnProcessAgentCollectorToggled { get; set; }
+    public Action<bool>? OnSessionLogWatcherToggled { get; set; }
     public Action<bool>? OnGitHubCiCollectorToggled { get; set; }
+    public Action<bool>? OnMediaSyncToggled { get; set; }
     public Action<bool>? OnSoundToggled { get; set; }
+    public Action? OnInstallHooks { get; set; }
+    public Action? OnUninstallHooks { get; set; }
     public Action<string>? OnDemoTrigger { get; set; }
     public Action? OnExportGif { get; set; }
 
@@ -133,14 +141,13 @@ public class TrayController : IDisposable
         double wsMb = proc.WorkingSet64 / 1024.0 / 1024.0;
         int agentCount = state?.Agents.Count ?? 0;
         int workingCount = state?.Agents.Count(a => a.State == AgentState.Working) ?? 0;
-        string diagText = $"KageDesk  \u2022  {wsMb:F1} MB  \u2022  {agentCount} Agents ({workingCount} Active)";
+        string diagText = $"KageDesk v2.2  \u2022  {wsMb:F1} MB  \u2022  {agentCount} Agents ({workingCount} Active)";
         var diagItem = new ToolStripMenuItem(diagText) { Enabled = false };
         _contextMenu.Items.Add(diagItem);
 
         _contextMenu.Items.Add(new ToolStripSeparator());
 
         // 2. Wallpaper Status & Toggle
-        bool isWpAttached = IsWallpaperAttached?.Invoke() ?? false;
         string wpStatus = GetWallpaperStatus?.Invoke() ?? (config.WallpaperEnabled ? "Enabled" : "Disabled");
         string wpLabel = $"Live Wallpaper ({wpStatus})";
 
@@ -205,12 +212,77 @@ public class TrayController : IDisposable
 
         var resetPosItem = new ToolStripMenuItem("Reset Position to Right", null, (_, _) =>
         {
-            UpdateConfig?.Invoke(c => c.PetX = null);
+            UpdateConfig?.Invoke(c =>
+            {
+                c.PetX = null;
+                c.PetRelativeX = null;
+            });
             OnResetPetPosition?.Invoke();
         });
         petMenu.DropDownItems.Add(resetPosItem);
 
         _contextMenu.Items.Add(petMenu);
+
+        // 3b. Monitor Submenu (Wallpaper & Taskbar Pet)
+        var monitorMenu = new ToolStripMenuItem("Monitor");
+        var monitors = GetConnectedMonitors?.Invoke() ?? MonitorLayoutHelper.GetConnectedMonitors();
+
+        var wpMonitorMenu = new ToolStripMenuItem("Wallpaper Monitor");
+        bool wpPrimarySelected = string.IsNullOrWhiteSpace(config.WallpaperMonitorDeviceName) ||
+                                 string.Equals(config.WallpaperMonitorDeviceName, "primary", StringComparison.OrdinalIgnoreCase);
+        wpMonitorMenu.DropDownItems.Add(new ToolStripMenuItem("Primary (Auto)", null, (_, _) =>
+        {
+            UpdateConfig?.Invoke(c => c.WallpaperMonitorDeviceName = "");
+            OnWallpaperMonitorChanged?.Invoke(null);
+        }) { Checked = wpPrimarySelected });
+
+        var petMonitorMenu = new ToolStripMenuItem("Taskbar Pet Monitor");
+        bool petPrimarySelected = string.IsNullOrWhiteSpace(config.PetMonitorDeviceName) ||
+                                  string.Equals(config.PetMonitorDeviceName, "primary", StringComparison.OrdinalIgnoreCase);
+        petMonitorMenu.DropDownItems.Add(new ToolStripMenuItem("Primary (Auto)", null, (_, _) =>
+        {
+            UpdateConfig?.Invoke(c =>
+            {
+                c.PetMonitorDeviceName = "";
+                c.PetRelativeX = null;
+                c.PetX = null;
+            });
+            OnPetMonitorChanged?.Invoke(null);
+        }) { Checked = petPrimarySelected });
+
+        for (int i = 0; i < monitors.Count; i++)
+        {
+            var m = monitors[i];
+            string label = MonitorLayoutHelper.FormatMonitorMenuLabel(m, i);
+            string deviceName = m.DeviceName;
+
+            wpMonitorMenu.DropDownItems.Add(new ToolStripMenuItem(label, null, (_, _) =>
+            {
+                UpdateConfig?.Invoke(c => c.WallpaperMonitorDeviceName = deviceName);
+                OnWallpaperMonitorChanged?.Invoke(deviceName);
+            })
+            {
+                Checked = !wpPrimarySelected && string.Equals(config.WallpaperMonitorDeviceName, deviceName, StringComparison.OrdinalIgnoreCase)
+            });
+
+            petMonitorMenu.DropDownItems.Add(new ToolStripMenuItem(label, null, (_, _) =>
+            {
+                UpdateConfig?.Invoke(c =>
+                {
+                    c.PetMonitorDeviceName = deviceName;
+                    c.PetRelativeX = null;
+                    c.PetX = null;
+                });
+                OnPetMonitorChanged?.Invoke(deviceName);
+            })
+            {
+                Checked = !petPrimarySelected && string.Equals(config.PetMonitorDeviceName, deviceName, StringComparison.OrdinalIgnoreCase)
+            });
+        }
+
+        monitorMenu.DropDownItems.Add(wpMonitorMenu);
+        monitorMenu.DropDownItems.Add(petMonitorMenu);
+        _contextMenu.Items.Add(monitorMenu);
 
         // 4. Themes Submenu
         var themeMenu = new ToolStripMenuItem("Theme Packs");
@@ -241,11 +313,12 @@ public class TrayController : IDisposable
 
         _contextMenu.Items.Add(themeMenu);
 
-        // 5. Weather Submenu
-        var weatherMenu = new ToolStripMenuItem("Weather");
+        // 5. Weather / Day-Night Submenu
+        var weatherMenu = new ToolStripMenuItem("Weather & Time");
         foreach (WeatherMode wm in Enum.GetValues<WeatherMode>())
         {
-            var item = new ToolStripMenuItem(wm.ToString(), null, (_, _) =>
+            string label = wm == WeatherMode.Auto ? "Auto (Real-Time Day/Night)" : wm.ToString();
+            var item = new ToolStripMenuItem(label, null, (_, _) =>
             {
                 UpdateConfig?.Invoke(c => c.WeatherMode = wm);
                 OnWeatherChanged?.Invoke(wm);
@@ -261,6 +334,8 @@ public class TrayController : IDisposable
         var demoMenu = new ToolStripMenuItem("Demo Studio");
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Working Agents", null, (_, _) => OnDemoTrigger?.Invoke("working")));
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Living Handoff", null, (_, _) => OnDemoTrigger?.Invoke("handoff")));
+        demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Review Drama (Kakashi \u2192 Minato)", null, (_, _) => OnDemoTrigger?.Invoke("drama")));
+        demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Squad Celebration", null, (_, _) => OnDemoTrigger?.Invoke("celebrate")));
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Needs Approval", null, (_, _) => OnDemoTrigger?.Invoke("approve")));
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Done (Celebration)", null, (_, _) => OnDemoTrigger?.Invoke("done")));
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Trigger Failure Alert", null, (_, _) => OnDemoTrigger?.Invoke("fail")));
@@ -274,7 +349,7 @@ public class TrayController : IDisposable
         demoMenu.DropDownItems.Add(new ToolStripMenuItem("Reset to Live Orca", null, (_, _) => OnDemoTrigger?.Invoke("clear")));
         _contextMenu.Items.Add(demoMenu);
 
-        // 7. Settings Submenu
+        // 7. Settings & Hooks Submenu
         var settingsMenu = new ToolStripMenuItem("Settings");
         var soundItem = new ToolStripMenuItem("Sound Effects (8-bit)", null, (_, _) =>
         {
@@ -282,6 +357,13 @@ public class TrayController : IDisposable
             UpdateConfig?.Invoke(c => c.SoundEnabled = next);
             OnSoundToggled?.Invoke(next);
         }) { Checked = config.SoundEnabled };
+
+        var mediaSyncItem = new ToolStripMenuItem("Now-Playing Media Sync", null, (_, _) =>
+        {
+            bool next = !config.EnableMediaSync;
+            UpdateConfig?.Invoke(c => c.EnableMediaSync = next);
+            OnMediaSyncToggled?.Invoke(next);
+        }) { Checked = config.EnableMediaSync };
 
         var autoPauseItem = new ToolStripMenuItem("Auto-Pause Wallpaper When Covered", null, (_, _) =>
         {
@@ -304,12 +386,29 @@ public class TrayController : IDisposable
             OnProcessAgentCollectorToggled?.Invoke(next);
         }) { Checked = config.EnableProcessAgentCollector };
 
+        var sessionLogItem = new ToolStripMenuItem("Live Session Log Watcher", null, (_, _) =>
+        {
+            bool next = !config.EnableSessionLogWatcher;
+            UpdateConfig?.Invoke(c => c.EnableSessionLogWatcher = next);
+            OnSessionLogWatcherToggled?.Invoke(next);
+        }) { Checked = config.EnableSessionLogWatcher };
+
         var ghCiItem = new ToolStripMenuItem("GitHub CI Collector", null, (_, _) =>
         {
             bool next = !config.EnableGitHubCiCollector;
             UpdateConfig?.Invoke(c => c.EnableGitHubCiCollector = next);
             OnGitHubCiCollectorToggled?.Invoke(next);
         }) { Checked = config.EnableGitHubCiCollector };
+
+        var installHooksItem = new ToolStripMenuItem("Install CLI Hooks (Claude / Codex / OpenCode)", null, (_, _) =>
+        {
+            OnInstallHooks?.Invoke();
+        });
+
+        var uninstallHooksItem = new ToolStripMenuItem("Remove CLI Hooks", null, (_, _) =>
+        {
+            OnUninstallHooks?.Invoke();
+        });
 
         var startupItem = new ToolStripMenuItem("Launch on Windows Startup", null, (_, _) =>
         {
@@ -321,12 +420,17 @@ public class TrayController : IDisposable
         }) { Checked = StartupManager.IsStartupEnabled() };
 
         settingsMenu.DropDownItems.Add(soundItem);
+        settingsMenu.DropDownItems.Add(mediaSyncItem);
         settingsMenu.DropDownItems.Add(new ToolStripSeparator());
         settingsMenu.DropDownItems.Add(autoPauseItem);
         settingsMenu.DropDownItems.Add(gameDndItem);
         settingsMenu.DropDownItems.Add(new ToolStripSeparator());
         settingsMenu.DropDownItems.Add(procAgentItem);
+        settingsMenu.DropDownItems.Add(sessionLogItem);
         settingsMenu.DropDownItems.Add(ghCiItem);
+        settingsMenu.DropDownItems.Add(new ToolStripSeparator());
+        settingsMenu.DropDownItems.Add(installHooksItem);
+        settingsMenu.DropDownItems.Add(uninstallHooksItem);
         settingsMenu.DropDownItems.Add(new ToolStripSeparator());
         settingsMenu.DropDownItems.Add(startupItem);
 
