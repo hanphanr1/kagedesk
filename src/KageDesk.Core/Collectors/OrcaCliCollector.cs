@@ -39,8 +39,8 @@ public class OrcaCliCollector
         // 2. orca worktree ps --since 48h --limit 25 --agent-wait --json
         var worktreeTask = _commandRunner(new[] { "worktree", "ps", "--since", "48h", "--limit", "25", "--agent-wait", "--json" }, CommandTimeout, cancellationToken);
 
-        // 3. orca bot item list --status needs-you,in-progress,waiting --limit 20 --json
-        var itemsTask = _commandRunner(new[] { "bot", "item", "list", "--status", "needs-you,in-progress,waiting", "--limit", "20", "--json" }, CommandTimeout, cancellationToken);
+        // 3. orca bot item list --status needs-you --limit 20 --json
+        var itemsTask = _commandRunner(new[] { "bot", "item", "list", "--status", "needs-you", "--limit", "20", "--json" }, CommandTimeout, cancellationToken);
 
         // 4. orca account list
         var accountsTask = _commandRunner(new[] { "account", "list" }, CommandTimeout, cancellationToken);

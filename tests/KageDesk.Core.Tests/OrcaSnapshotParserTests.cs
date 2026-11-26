@@ -730,5 +730,287 @@ public class OrcaSnapshotParserTests
         Assert.Equal(expected, ag.State);
         Assert.NotEqual(AgentState.Idle, ag.State);
     }
-}
 
+    [Theory]
+    [InlineData("agentId", "Kakashi", AgentRole.Reviewer, "kakashi")]
+    [InlineData("agentId", "kakashi-reviewer", AgentRole.Reviewer, "kakashi")]
+    [InlineData("agentId", "bot:Kakashi", AgentRole.Reviewer, "kakashi")]
+    [InlineData("agentId", "bot:Kakashi-review", AgentRole.Reviewer, "kakashi")]
+    [InlineData("worktreeId", "folder:kakashi", AgentRole.Reviewer, "kakashi")]
+    [InlineData("worktreeId", "bot:kakashi", AgentRole.Reviewer, "kakashi")]
+    [InlineData("conversationName", "Kakashi (Reviewer)", AgentRole.Reviewer, "kakashi")]
+    [InlineData("conversationName", "Minato (Main Coder)", AgentRole.Coder, "minato")]
+    [InlineData("conversationName", "Minato \u00B7 Sprint Delivery", AgentRole.Coder, "minato")]
+    public void ParseWorktreePs_AndAggregator_OneFieldOnlyNonHomeRows_ResolveCanonicalIdentity(
+        string fieldName,
+        string fieldValue,
+        AgentRole expectedRole,
+        string expectedSprite)
+    {
+        var now = DateTimeOffset.UtcNow;
+        string worktreeId = fieldName == "worktreeId" ? fieldValue : "wt:generic-task";
+        string agentIdProp = fieldName == "agentId" ? $""" "agentId": "{fieldValue}", """ : "";
+        string convNameProp = fieldName == "conversationName" ? $""" "conversationName": "{fieldValue}", """ : "";
+
+        string json = $$"""
+        {
+          "ok": true,
+          "result": {
+            "worktrees": [
+              {
+                "worktreeId": "{{worktreeId}}",
+                "repo": "kagedesk",
+                "botHome": false,
+                "displayName": "generic-task-branch",
+                "status": "working",
+                "agents": [
+                  {
+                    "address": "orca_session_id:one-field-test",
+                    {{agentIdProp}}
+                    {{convNameProp}}
+                    "state": "working",
+                    "updatedAt": 1795545570739
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """;
+
+        var parsed = OrcaSnapshotParser.ParseWorktreePs(json, now);
+        var parsedAgent = Assert.Single(parsed);
+        Assert.Equal(expectedRole, parsedAgent.Role);
+        Assert.Equal(expectedSprite, parsedAgent.SpriteKey);
+
+        var aggregator = new HqStateAggregator(timeProvider: () => now);
+        aggregator.UpdateOrcaSnapshot(parsed, Array.Empty<AccountInfo>());
+        var aggAgent = Assert.Single(aggregator.GetState().Agents);
+        Assert.Equal(expectedRole, aggAgent.Role);
+        Assert.Equal(expectedSprite, aggAgent.SpriteKey);
+    }
+
+    [Theory]
+    [InlineData("name", "Kakashi")]
+    [InlineData("botName", "Kakashi (Reviewer)")]
+    [InlineData("role", "Kakashi")]
+    [InlineData("agentId", "Kakashi")]
+    [InlineData("agentId", "kakashi-reviewer")]
+    [InlineData("agentId", "bot:Kakashi")]
+    [InlineData("conversationName", "Kakashi (Reviewer)")]
+    public void ParseWorktreePs_AndAggregator_ConflictingOwnerVsAgent_AgentOwnedKakashiBeatsParentShikamaru(
+        string agentOwnedField,
+        string agentOwnedValue)
+    {
+        var now = DateTimeOffset.UtcNow;
+        string json = $$"""
+        {
+          "ok": true,
+          "result": {
+            "worktrees": [
+              {
+                "worktreeId": "wt:review-task",
+                "repo": "kagedesk",
+                "botHome": false,
+                "bot": "Shikamaru (Team Leader)",
+                "botName": "Shikamaru (Team Leader)",
+                "underBot": "Shikamaru (Team Leader)",
+                "displayName": "Shikamaru \u00B7 Delegated Review",
+                "status": "working",
+                "agents": [
+                  {
+                    "address": "orca_session_id:conflict-test",
+                    "underBot": "Shikamaru (Team Leader)",
+                    "{{agentOwnedField}}": "{{agentOwnedValue}}",
+                    "state": "working",
+                    "updatedAt": 1795545570739
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """;
+
+        var parsed = OrcaSnapshotParser.ParseWorktreePs(json, now);
+        var parsedAgent = Assert.Single(parsed);
+        Assert.Equal(AgentRole.Reviewer, parsedAgent.Role);
+        Assert.Equal("kakashi", parsedAgent.SpriteKey);
+
+        var aggregator = new HqStateAggregator(timeProvider: () => now);
+        aggregator.UpdateOrcaSnapshot(parsed, Array.Empty<AccountInfo>());
+        var aggAgent = Assert.Single(aggregator.GetState().Agents);
+        Assert.Equal(AgentRole.Reviewer, aggAgent.Role);
+        Assert.Equal("kakashi", aggAgent.SpriteKey);
+    }
+
+    [Theory]
+    [InlineData("Migration for Minato", "wt:migration-for-minato")]
+    [InlineData("minato-migration", "wt:minato-migration")]
+    [InlineData("minato-migration", "folder:minato-migration")]
+    [InlineData("docs-reviewer", "wt:docs-reviewer")]
+    [InlineData("docs-reviewer", "folder:docs-reviewer")]
+    public void ParseWorktreePs_AndAggregator_FalsePositiveProseAndProjectTitles_NeverMatchCanonicalBots(
+        string misleadingTitle,
+        string worktreeId)
+    {
+        var now = DateTimeOffset.UtcNow;
+        string json = $$"""
+        {
+          "ok": true,
+          "result": {
+            "worktrees": [
+              {
+                "worktreeId": "{{worktreeId}}",
+                "repo": "{{misleadingTitle}}",
+                "name": "{{misleadingTitle}}",
+                "displayName": "{{misleadingTitle}}",
+                "botHome": false,
+                "status": "working",
+                "agents": [
+                  {
+                    "address": "orca_session_id:fp-test",
+                    "agentId": "{{misleadingTitle}}",
+                    "name": "{{misleadingTitle}}",
+                    "displayName": "{{misleadingTitle}}",
+                    "conversationName": "{{misleadingTitle}}",
+                    "state": "working",
+                    "updatedAt": 1795545570739
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """;
+
+        var parsed = OrcaSnapshotParser.ParseWorktreePs(json, now);
+        var parsedAgent = Assert.Single(parsed);
+        Assert.Equal(AgentRole.Clone, parsedAgent.Role);
+        Assert.NotEqual("minato", parsedAgent.SpriteKey);
+        Assert.NotEqual("kakashi", parsedAgent.SpriteKey);
+
+        var aggregator = new HqStateAggregator(timeProvider: () => now);
+        aggregator.UpdateOrcaSnapshot(parsed, Array.Empty<AccountInfo>());
+        var aggAgent = Assert.Single(aggregator.GetState().Agents);
+        Assert.Equal(AgentRole.Clone, aggAgent.Role);
+        Assert.NotEqual("minato", aggAgent.SpriteKey);
+        Assert.NotEqual("kakashi", aggAgent.SpriteKey);
+    }
+
+    [Fact]
+    public async Task MergeSnapshots_AndCollector_ExternalWaitingItemStaysIdle_WhileNeedsYouTriggersNeedsApproval()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var idleBot = new AgentSnapshot(
+            Id: "b1",
+            Name: "Shikamaru (Team Leader)",
+            Role: AgentRole.Leader,
+            SpriteKey: "shikamaru",
+            State: AgentState.Idle,
+            IsBotHome: true,
+            Source: "orca");
+
+        // Negative control: external "waiting" bot item (e.g. waiting on CI/deploy) MUST NOT trigger NeedsApproval
+        var waitingItems = new List<BotItemInfo>
+        {
+            new(42, "b1", "Shikamaru (Team Leader)", "Waiting for CI pipeline", "waiting", null, now)
+        };
+
+        var mergedWaiting = OrcaSnapshotParser.MergeSnapshots(new[] { idleBot }, waitingItems);
+        var afterWaiting = Assert.Single(mergedWaiting);
+        Assert.Equal(AgentState.Idle, afterWaiting.State);
+        Assert.Null(afterWaiting.QuestionPrompt);
+        Assert.False(afterWaiting.Unread);
+
+        // Positive control: "needs-you" and "needs_you" bot items DO trigger NeedsApproval
+        foreach (string approvalStatus in new[] { "needs-you", "needs_you" })
+        {
+            var needsYouItems = new List<BotItemInfo>
+            {
+                new(43, "b1", "Shikamaru (Team Leader)", "Deploy sign-off", approvalStatus, "Approve prod deploy?", now)
+            };
+
+            var mergedApproval = OrcaSnapshotParser.MergeSnapshots(new[] { idleBot }, needsYouItems);
+            var afterApproval = Assert.Single(mergedApproval);
+            Assert.Equal(AgentState.NeedsApproval, afterApproval.State);
+            Assert.Equal("Approve prod deploy?", afterApproval.QuestionPrompt);
+            Assert.True(afterApproval.Unread);
+        }
+
+        // End-to-end OrcaCliCollector check: bot item query requests ONLY needs-you (never waiting)
+        // and even if a waiting item is present in output, the idle bot remains Idle in HqStateAggregator
+        string[]? capturedItemArgs = null;
+        const string idleWorktreeJson = """
+        {
+          "ok": true,
+          "result": {
+            "worktrees": [
+              {
+                "worktreeId": "folder:kazama-team-leader",
+                "bot": "Shikamaru (Team Leader)",
+                "botHome": true,
+                "displayName": "Shikamaru (Team Leader)",
+                "status": "idle",
+                "sidebarStatus": "idle",
+                "agents": [
+                  {
+                    "address": "b1",
+                    "state": "idle",
+                    "updatedAt": 1795545570739
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """;
+
+        const string waitingItemJson = """
+        {
+          "ok": true,
+          "result": {
+            "items": [
+              {
+                "number": 42,
+                "owner": { "botId": "b1", "name": "Shikamaru (Team Leader)" },
+                "title": "Waiting on external CI",
+                "status": "waiting",
+                "question": null
+              }
+            ]
+          }
+        }
+        """;
+
+        var aggregator = new HqStateAggregator(timeProvider: () => now);
+        var collector = new OrcaCliCollector(
+            aggregator,
+            timeProvider: () => now,
+            commandRunner: (args, _, _) =>
+            {
+                if (args.Length >= 2 && args[0] == "bot" && args[1] == "item")
+                {
+                    capturedItemArgs = args;
+                    return Task.FromResult(new CliResult(0, waitingItemJson, ""));
+                }
+                if (args.Length >= 1 && args[0] == "worktree")
+                {
+                    return Task.FromResult(new CliResult(0, idleWorktreeJson, ""));
+                }
+                return Task.FromResult(new CliResult(0, """{ "ok": true, "result": { "bots": [] } }""", ""));
+            });
+
+        await collector.CollectOnceAsync();
+
+        Assert.NotNull(capturedItemArgs);
+        int statusIdx = Array.IndexOf(capturedItemArgs!, "--status");
+        Assert.True(statusIdx >= 0 && statusIdx + 1 < capturedItemArgs!.Length);
+        Assert.Equal("needs-you", capturedItemArgs![statusIdx + 1]);
+
+        var state = aggregator.GetState();
+        var bot = Assert.Single(state.Agents);
+        Assert.Equal(AgentState.Idle, bot.State);
+        Assert.Equal(HqMood.Calm, state.Mood);
+    }
+}

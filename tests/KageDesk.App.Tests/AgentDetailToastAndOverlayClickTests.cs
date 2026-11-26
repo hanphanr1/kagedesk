@@ -598,5 +598,65 @@ public class AgentDetailToastAndOverlayClickTests
         Assert.False(form.IsHandoffActive);
         Assert.False(form.ShouldStayVisibleInAutoHide());
     }
-}
 
+    [Fact]
+    public void PetOverlayForm_DismissingApprovalAlertAThenClickingDismissOnFailedAlertB_DismissesBothWhileMixiRemainsBlocked()
+    {
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        var agentA = new AgentSnapshot("agent-A", "Minato", AgentRole.Coder, "minato", AgentState.NeedsApproval, QuestionPrompt: "Approve migration?", Source: "orca");
+        var agentB = new AgentSnapshot("agent-B", "Tsunade", AgentRole.Tester, "tsunade", AgentState.Failed, TaskTitle: "Suite failed", Source: "orca");
+
+        var dualAlertState = new HqState(
+            Agents: new[] { agentA, agentB },
+            Accounts: Array.Empty<AccountInfo>(),
+            Builds: Array.Empty<BuildInfo>(),
+            Weather: EffectiveWeather.Day,
+            Mood: HqMood.Alert,
+            PendingVisualEvents: Array.Empty<HqEvent>(),
+            Timestamp: now);
+
+        using var form = new PetOverlayForm(theme, initialScale: 1, idleMode: "chill", showMixiWhenAllIdle: true);
+        _ = form.Handle;
+
+        // 1. Initial render shows approval alert A
+        form.ApplyRenderState(dualAlertState, theme, petPaused: false, petHiddenByDndOrLock: false);
+        var dismissA = Assert.Single(form.CurrentHitRegions, r => r.ActionId == "dismiss");
+        Assert.Equal("agent-A", dismissA.TargetAgentId);
+        Assert.Equal(AgentState.NeedsApproval, dismissA.TargetAgentState);
+        Assert.Contains(form.CurrentHitRegions, r => r.ActionId == "agent:agent-A");
+        Assert.False(form.IsMixiChillActive);
+
+        // 2. Click dismiss X on A -> reveals failure alert B
+        form.SimulateMouseDown(dismissA.X + dismissA.Width / 2, dismissA.Y + dismissA.Height / 2, MouseButtons.Left);
+
+        var dismissB = Assert.Single(form.CurrentHitRegions, r => r.ActionId == "dismiss");
+        Assert.Equal("agent-B", dismissB.TargetAgentId);
+        Assert.Equal(AgentState.Failed, dismissB.TargetAgentState);
+        Assert.Contains(form.CurrentHitRegions, r => r.ActionId == "agent:agent-B");
+        Assert.False(form.IsMixiChillActive);
+
+        // 3. Click dismiss X on B -> BOTH A and B are dismissed (no alert card shown), while Mixi remains blocked!
+        form.SimulateMouseDown(dismissB.X + dismissB.Width / 2, dismissB.Y + dismissB.Height / 2, MouseButtons.Left);
+
+        Assert.DoesNotContain(form.CurrentHitRegions, r => r.ActionId == "dismiss");
+        Assert.False(form.IsMixiChillActive);
+
+        // 4. Subsequent re-render with A and B still active keeps BOTH dismissed and Mixi blocked
+        form.ApplyRenderState(dualAlertState, theme, petPaused: false, petHiddenByDndOrLock: false);
+        Assert.DoesNotContain(form.CurrentHitRegions, r => r.ActionId == "dismiss");
+        Assert.False(form.IsMixiChillActive);
+
+        // 5. When A leaves NeedsApproval (becomes Idle), B stays dismissed; if A later raises NeedsApproval again, A reappears
+        var aIdleBFailed = dualAlertState with { Agents = new[] { agentA with { State = AgentState.Idle }, agentB } };
+        form.ApplyRenderState(aIdleBFailed, theme, petPaused: false, petHiddenByDndOrLock: false);
+        Assert.DoesNotContain(form.CurrentHitRegions, r => r.ActionId == "dismiss");
+        Assert.False(form.IsMixiChillActive);
+
+        form.ApplyRenderState(dualAlertState, theme, petPaused: false, petHiddenByDndOrLock: false);
+        var dismissAAgain = Assert.Single(form.CurrentHitRegions, r => r.ActionId == "dismiss");
+        Assert.Equal("agent-A", dismissAAgain.TargetAgentId);
+        Assert.Equal(AgentState.NeedsApproval, dismissAAgain.TargetAgentState);
+    }
+}

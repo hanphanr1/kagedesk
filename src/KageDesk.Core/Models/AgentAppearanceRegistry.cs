@@ -66,6 +66,18 @@ public sealed class AgentAppearanceRegistry
         @"(?<![a-z0-9_\-./\\])(team\s+leader|team\s+lead|teamlead|leader|lead|main\s+coder|coder|reviewer|tester|qa)(?![a-z0-9_\-./\\])",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    private static readonly Regex CanonicalSlugRegex = new(
+        @"^\s*(shikamaru|kazama|minato|kakashi|tsunade)(?:[\-_](?:team[\-_]?leader|team[\-_]?lead|leader|lead|main[\-_]?coder|coder|reviewer|tester|qa|bot|home))+\s*$",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex StructuredBotIdPrefixRegex = new(
+        @"^\s*bot:(shikamaru|kazama|minato|kakashi|tsunade)(?:$|[\s\-_:\./\(\)\u00B7\u2022\|\u2014\u2013])",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex StructuredWorktreeIdRegex = new(
+        @"^\s*(?:folder|bot):(shikamaru|kazama|minato|kakashi|tsunade)(?:\s*$|(?:[\-_](?:team[\-_]?leader|team[\-_]?lead|leader|lead|main[\-_]?coder|coder|reviewer|tester|qa|bot|home))+\s*$|\s*[\(\u00B7\u2022:\|\u2014\u2013]|\s+-\s+)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     public static bool TryMatchCanonicalPersonaName(string? text, out AgentRole role, out string spriteKey)
     {
         if (!string.IsNullOrWhiteSpace(text))
@@ -90,6 +102,49 @@ public sealed class AgentAppearanceRegistry
             if (match.Success)
             {
                 return TryMapCanonicalPersonaToken(match.Groups[1].Value, out role, out spriteKey);
+            }
+        }
+
+        role = default;
+        spriteKey = string.Empty;
+        return false;
+    }
+
+    public static bool TryMatchCanonicalAgentId(string? agentId, out AgentRole role, out string spriteKey)
+    {
+        if (!string.IsNullOrWhiteSpace(agentId))
+        {
+            if (TryMatchStructuredWorkerPrefix(agentId, out role, out spriteKey))
+            {
+                return true;
+            }
+
+            var slugMatch = CanonicalSlugRegex.Match(agentId);
+            if (slugMatch.Success && TryMapCanonicalPersonaToken(slugMatch.Groups[1].Value, out role, out spriteKey))
+            {
+                return true;
+            }
+
+            var botMatch = StructuredBotIdPrefixRegex.Match(agentId);
+            if (botMatch.Success && TryMapCanonicalPersonaToken(botMatch.Groups[1].Value, out role, out spriteKey))
+            {
+                return true;
+            }
+        }
+
+        role = default;
+        spriteKey = string.Empty;
+        return false;
+    }
+
+    public static bool TryMatchCanonicalWorktreeId(string? worktreeId, out AgentRole role, out string spriteKey)
+    {
+        if (!string.IsNullOrWhiteSpace(worktreeId))
+        {
+            var match = StructuredWorktreeIdRegex.Match(worktreeId);
+            if (match.Success && TryMapCanonicalPersonaToken(match.Groups[1].Value, out role, out spriteKey))
+            {
+                return true;
             }
         }
 
@@ -217,11 +272,14 @@ public sealed class AgentAppearanceRegistry
 
     /// <summary>
     /// Resolves a canonical Orca bot (Shikamaru, Minato, Kakashi, Tsunade) once from structured Orca metadata.
-    /// Priority:
-    /// 1) Explicit agent metadata (name, displayName prefix, botName, bot, exact role, underBot)
-    /// 2) Worktree explicit role/name and structured worker prefix in displayName (e.g. "Minato · Task")
-    /// 3) Validated owner/parent bot metadata (underBot, botName, bot) and bot-home role titles
-    /// Never matches arbitrary project/branch slugs in displayName or WorktreeId.
+    /// Priority (agent-owned fields ALWAYS precede owner/parent fallbacks):
+    /// 1) Explicit agent metadata (agentName, agentDisplayName prefix, agentRoleText, agentBotName, agentBot)
+    /// 2) Agent-owned agentId (exact canonical identity or structured form: "Kakashi", "kakashi-reviewer", "bot:Kakashi...")
+    /// 3) Agent-owned conversationName on ALL rows using exact/structured canonical forms (e.g. "Kakashi (Reviewer)", "Minato · ...")
+    /// 4) Structured worktreeId ONLY ("folder:kakashi", "bot:kakashi", canonical bot-home folder/slug — never arbitrary repo/branch paths)
+    /// 5) Worktree structured worker prefix / explicit role ("Minato · ...") and validated owner/parent metadata (underBot, botName, bot)
+    /// 6) Bot-home role-based display/conversation titles (e.g. "Senior coder bot", "Code reviewer")
+    /// Never matches arbitrary prose or project/branch slugs like "Migration for Minato", "minato-migration", or "docs-reviewer".
     /// </summary>
     public static bool TryResolveCanonicalOrcaBot(
         string? displayName,
@@ -243,46 +301,68 @@ public sealed class AgentAppearanceRegistry
         string? agentRoleText = null,
         string? agentUnderBot = null)
     {
-        // 1. Agent's own explicit metadata FIRST (explicit agent name, bot name, exact role, underBot)
-        if (TryMatchCanonicalPersonaName(agentName, out role, out spriteKey) ||
+        // 1. Explicit agent-owned fields FIRST (never preempted by owner/parent underBot)
+        if (TryMatchStructuredWorkerPrefix(agentName, out role, out spriteKey) ||
             TryMatchCanonicalRoleValue(agentName, out role, out spriteKey) ||
             TryMatchStructuredWorkerPrefix(agentDisplayName, out role, out spriteKey) ||
-            TryMatchCanonicalPersonaName(agentBotName, out role, out spriteKey) ||
-            TryMatchCanonicalPersonaName(agentBot, out role, out spriteKey) ||
             TryMatchCanonicalRoleValue(agentRoleText, out role, out spriteKey) ||
+            TryMatchStructuredWorkerPrefix(agentBotName, out role, out spriteKey) ||
+            TryMatchCanonicalRoleValue(agentBotName, out role, out spriteKey) ||
             TryMatchCanonicalRoleKeyword(agentBotName, out role, out spriteKey) ||
-            TryMatchCanonicalRoleKeyword(agentBot, out role, out spriteKey) ||
-            TryMatchCanonicalPersonaName(agentUnderBot, out role, out spriteKey) ||
-            TryMatchCanonicalRoleKeyword(agentUnderBot, out role, out spriteKey))
+            TryMatchStructuredWorkerPrefix(agentBot, out role, out spriteKey) ||
+            TryMatchCanonicalRoleValue(agentBot, out role, out spriteKey) ||
+            TryMatchCanonicalRoleKeyword(agentBot, out role, out spriteKey))
         {
             return true;
         }
 
-        // 2. Worktree explicit role/name and structured worker prefix (e.g. "Minato · KageDesk v2.1")
+        // 2. Agent-owned agentId (exact canonical identity or documented structured form)
+        if (TryMatchCanonicalAgentId(agentId, out role, out spriteKey))
+        {
+            return true;
+        }
+
+        // 3. Agent-owned conversationName on ALL rows (both bot-home and non-home) using exact/structured canonical forms
+        if (TryMatchStructuredWorkerPrefix(conversationName, out role, out spriteKey))
+        {
+            return true;
+        }
+
+        // 4. Documented structured worktreeId ONLY (e.g. "folder:kakashi", "bot:kakashi", canonical bot-home slug)
+        if (TryMatchCanonicalWorktreeId(worktreeId, out role, out spriteKey))
+        {
+            return true;
+        }
+
+        // 5. Worktree explicit role / structured worker prefix ("Minato · Task"), then validated owner/parent metadata
         if (TryMatchCanonicalRoleValue(roleText, out role, out spriteKey) ||
-            TryMatchCanonicalPersonaName(name, out role, out spriteKey) ||
+            TryMatchStructuredWorkerPrefix(name, out role, out spriteKey) ||
             TryMatchCanonicalRoleValue(name, out role, out spriteKey) ||
             TryMatchStructuredWorkerPrefix(displayName, out role, out spriteKey))
         {
             return true;
         }
 
-        // 3. Validated owner/parent bot metadata (underBot, botName, bot)
-        if (TryMatchCanonicalPersonaName(underBot, out role, out spriteKey) ||
-            TryMatchCanonicalPersonaName(botName, out role, out spriteKey) ||
-            TryMatchCanonicalPersonaName(bot, out role, out spriteKey) ||
-            TryMatchCanonicalRoleKeyword(underBot, out role, out spriteKey) ||
+        if (TryMatchStructuredWorkerPrefix(agentUnderBot, out role, out spriteKey) ||
+            TryMatchCanonicalRoleValue(agentUnderBot, out role, out spriteKey) ||
+            TryMatchCanonicalRoleKeyword(agentUnderBot, out role, out spriteKey) ||
+            TryMatchStructuredWorkerPrefix(botName, out role, out spriteKey) ||
+            TryMatchCanonicalRoleValue(botName, out role, out spriteKey) ||
             TryMatchCanonicalRoleKeyword(botName, out role, out spriteKey) ||
+            TryMatchStructuredWorkerPrefix(underBot, out role, out spriteKey) ||
+            TryMatchCanonicalRoleValue(underBot, out role, out spriteKey) ||
+            TryMatchCanonicalRoleKeyword(underBot, out role, out spriteKey) ||
+            TryMatchStructuredWorkerPrefix(bot, out role, out spriteKey) ||
+            TryMatchCanonicalRoleValue(bot, out role, out spriteKey) ||
             TryMatchCanonicalRoleKeyword(bot, out role, out spriteKey))
         {
             return true;
         }
 
-        // 4. Bot-home entries may carry role-based display names (e.g. "Senior coder bot", "Code reviewer")
+        // 6. Bot-home entries may carry role-based display/conversation titles (e.g. "Senior coder bot", "Code reviewer")
         if (isBotHome &&
-            (TryMatchCanonicalPersonaName(displayName, out role, out spriteKey) ||
-             TryMatchCanonicalRoleKeyword(displayName, out role, out spriteKey) ||
-             TryMatchCanonicalPersonaName(conversationName, out role, out spriteKey) ||
+            (TryMatchCanonicalRoleKeyword(displayName, out role, out spriteKey) ||
+             TryMatchCanonicalRoleKeyword(name, out role, out spriteKey) ||
              TryMatchCanonicalRoleKeyword(conversationName, out role, out spriteKey)))
         {
             return true;

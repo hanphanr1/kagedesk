@@ -10,7 +10,9 @@ public readonly record struct PetHitRegion(
     int Y,
     int Width,
     int Height,
-    string? Label = null
+    string? Label = null,
+    string? TargetAgentId = null,
+    AgentState? TargetAgentState = null
 )
 {
     public bool Contains(int px, int py) => px >= X && px < X + Width && py >= Y && py < Y + Height;
@@ -78,6 +80,8 @@ public sealed class TaskbarPetRenderer
     public ActorMotionSystem MotionSystem => _motionSystem;
     public bool IsMixiChillActive { get; private set; }
     public MixiChillActivity? ActiveMixiActivity { get; private set; }
+    public string? ActiveAlertAgentId { get; private set; }
+    public AgentState? ActiveAlertAgentState { get; private set; }
 
     public bool HasUnconsumedHandoffEvent(HqState state) => _motionSystem.HasUnconsumedHandoffEvent(state);
 
@@ -104,6 +108,8 @@ public sealed class TaskbarPetRenderer
         Array.Clear(_cachedWorkingItems);
         IsMixiChillActive = false;
         ActiveMixiActivity = null;
+        ActiveAlertAgentId = null;
+        ActiveAlertAgentState = null;
     }
 
     public IReadOnlyList<PetHitRegion> Render(
@@ -114,8 +120,7 @@ public sealed class TaskbarPetRenderer
         bool showIdleChill = true,
         DateTimeOffset? nowOverride = null,
         bool showMixiWhenAllIdle = true,
-        string? dismissedAlertAgentId = null,
-        AgentState? dismissedAlertState = null)
+        IReadOnlyDictionary<string, AgentState>? dismissedAlerts = null)
     {
         if (buf.Width < CanvasWidth || buf.Height < CanvasHeight)
         {
@@ -137,6 +142,8 @@ public sealed class TaskbarPetRenderer
         _hitRegions.Clear();
         IsMixiChillActive = false;
         ActiveMixiActivity = null;
+        ActiveAlertAgentId = null;
+        ActiveAlertAgentState = null;
 
         _emitAccum += dt;
         bool emitTick = false;
@@ -166,10 +173,9 @@ public sealed class TaskbarPetRenderer
         for (int i = 0; i < agents.Count; i++)
         {
             AgentSnapshot ag = agents[i];
-            bool isDismissedAlert = dismissedAlertAgentId != null &&
-                dismissedAlertState.HasValue &&
-                ag.State == dismissedAlertState.Value &&
-                string.Equals(ag.Id, dismissedAlertAgentId, StringComparison.OrdinalIgnoreCase);
+            bool isDismissedAlert = dismissedAlerts != null &&
+                dismissedAlerts.TryGetValue(ag.Id, out var dismissedState) &&
+                ag.State == dismissedState;
 
             if (ag.State == AgentState.NeedsApproval && !isDismissedAlert && approvalAgent == null)
             {
@@ -513,6 +519,9 @@ public sealed class TaskbarPetRenderer
 
     private void RenderApprovalMode(PixelBuffer buf, AgentSnapshot agent, float timeSeconds)
     {
+        ActiveAlertAgentId = agent.Id;
+        ActiveAlertAgentState = AgentState.NeedsApproval;
+
         const int charX = 344;
         string sprite = ShinobiSpriteRenderer.NormalizeSpriteKey(agent.SpriteKey);
 
@@ -573,11 +582,14 @@ public sealed class TaskbarPetRenderer
         const int dismissX = cardX + cardW - dismissW - 8;
         buf.DrawPixelCard(dismissX, btnY, dismissW, btnH, ColorUtil.FromRgb(56, 28, 36), ColorCrimson);
         PixelFont.DrawTextCentered(buf, dismissX + dismissW / 2, btnY + 5, "X", ColorUtil.FromRgb(254, 202, 202), PixelFontSize.Regular);
-        _hitRegions.Add(new PetHitRegion("dismiss", dismissX, btnY, dismissW, btnH, "Dismiss"));
+        _hitRegions.Add(new PetHitRegion("dismiss", dismissX, btnY, dismissW, btnH, "Dismiss", agent.Id, AgentState.NeedsApproval));
     }
 
     private void RenderFailedMode(PixelBuffer buf, AgentSnapshot agent, float timeSeconds, bool emitTick)
     {
+        ActiveAlertAgentId = agent.Id;
+        ActiveAlertAgentState = AgentState.Failed;
+
         const int charX = 344;
         const int laptopX = 314;
         string sprite = ShinobiSpriteRenderer.NormalizeSpriteKey(agent.SpriteKey);
@@ -620,7 +632,7 @@ public sealed class TaskbarPetRenderer
         int dismissX = cardX + cardW - 28;
         buf.DrawPixelCard(dismissX, btnY, 20, 16, ColorUtil.FromRgb(56, 28, 36), ColorCrimson);
         PixelFont.DrawTextCentered(buf, dismissX + 10, btnY + 5, "X", ColorWhite, PixelFontSize.Small);
-        _hitRegions.Add(new PetHitRegion("dismiss", dismissX, btnY, 20, 16, "Dismiss"));
+        _hitRegions.Add(new PetHitRegion("dismiss", dismissX, btnY, 20, 16, "Dismiss", agent.Id, AgentState.Failed));
     }
 
     private void RenderDoneMode(PixelBuffer buf, AgentSnapshot agent, float timeSeconds, bool emitTick)

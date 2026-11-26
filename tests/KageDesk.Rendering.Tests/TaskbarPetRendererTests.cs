@@ -985,6 +985,55 @@ public class TaskbarPetRendererTests
         Assert.True(typeof(PetHitRegion).IsValueType);
     }
 
+    [Fact]
+    public void Render_IdleBotWithExternalWaitingBotItem_DoesNotShowApprovalCardOrBlockMixi_WhileNeedsYouDoes()
+    {
+        var renderer = new TaskbarPetRenderer();
+        using var buf = new PixelBuffer(TaskbarPetRenderer.CanvasWidth, TaskbarPetRenderer.CanvasHeight);
+        var theme = ThemePackLoader.BuiltInFallback;
+        var now = DateTimeOffset.UtcNow;
+
+        var idleBot = new AgentSnapshot(
+            Id: "bot-shika",
+            Name: "Shikamaru (Team Leader)",
+            Role: AgentRole.Leader,
+            SpriteKey: "shikamaru",
+            State: AgentState.Idle,
+            IsBotHome: true,
+            Source: "orca");
+
+        // Negative control: external "waiting" item keeps bot Idle, shows no approval card, and does NOT block Mixi
+        var mergedWaiting = KageDesk.Core.Collectors.OrcaSnapshotParser.MergeSnapshots(
+            new[] { idleBot },
+            new[]
+            {
+                new KageDesk.Core.Collectors.BotItemInfo(1, "bot-shika", "Shikamaru (Team Leader)", "Waiting for deploy", "waiting", null, now)
+            });
+
+        var waitingState = MakeState(mergedWaiting.ToArray());
+        var waitingRegions = renderer.Render(buf, waitingState, theme, 1.0f, showIdleChill: true, nowOverride: now, showMixiWhenAllIdle: true);
+        Assert.Equal(AgentState.Idle, Assert.Single(mergedWaiting).State);
+        Assert.True(renderer.IsMixiChillActive);
+        Assert.DoesNotContain(waitingRegions, r => r.ActionId == "dismiss");
+        Assert.Null(renderer.ActiveAlertAgentId);
+
+        // Positive control: "needs-you" item triggers NeedsApproval, summons approval card, and blocks Mixi
+        var mergedNeedsYou = KageDesk.Core.Collectors.OrcaSnapshotParser.MergeSnapshots(
+            new[] { idleBot },
+            new[]
+            {
+                new KageDesk.Core.Collectors.BotItemInfo(2, "bot-shika", "Shikamaru (Team Leader)", "Approval needed", "needs-you", "Approve release?", now)
+            });
+
+        var approvalState = MakeState(mergedNeedsYou.ToArray());
+        var approvalRegions = renderer.Render(buf, approvalState, theme, 1.5f, showIdleChill: true, nowOverride: now, showMixiWhenAllIdle: true);
+        Assert.Equal(AgentState.NeedsApproval, Assert.Single(mergedNeedsYou).State);
+        Assert.False(renderer.IsMixiChillActive);
+        var dismissRegion = Assert.Single(approvalRegions, r => r.ActionId == "dismiss");
+        Assert.Equal("bot-shika", dismissRegion.TargetAgentId);
+        Assert.Equal(AgentState.NeedsApproval, dismissRegion.TargetAgentState);
+    }
+
     private static long ComputeChecksum(PixelBuffer buf)
     {
         unchecked

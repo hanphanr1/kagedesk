@@ -72,8 +72,17 @@ public static class OrcaSnapshotParser
         "crashed"
     };
 
+    private static readonly HashSet<string> BotItemApprovalStates = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "needs-you",
+        "needs_you"
+    };
+
     private static bool IsApprovalToken(string? value)
         => !string.IsNullOrWhiteSpace(value) && ApprovalStates.Contains(value.Trim());
+
+    private static bool IsBotItemApprovalStatus(string? value)
+        => !string.IsNullOrWhiteSpace(value) && BotItemApprovalStates.Contains(value.Trim());
 
     private static bool IsWorkingToken(string? value)
         => !string.IsNullOrWhiteSpace(value) && WorkingStates.Contains(value.Trim());
@@ -180,6 +189,8 @@ public static class OrcaSnapshotParser
         var underBot = wt.TryGetProperty("underBot", out var ubProp) ? ubProp.GetString() : null;
         var wtName = wt.TryGetProperty("name", out var nmProp) ? nmProp.GetString() : null;
         var wtRole = wt.TryGetProperty("role", out var rlProp) ? rlProp.GetString() : null;
+        var wtConvName = wt.TryGetProperty("conversationName", out var wcnProp) ? wcnProp.GetString() : null;
+        var wtAgentId = wt.TryGetProperty("agentId", out var waiProp) ? waiProp.GetString() : null;
         var botHome = wt.TryGetProperty("botHome", out var bhProp) && bhProp.ValueKind == JsonValueKind.True;
         if (!botHome && wt.TryGetProperty("chats", out var chatsProp) && chatsProp.ValueKind == JsonValueKind.Object &&
             chatsProp.TryGetProperty("home", out var chHome) && chHome.ValueKind == JsonValueKind.True)
@@ -202,13 +213,14 @@ public static class OrcaSnapshotParser
         var (role, spriteKey) = InferRoleAndSprite(
             bot: bot,
             displayName: displayName,
-            conversationName: null,
+            conversationName: wtConvName,
             isBotHome: botHome,
             worktreeId: worktreeId,
             name: wtName,
             botName: botName,
             underBot: underBot,
-            roleText: wtRole);
+            roleText: wtRole,
+            agentId: wtAgentId);
 
         // Check if agents array is present
         if (wt.TryGetProperty("agents", out var agentsArr) && agentsArr.ValueKind == JsonValueKind.Array)
@@ -259,15 +271,18 @@ public static class OrcaSnapshotParser
                             taskTitle = actTitle.GetString();
                     }
 
-                    // Resolve canonical Orca identity ONCE: agent's own explicit metadata FIRST
-                    // (explicit agent name, displayName prefix, botName/bot, exact role, underBot),
-                    // THEN worktree structured worker prefix / validated owner bot metadata.
-                    string? effectiveAgentId = !string.IsNullOrWhiteSpace(agentIdField) ? agentIdField : address;
+                    // Resolve canonical Orca identity ONCE: agent-owned fields FIRST
+                    // (explicit agentName/botName/role, agentId, conversationName on all rows, structured worktreeId),
+                    // THEN validated owner/parent metadata (underBot / structured displayName prefix).
+                    string? effectiveAgentId = !string.IsNullOrWhiteSpace(agentIdField)
+                        ? agentIdField
+                        : (!string.IsNullOrWhiteSpace(address) ? address : wtAgentId);
+                    string? effectiveConvName = !string.IsNullOrWhiteSpace(convName) ? convName : wtConvName;
 
                     var (effectiveRole, effectiveSprite) = InferRoleAndSprite(
                         bot: bot,
                         displayName: displayName,
-                        conversationName: convName,
+                        conversationName: effectiveConvName,
                         isBotHome: botHome,
                         worktreeId: worktreeId,
                         name: wtName,
@@ -638,9 +653,9 @@ public static class OrcaSnapshotParser
         var merged = new List<AgentSnapshot>(agents.Count);
         foreach (var agent in agents)
         {
-            // Find if any item requires approval/input for this agent
+            // Find if any bot item explicitly requires user approval (needs-you / needs_you ONLY; never external waiting)
             var item = items.FirstOrDefault(i =>
-                IsApprovalToken(i.Status) &&
+                IsBotItemApprovalStatus(i.Status) &&
                 (!string.IsNullOrEmpty(i.OwnerBotId) && (agent.Id.Contains(i.OwnerBotId, StringComparison.OrdinalIgnoreCase) || agent.Name.Contains(i.OwnerBotId, StringComparison.OrdinalIgnoreCase)) ||
                  (!string.IsNullOrEmpty(i.OwnerName) && (agent.Name.Contains(i.OwnerName, StringComparison.OrdinalIgnoreCase) || i.OwnerName.Contains(agent.Name, StringComparison.OrdinalIgnoreCase)))));
 

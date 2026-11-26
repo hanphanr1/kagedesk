@@ -41,6 +41,9 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
     private const int STATUS_INFO_LENGTH_MISMATCH = unchecked((int)0xC0000004);
     private const int STATUS_BUFFER_TOO_SMALL = unchecked((int)0xC0000023);
     private const int STATUS_BUFFER_OVERFLOW = unchecked((int)0x80000005);
+    private const int ERROR_INSUFFICIENT_BUFFER = 122;
+
+    private static readonly ProcessClassification RejectedHandleClassification = new(null, false, false, null);
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct PROCESSENTRY32W
@@ -104,6 +107,13 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
     private static extern bool GetProcessIoCounters(
         IntPtr hProcess,
         out IO_COUNTERS lpIoCounters);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool QueryFullProcessImageNameW(
+        IntPtr hProcess,
+        uint dwFlags,
+        [Out] char[] lpExeName,
+        ref uint lpdwSize);
 
     [DllImport("ntdll.dll", SetLastError = true)]
     private static extern int NtQueryInformationProcess(
@@ -241,16 +251,106 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
         return parentMap;
     }
 
+    internal readonly record struct RawToolhelpEntry(int Pid, int ParentPid, string ExeName);
+
+    internal readonly record struct OpenedProcessHandleData(
+        long StartTimeTicks,
+        long TotalCpuTimeMs,
+        string? ImagePath,
+        Func<(bool HasIoCounters, long ReadTransferBytes, long OtherTransferBytes)> ReadIoCounters,
+        Func<string?> ReadCommandLine);
+
+    internal static string? ExtractExecutableBasename(string? imagePath)
+    {
+        if (string.IsNullOrWhiteSpace(imagePath)) return null;
+        string trimmed = imagePath.Trim();
+        int lastSlash = trimmed.LastIndexOfAny(new[] { '\\', '/' });
+        string fileName = lastSlash >= 0 ? trimmed[(lastSlash + 1)..] : trimmed;
+        return string.IsNullOrWhiteSpace(fileName) ? null : fileName;
+    }
+
+    public static bool VerifyProcessHandleIdentity(
+        string? toolhelpExeName,
+        long snapshotCapturedUtcTicks,
+        long handleCreationTimeTicks,
+        string? handleImagePath)
+    {
+        if (handleCreationTimeTicks <= 0 ||
+            snapshotCapturedUtcTicks <= 0 ||
+            handleCreationTimeTicks > snapshotCapturedUtcTicks)
+        {
+            return false;
+        }
+
+        string? expectedBasename = ExtractExecutableBasename(toolhelpExeName);
+        string? actualBasename = ExtractExecutableBasename(handleImagePath);
+        if (string.IsNullOrEmpty(expectedBasename) || string.IsNullOrEmpty(actualBasename))
+        {
+            return false;
+        }
+
+        return string.Equals(expectedBasename, actualBasename, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static long TryConvertFileTimeToUtcTicks(System.Runtime.InteropServices.ComTypes.FILETIME fileTime)
+    {
+        long ft = ((long)fileTime.dwHighDateTime << 32) | (uint)fileTime.dwLowDateTime;
+        if (ft <= 0)
+        {
+            return 0;
+        }
+
+        try
+        {
+            return DateTime.FromFileTimeUtc(ft).Ticks;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static string? QueryProcessImagePath(IntPtr hProcess)
+    {
+        uint capacity = 1024;
+        const uint maxCapacity = 32768;
+
+        while (capacity <= maxCapacity)
+        {
+            var buffer = new char[capacity];
+            uint size = capacity;
+            if (QueryFullProcessImageNameW(hProcess, 0, buffer, ref size))
+            {
+                if (size == 0 || size > buffer.Length)
+                {
+                    return null;
+                }
+                return new string(buffer, 0, (int)size);
+            }
+
+            int err = Marshal.GetLastWin32Error();
+            if (err != ERROR_INSUFFICIENT_BUFFER || capacity >= maxCapacity)
+            {
+                return null;
+            }
+
+            capacity = Math.Min(capacity * 2, maxCapacity);
+        }
+
+        return null;
+    }
+
     public IReadOnlyList<ProcessItem> InspectProcesses()
     {
-        long capturedGen = Interlocked.Read(ref _cacheGeneration);
-        var rawEntries = new List<(int Pid, int ParentPid, string ExeName)>(256);
+        var rawEntries = new List<RawToolhelpEntry>(256);
 
         IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1))
         {
             return Array.Empty<ProcessItem>();
         }
+
+        long snapshotCapturedUtcTicks = DateTime.UtcNow.Ticks;
 
         try
         {
@@ -264,7 +364,7 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
                     int pid = (int)entry.th32ProcessID;
                     if (pid > 0)
                     {
-                        rawEntries.Add((pid, (int)entry.th32ParentProcessID, entry.szExeFile));
+                        rawEntries.Add(new RawToolhelpEntry(pid, (int)entry.th32ParentProcessID, entry.szExeFile));
                     }
                 }
                 while (Process32NextW(snapshot, ref entry));
@@ -279,13 +379,77 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
             CloseHandle(snapshot);
         }
 
+        return InspectFromRawSnapshot(rawEntries, snapshotCapturedUtcTicks, WithWin32ProcessHandle);
+    }
+
+    private static T? WithWin32ProcessHandle<T>(int pid, bool includeCpuTime, Func<OpenedProcessHandleData, T> onHandle)
+    {
+        IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (hProcess == IntPtr.Zero)
+        {
+            return default;
+        }
+
+        try
+        {
+            long startTicks = 0;
+            long totalCpuMs = 0;
+            if (GetProcessTimes(hProcess, out var createTime, out _, out var kernelTime, out var userTime))
+            {
+                startTicks = TryConvertFileTimeToUtcTicks(createTime);
+                if (includeCpuTime)
+                {
+                    long kTicks = ((long)kernelTime.dwHighDateTime << 32) | (uint)kernelTime.dwLowDateTime;
+                    long uTicks = ((long)userTime.dwHighDateTime << 32) | (uint)userTime.dwLowDateTime;
+                    totalCpuMs = (kTicks + uTicks) / 10000; // 100-ns ticks to ms
+                }
+            }
+
+            string? imagePath = QueryProcessImagePath(hProcess);
+
+            var data = new OpenedProcessHandleData(
+                StartTimeTicks: startTicks,
+                TotalCpuTimeMs: totalCpuMs,
+                ImagePath: imagePath,
+                ReadIoCounters: () =>
+                {
+                    if (GetProcessIoCounters(hProcess, out var ioCounters))
+                    {
+                        long readBytes = ioCounters.ReadTransferCount > long.MaxValue ? long.MaxValue : (long)ioCounters.ReadTransferCount;
+                        long otherBytes = ioCounters.OtherTransferCount > long.MaxValue ? long.MaxValue : (long)ioCounters.OtherTransferCount;
+                        return (true, readBytes, otherBytes);
+                    }
+                    return (false, 0L, 0L);
+                },
+                ReadCommandLine: () => ReadProcessCommandLine(hProcess));
+
+            return onHandle(data);
+        }
+        finally
+        {
+            CloseHandle(hProcess);
+        }
+    }
+
+    internal IReadOnlyList<ProcessItem> InspectFromRawSnapshot(
+        IReadOnlyList<RawToolhelpEntry> rawEntries,
+        long snapshotCapturedUtcTicks,
+        Func<int, bool, Func<OpenedProcessHandleData, ProcessItem>, ProcessItem?> withOpenedHandle)
+    {
+        long capturedGen = Interlocked.Read(ref _cacheGeneration);
+
         var rawParentByPid = new Dictionary<int, int>(rawEntries.Count);
         var rawChildrenByPid = new Dictionary<int, List<int>>(rawEntries.Count);
         var relevantOrOrcaPids = new HashSet<int>();
         var orcaSeedPids = new Queue<int>();
 
-        foreach (var (pid, parentPid, exeName) in rawEntries)
+        for (int i = 0; i < rawEntries.Count; i++)
         {
+            var entry = rawEntries[i];
+            int pid = entry.Pid;
+            int parentPid = entry.ParentPid;
+            string exeName = entry.ExeName;
+
             rawParentByPid[pid] = parentPid;
             if (!rawChildrenByPid.TryGetValue(parentPid, out var childList))
             {
@@ -342,108 +506,71 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
         var results = new List<ProcessItem>(rawEntries.Count);
         var activeKeys = new HashSet<(int Pid, long StartTimeTicks)>(rawEntries.Count);
 
-        foreach (var (pid, parentPid, exeName) in rawEntries)
+        for (int i = 0; i < rawEntries.Count; i++)
         {
+            var entry = rawEntries[i];
+            int pid = entry.Pid;
+            int parentPid = entry.ParentPid;
+            string exeName = entry.ExeName;
+
             if (!IsRelevantExecutable(exeName))
             {
-                long ancestryStartTicks = 0;
+                ProcessItem? ancestryItem = null;
                 if (ancestryTimePids.Contains(pid))
                 {
-                    IntPtr hAnc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-                    if (hAnc != IntPtr.Zero)
+                    ancestryItem = withOpenedHandle(pid, false, data =>
                     {
-                        try
-                        {
-                            if (GetProcessTimes(hAnc, out var createTime, out _, out _, out _))
-                            {
-                                long ft = ((long)createTime.dwHighDateTime << 32) | (uint)createTime.dwLowDateTime;
-                                try
-                                {
-                                    ancestryStartTicks = DateTime.FromFileTimeUtc(ft).Ticks;
-                                }
-                                catch
-                                {
-                                    ancestryStartTicks = ft;
-                                }
-                            }
-                        }
-                        finally
-                        {
-                            CloseHandle(hAnc);
-                        }
-                    }
+                        // Verify handle identity on the SAME opened handle (creationTime <= snapshot && basename matches szExeFile)
+                        bool verified = VerifyProcessHandleIdentity(
+                            exeName,
+                            snapshotCapturedUtcTicks,
+                            data.StartTimeTicks,
+                            data.ImagePath);
+
+                        long verifiedStartTicks = verified ? data.StartTimeTicks : 0;
+                        return new ProcessItem(pid, parentPid, exeName, null, verifiedStartTicks, 0, null);
+                    });
                 }
 
-                results.Add(new ProcessItem(pid, parentPid, exeName, null, ancestryStartTicks, 0, null));
+                results.Add(ancestryItem ?? new ProcessItem(pid, parentPid, exeName, null, 0, 0, null));
                 continue;
             }
 
-            IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-            if (hProcess == IntPtr.Zero)
+            ProcessItem? relevantItem = withOpenedHandle(pid, true, data =>
             {
-                results.Add(new ProcessItem(pid, parentPid, exeName, null, 0, 0, null));
-                continue;
-            }
-
-            try
-            {
-                long startTicks = 0;
-                long totalCpuMs = 0;
-                bool hasIoCounters = false;
-                long readTransferBytes = 0;
-                long otherTransferBytes = 0;
-
-                if (GetProcessTimes(hProcess, out var createTime, out _, out var kernelTime, out var userTime))
+                // Verify handle identity on the SAME opened handle BEFORE trusting StartTimeTicks, metrics, or command line
+                if (!VerifyProcessHandleIdentity(exeName, snapshotCapturedUtcTicks, data.StartTimeTicks, data.ImagePath))
                 {
-                    long ft = ((long)createTime.dwHighDateTime << 32) | (uint)createTime.dwLowDateTime;
-                    try
-                    {
-                        startTicks = DateTime.FromFileTimeUtc(ft).Ticks;
-                    }
-                    catch
-                    {
-                        startTicks = ft;
-                    }
-                    long kTicks = ((long)kernelTime.dwHighDateTime << 32) | (uint)kernelTime.dwLowDateTime;
-                    long uTicks = ((long)userTime.dwHighDateTime << 32) | (uint)userTime.dwLowDateTime;
-                    totalCpuMs = (kTicks + uTicks) / 10000; // 100-ns ticks to ms
+                    // PID was reused or handle identity could not be verified: reject handle completely
+                    return new ProcessItem(pid, parentPid, exeName, null, 0, 0, RejectedHandleClassification);
                 }
 
-                if (GetProcessIoCounters(hProcess, out var ioCounters))
-                {
-                    hasIoCounters = true;
-                    readTransferBytes = ioCounters.ReadTransferCount > long.MaxValue ? long.MaxValue : (long)ioCounters.ReadTransferCount;
-                    otherTransferBytes = ioCounters.OtherTransferCount > long.MaxValue ? long.MaxValue : (long)ioCounters.OtherTransferCount;
-                }
+                long startTicks = data.StartTimeTicks;
+                var (hasIoCounters, readTransferBytes, otherTransferBytes) = data.ReadIoCounters();
 
-                if (startTicks > 0)
-                {
-                    activeKeys.Add((pid, startTicks));
-                }
+                activeKeys.Add((pid, startTicks));
 
                 var classification = ResolveClassification(
                     pid,
                     startTicks,
                     exeName,
-                    () => ReadProcessCommandLine(hProcess),
+                    data.ReadCommandLine,
                     capturedGen);
 
-                results.Add(new ProcessItem(
+                return new ProcessItem(
                     pid,
                     parentPid,
                     exeName,
                     null,
                     startTicks,
-                    totalCpuMs,
+                    data.TotalCpuTimeMs,
                     classification,
                     hasIoCounters,
                     readTransferBytes,
-                    otherTransferBytes));
-            }
-            finally
-            {
-                CloseHandle(hProcess);
-            }
+                    otherTransferBytes);
+            });
+
+            results.Add(relevantItem ?? new ProcessItem(pid, parentPid, exeName, null, 0, 0, null));
         }
 
         lock (_lock)
@@ -787,4 +914,3 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
                parent.StartTimeTicks <= child.StartTimeTicks;
     }
 }
-

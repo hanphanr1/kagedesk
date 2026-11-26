@@ -29,8 +29,7 @@ public class PetOverlayForm : Form
 
     private bool _isDragging;
     private int _dragStartX;
-    private string? _dismissedAgentId;
-    private AgentState? _dismissedAgentState;
+    private readonly Dictionary<string, AgentState> _dismissedAlerts = new(StringComparer.OrdinalIgnoreCase);
 
     public int PetScale => _scale;
     public int? PetX => _petX;
@@ -208,22 +207,37 @@ public class PetOverlayForm : Form
 
     private void RecomputeCachedRenderState()
     {
-        // Check if dismissed agent is still in that dismissed state
-        if (_dismissedAgentId != null)
+        // Retain each dismissed (AgentId -> AgentState) entry only while that agent stays in its dismissed state
+        if (_dismissedAlerts.Count > 0)
         {
-            bool stillDismissed = false;
-            foreach (var ag in _currentState.Agents)
+            List<string>? toRemove = null;
+            var agents = _currentState.Agents;
+            foreach (var kv in _dismissedAlerts)
             {
-                if (ag.Id == _dismissedAgentId && ag.State == _dismissedAgentState)
+                bool stillDismissed = false;
+                for (int i = 0; i < agents.Count; i++)
                 {
-                    stillDismissed = true;
-                    break;
+                    if (string.Equals(agents[i].Id, kv.Key, StringComparison.OrdinalIgnoreCase) &&
+                        agents[i].State == kv.Value)
+                    {
+                        stillDismissed = true;
+                        break;
+                    }
+                }
+
+                if (!stillDismissed)
+                {
+                    toRemove ??= new List<string>();
+                    toRemove.Add(kv.Key);
                 }
             }
-            if (!stillDismissed)
+
+            if (toRemove != null)
             {
-                _dismissedAgentId = null;
-                _dismissedAgentState = null;
+                for (int i = 0; i < toRemove.Count; i++)
+                {
+                    _dismissedAlerts.Remove(toRemove[i]);
+                }
             }
         }
 
@@ -334,8 +348,7 @@ public class PetOverlayForm : Form
             showIdle,
             DateTimeOffset.UtcNow,
             _showMixiWhenAllIdle,
-            _dismissedAgentId,
-            _dismissedAgentState);
+            _dismissedAlerts);
 
         if (_scale == 1)
         {
@@ -390,7 +403,14 @@ public class PetOverlayForm : Form
                 }
                 if (hit.ActionId == "dismiss")
                 {
-                    DismissActiveApprovalOrFail();
+                    if (!string.IsNullOrEmpty(hit.TargetAgentId) && hit.TargetAgentState.HasValue)
+                    {
+                        DismissAlert(hit.TargetAgentId, hit.TargetAgentState.Value);
+                    }
+                    else
+                    {
+                        DismissActiveApprovalOrFail();
+                    }
                     return;
                 }
                 if (hit.ActionId.StartsWith("agent:"))
@@ -490,11 +510,29 @@ public class PetOverlayForm : Form
         return _renderer.HitTest(unscaledX, unscaledY);
     }
 
+    internal void DismissAlert(string agentId, AgentState state)
+    {
+        if (string.IsNullOrEmpty(agentId)) return;
+        _dismissedAlerts[agentId] = state;
+        RecomputeCachedRenderState();
+        RenderAndPresent();
+    }
+
     internal void DismissActiveApprovalOrFail()
     {
+        if (!string.IsNullOrEmpty(_renderer.ActiveAlertAgentId) && _renderer.ActiveAlertAgentState.HasValue)
+        {
+            DismissAlert(_renderer.ActiveAlertAgentId, _renderer.ActiveAlertAgentState.Value);
+            return;
+        }
+
         AgentSnapshot? target = null;
         foreach (var ag in _currentState.Agents)
         {
+            bool alreadyDismissed = _dismissedAlerts.TryGetValue(ag.Id, out var dismissedState) &&
+                ag.State == dismissedState;
+            if (alreadyDismissed) continue;
+
             if (ag.State == AgentState.NeedsApproval)
             {
                 target = ag;
@@ -508,10 +546,7 @@ public class PetOverlayForm : Form
 
         if (target != null)
         {
-            _dismissedAgentId = target.Id;
-            _dismissedAgentState = target.State;
-            RecomputeCachedRenderState();
-            RenderAndPresent();
+            DismissAlert(target.Id, target.State);
         }
     }
 
