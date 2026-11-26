@@ -844,4 +844,230 @@ public class V22MultiMonitorWakeUpMediaAndUiTests
             Assert.Equal(0, Volatile.Read(ref rejectClientCount));
         }
     }
+
+    [Fact]
+    public void KageDeskRuntime_TrayExitWhileHookOpInFlight_DefersExitUntilCleanCommitOrLockUnwind()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), $"kagedesk-exit-hooks-{Guid.NewGuid():N}");
+        string fakeHome1 = Path.Combine(tempRoot, "home1");
+        string fakeAppData1 = Path.Combine(tempRoot, "appdata1");
+        string fakeHome2 = Path.Combine(tempRoot, "home2");
+        string fakeAppData2 = Path.Combine(tempRoot, "appdata2");
+        string cfgDir1 = Path.Combine(tempRoot, "cfg1");
+        string cfgDir2 = Path.Combine(tempRoot, "cfg2");
+
+        Directory.CreateDirectory(Path.Combine(fakeHome1, ".claude"));
+        Directory.CreateDirectory(Path.Combine(fakeHome1, ".codex"));
+        Directory.CreateDirectory(Path.Combine(fakeHome2, ".claude"));
+        Directory.CreateDirectory(cfgDir1);
+        Directory.CreateDirectory(cfgDir2);
+
+        static AppConfig MakeMinimalTestConfig() => new()
+        {
+            EnableMediaSync = false,
+            WallpaperEnabled = false,
+            PetOverlayEnabled = false,
+            EnableProcessAgentCollector = false,
+            EnableSessionLogWatcher = false,
+            EnableGitHubCiCollector = false,
+            LocalBridgePort = 0
+        };
+
+        static void PumpUntil(Func<bool> predicate, TimeSpan timeout)
+        {
+            var deadline = DateTime.UtcNow + timeout;
+            while (!predicate() && DateTime.UtcNow < deadline)
+            {
+                Application.DoEvents();
+                Thread.Sleep(15);
+            }
+            Application.DoEvents();
+        }
+
+        var prevSyncContext = SynchronizationContext.Current;
+        try
+        {
+            // 1. Mid-commit case: hold provenance.json lock AFTER ClaudeCode settings.json File.Replace commits.
+            //    Tray Exit MUST defer until provenance write finishes cleanly, cancel before Codex, and THEN exit!
+            var store1 = new KageDesk.Core.Config.ConfigStore(Path.Combine(cfgDir1, "config.json"));
+            store1.Save(MakeMinimalTestConfig());
+
+            var installer1 = new KageDesk.Core.Hooks.HookInstaller(
+                userProfileDir: fakeHome1,
+                appDataDir: fakeAppData1,
+                bridgePort: 4319,
+                codexHomeDir: Path.Combine(fakeHome1, ".codex"),
+                openCodeVersionProbe: () => "opencode 2.1.0");
+
+            string claudeSettings1 = Path.Combine(fakeHome1, ".claude", "settings.json");
+            string codexHooks1 = Path.Combine(fakeHome1, ".codex", "hooks.json");
+            string provenancePath1 = installer1.ProvenanceStorePath;
+            string provenanceMutexName = KageDesk.Core.Hooks.HookInstaller.ComputeTargetLockMutexName(provenancePath1);
+
+            using var provLockAcquiredByHolder = new ManualResetEventSlim(false);
+            using var releaseProvLock = new ManualResetEventSlim(false);
+            using var reachedProvLock = new ManualResetEventSlim(false);
+
+            var provHolderThread = new Thread(() =>
+            {
+                using var m = new Mutex(initiallyOwned: false, name: provenanceMutexName);
+                bool owned = m.WaitOne(TimeSpan.FromSeconds(5));
+                try
+                {
+                    if (owned)
+                    {
+                        provLockAcquiredByHolder.Set();
+                        releaseProvLock.Wait(TimeSpan.FromSeconds(10));
+                    }
+                }
+                finally
+                {
+                    if (owned) m.ReleaseMutex();
+                }
+            })
+            { IsBackground = true };
+            provHolderThread.Start();
+            Assert.True(provLockAcquiredByHolder.Wait(TimeSpan.FromSeconds(3)));
+
+            installer1.BeforeAcquireLockHookForTest = targetPath =>
+            {
+                if (string.Equals(Path.GetFullPath(targetPath), Path.GetFullPath(provenancePath1), StringComparison.OrdinalIgnoreCase))
+                {
+                    reachedProvLock.Set();
+                }
+            };
+
+            int exitCount1 = 0;
+            using var runtime1 = new KageDesk.App.Services.KageDeskRuntime(store1, noWallpaper: true)
+            {
+                HookInstallerFactoryForTest = _ => installer1,
+                ExitActionForTest = () => Interlocked.Increment(ref exitCount1)
+            };
+
+            try
+            {
+                runtime1.TriggerHookOperationForTest(install: true);
+                Assert.True(reachedProvLock.Wait(TimeSpan.FromSeconds(3)), "Expected hook install to reach provenance lock right after config File.Replace.");
+                Assert.True(File.Exists(claudeSettings1), "Claude settings.json should already be committed before provenance write.");
+
+                // Click Tray Exit while provenance write is in-flight!
+                runtime1.TriggerTrayExitForTest();
+                Assert.True(runtime1.IsExitDeferredForTest);
+
+                // Pump UI messages briefly while provenance lock is still held -> exit MUST stay deferred!
+                for (int i = 0; i < 8; i++)
+                {
+                    Application.DoEvents();
+                    Thread.Sleep(20);
+                }
+
+                Assert.Equal(0, Volatile.Read(ref exitCount1));
+                Assert.False(runtime1.IsDisposedForTest);
+                Assert.False(runtime1.ActiveHookOperationTaskForTest!.IsCompleted);
+
+                // Release provenance lock -> in-flight target finishes provenance write, cancels cleanly before Codex, and THEN triggers deferred exit!
+                releaseProvLock.Set();
+                PumpUntil(() => Volatile.Read(ref exitCount1) > 0, TimeSpan.FromSeconds(5));
+
+                Assert.Equal(1, Volatile.Read(ref exitCount1));
+                Assert.True(runtime1.IsDisposedForTest);
+                Assert.True(runtime1.ActiveHookOperationTaskForTest!.IsCompleted);
+
+                // Verify zero abandoned mid-commit state: BOTH settings.json AND matching SHA-256 provenance.json exist!
+                Assert.True(File.Exists(claudeSettings1));
+                Assert.True(File.Exists(provenancePath1), "Provenance write must finish cleanly before deferred exit runs.");
+                string settingsShaHex = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(claudeSettings1)));
+                string provText = File.ReadAllText(provenancePath1, Encoding.UTF8);
+                Assert.Contains(settingsShaHex, provText, StringComparison.OrdinalIgnoreCase);
+
+                // Verify cooperative between-target cancellation prevented Codex target from starting!
+                Assert.False(File.Exists(codexHooks1), "Subsequent Codex target should have been cancelled cleanly between targets.");
+            }
+            finally
+            {
+                releaseProvLock.Set();
+                provHolderThread.Join(TimeSpan.FromSeconds(3));
+            }
+
+            // 2. Lock-wait case: hold ClaudeCode target config lock BEFORE any modification -> Tray Exit cancels lock wait promptly and exits cleanly!
+            var store2 = new KageDesk.Core.Config.ConfigStore(Path.Combine(cfgDir2, "config.json"));
+            store2.Save(MakeMinimalTestConfig());
+
+            var installer2 = new KageDesk.Core.Hooks.HookInstaller(
+                userProfileDir: fakeHome2,
+                appDataDir: fakeAppData2,
+                bridgePort: 4319);
+
+            string claudeSettings2 = Path.Combine(fakeHome2, ".claude", "settings.json");
+            string settingsMutexName = KageDesk.Core.Hooks.HookInstaller.ComputeTargetLockMutexName(claudeSettings2);
+
+            using var targetLockAcquiredByHolder = new ManualResetEventSlim(false);
+            using var releaseTargetLock = new ManualResetEventSlim(false);
+            using var reachedTargetLock = new ManualResetEventSlim(false);
+
+            var targetHolderThread = new Thread(() =>
+            {
+                using var m = new Mutex(initiallyOwned: false, name: settingsMutexName);
+                bool owned = m.WaitOne(TimeSpan.FromSeconds(5));
+                try
+                {
+                    if (owned)
+                    {
+                        targetLockAcquiredByHolder.Set();
+                        releaseTargetLock.Wait(TimeSpan.FromSeconds(10));
+                    }
+                }
+                finally
+                {
+                    if (owned) m.ReleaseMutex();
+                }
+            })
+            { IsBackground = true };
+            targetHolderThread.Start();
+            Assert.True(targetLockAcquiredByHolder.Wait(TimeSpan.FromSeconds(3)));
+
+            installer2.BeforeAcquireLockHookForTest = targetPath =>
+            {
+                if (string.Equals(Path.GetFullPath(targetPath), Path.GetFullPath(claudeSettings2), StringComparison.OrdinalIgnoreCase))
+                {
+                    reachedTargetLock.Set();
+                }
+            };
+
+            int exitCount2 = 0;
+            using var runtime2 = new KageDesk.App.Services.KageDeskRuntime(store2, noWallpaper: true)
+            {
+                HookInstallerFactoryForTest = _ => installer2,
+                ExitActionForTest = () => Interlocked.Increment(ref exitCount2)
+            };
+
+            try
+            {
+                runtime2.TriggerHookOperationForTest(install: true);
+                Assert.True(reachedTargetLock.Wait(TimeSpan.FromSeconds(3)), "Expected hook install to wait on Claude settings.json target lock.");
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                runtime2.TriggerTrayExitForTest();
+                PumpUntil(() => Volatile.Read(ref exitCount2) > 0, TimeSpan.FromSeconds(3));
+                sw.Stop();
+
+                Assert.Equal(1, Volatile.Read(ref exitCount2));
+                Assert.True(runtime2.IsDisposedForTest);
+                Assert.True(sw.ElapsedMilliseconds < 2500,
+                    $"Expected Tray Exit while waiting on target lock to cancel cooperatively well before 5s LockTimeout, took {sw.ElapsedMilliseconds}ms.");
+                Assert.False(File.Exists(claudeSettings2), "Canceled lock wait must NOT modify settings.json.");
+                Assert.False(File.Exists(installer2.ProvenanceStorePath), "Canceled lock wait must NOT create provenance.json.");
+            }
+            finally
+            {
+                releaseTargetLock.Set();
+                targetHolderThread.Join(TimeSpan.FromSeconds(3));
+            }
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(prevSyncContext);
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
+        }
+    }
 }

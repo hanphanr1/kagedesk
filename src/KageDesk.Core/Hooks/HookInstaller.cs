@@ -85,8 +85,8 @@ public sealed class HookInstaller
     private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan VersionProbeTimeout = TimeSpan.FromSeconds(2);
     private static readonly Regex OpenCodeSemVerRegex = new(
-        @"(?:^|[^0-9.])v?(?<major>[0-9]+)\.(?<minor>[0-9]+)(?:\.(?<patch>[0-9]+))?",
-        RegexOptions.CultureInvariant | RegexOptions.Compiled);
+        @"^(?:opencode[ \t]+)?v?(?<major>[0-9]+)\.(?<minor>[0-9]+)\.(?<patch>[0-9]+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private static readonly char[] ForbiddenShellChars =
     {
@@ -101,13 +101,23 @@ public sealed class HookInstaller
     private readonly string? _codexHomeDir;
     private readonly int _bridgePort;
     private readonly Func<DateTimeOffset> _clock;
-    private readonly Func<OpenCodeVersionProbeResult> _openCodeVersionProbe;
+    private readonly Func<CancellationToken, OpenCodeVersionProbeResult> _openCodeVersionProbe;
 
     /// <summary>
     /// Internal test seam invoked after staging/flushing the temp file and immediately before
     /// final identity/content revalidation and commit under the per-target lock.
     /// </summary>
     internal Action<string>? BeforeCommitHookForTest { get; set; }
+
+    /// <summary>
+    /// Internal test seam invoked immediately before waiting on a per-target lock mutex.
+    /// </summary>
+    internal Action<string>? BeforeAcquireLockHookForTest { get; set; }
+
+    /// <summary>
+    /// Internal test seam overriding the structured OpenCode version probe.
+    /// </summary>
+    internal Func<CancellationToken, OpenCodeVersionProbeResult>? OpenCodeProbeOverrideForTest { get; set; }
 
     public HookInstaller(
         string? userProfileDir = null,
@@ -127,13 +137,13 @@ public sealed class HookInstaller
         _bridgePort = bridgePort is >= 1 and <= 65535 ? bridgePort : 4319;
         _clock = clock ?? (() => DateTimeOffset.Now);
         _openCodeVersionProbe = openCodeVersionProbe != null
-            ? () => InvokeCustomOpenCodeVersionProbe(openCodeVersionProbe)
+            ? _ => InvokeCustomOpenCodeVersionProbe(openCodeVersionProbe)
             : ProbeInstalledOpenCodeVersion;
     }
 
     public string DefaultEmitterScriptPath => Path.Combine(_appDataDir, "hooks", EmitterMarkerPs1);
 
-    private string ProvenanceStorePath => Path.Combine(_appDataDir, "hooks", ProvenanceFileName);
+    internal string ProvenanceStorePath => Path.Combine(_appDataDir, "hooks", ProvenanceFileName);
 
     public string ResolveCodexHomeDirectory()
     {
@@ -151,40 +161,54 @@ public sealed class HookInstaller
         return Path.Combine(_userProfileDir, ".codex");
     }
 
-    public HookOperationSummary InstallAll(string? explicitEmitterScriptPath = null)
+    public HookOperationSummary InstallAll(string? explicitEmitterScriptPath = null, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         string reportedEmitterPath = string.IsNullOrWhiteSpace(explicitEmitterScriptPath)
             ? DefaultEmitterScriptPath
             : explicitEmitterScriptPath;
 
-        var results = new List<HookTargetResult>(3)
-        {
-            InstallClaudeCodeWithEmitterEnsure(explicitEmitterScriptPath),
-            InstallCodexWithEmitterEnsure(explicitEmitterScriptPath),
-            InstallOpenCode()
-        };
+        var results = new List<HookTargetResult>(3);
+
+        cancellationToken.ThrowIfCancellationRequested();
+        results.Add(InstallClaudeCodeWithEmitterEnsure(explicitEmitterScriptPath, cancellationToken));
+
+        cancellationToken.ThrowIfCancellationRequested();
+        results.Add(InstallCodexWithEmitterEnsure(explicitEmitterScriptPath, cancellationToken));
+
+        cancellationToken.ThrowIfCancellationRequested();
+        results.Add(InstallOpenCode(cancellationToken: cancellationToken));
 
         return new HookOperationSummary(true, reportedEmitterPath, results);
     }
 
-    public HookOperationSummary UninstallAll(string? explicitEmitterScriptPath = null)
+    public HookOperationSummary UninstallAll(string? explicitEmitterScriptPath = null, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         string emitterPath = string.IsNullOrWhiteSpace(explicitEmitterScriptPath)
             ? DefaultEmitterScriptPath
             : explicitEmitterScriptPath;
 
-        var results = new List<HookTargetResult>(3)
-        {
-            UninstallClaudeCode(emitterPath),
-            UninstallCodex(emitterPath),
-            UninstallOpenCode()
-        };
+        var results = new List<HookTargetResult>(3);
+
+        cancellationToken.ThrowIfCancellationRequested();
+        results.Add(UninstallClaudeCode(emitterPath, cancellationToken));
+
+        cancellationToken.ThrowIfCancellationRequested();
+        results.Add(UninstallCodex(emitterPath, cancellationToken));
+
+        cancellationToken.ThrowIfCancellationRequested();
+        results.Add(UninstallOpenCode(cancellationToken));
 
         return new HookOperationSummary(false, emitterPath, results);
     }
 
-    public string EnsureEmitterScript(string? explicitEmitterScriptPath = null)
+    public string EnsureEmitterScript(string? explicitEmitterScriptPath = null, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (!string.IsNullOrWhiteSpace(explicitEmitterScriptPath))
         {
             return ValidateEmitterScriptPath(explicitEmitterScriptPath);
@@ -215,18 +239,24 @@ public sealed class HookInstaller
             {
                 WriteInternalBytesAtomic(targetPath, desiredBytes, fileExisted: false);
             }
-        });
+        }, cancellationToken);
 
         return targetPath;
     }
 
-    private HookTargetResult InstallClaudeCodeWithEmitterEnsure(string? explicitEmitterScriptPath)
+    private HookTargetResult InstallClaudeCodeWithEmitterEnsure(string? explicitEmitterScriptPath, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         string settingsPath = Path.Combine(_userProfileDir, ".claude", "settings.json");
         try
         {
-            string emitterPath = EnsureEmitterScript(explicitEmitterScriptPath);
-            return InstallClaudeCode(emitterPath);
+            string emitterPath = EnsureEmitterScript(explicitEmitterScriptPath, cancellationToken);
+            return InstallClaudeCode(emitterPath, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -234,8 +264,10 @@ public sealed class HookInstaller
         }
     }
 
-    private HookTargetResult InstallCodexWithEmitterEnsure(string? explicitEmitterScriptPath)
+    private HookTargetResult InstallCodexWithEmitterEnsure(string? explicitEmitterScriptPath, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         string codexDir;
         try
         {
@@ -259,8 +291,12 @@ public sealed class HookInstaller
                     $"Codex config directory not detected ({codexDir}).");
             }
 
-            string emitterPath = EnsureEmitterScript(explicitEmitterScriptPath);
-            return InstallCodex(emitterPath);
+            string emitterPath = EnsureEmitterScript(explicitEmitterScriptPath, cancellationToken);
+            return InstallCodex(emitterPath, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -268,8 +304,10 @@ public sealed class HookInstaller
         }
     }
 
-    public HookTargetResult InstallClaudeCode(string emitterScriptPath)
+    public HookTargetResult InstallClaudeCode(string emitterScriptPath, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         string claudeDir = Path.Combine(_userProfileDir, ".claude");
         string settingsPath = Path.Combine(claudeDir, "settings.json");
 
@@ -283,7 +321,12 @@ public sealed class HookInstaller
                 agentId: "claude",
                 emitterScriptPath: validatedEmitter,
                 specs: GetClaudeHookSpecs(),
-                extraNote: null);
+                extraNote: null,
+                cancellationToken: cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -291,8 +334,10 @@ public sealed class HookInstaller
         }
     }
 
-    public HookTargetResult UninstallClaudeCode(string? emitterScriptPath = null)
+    public HookTargetResult UninstallClaudeCode(string? emitterScriptPath = null, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         string settingsPath = Path.Combine(_userProfileDir, ".claude", "settings.json");
         try
         {
@@ -302,7 +347,12 @@ public sealed class HookInstaller
                 settingsPath,
                 agentId: "claude",
                 emitterScriptPath: validatedEmitter,
-                specs: GetClaudeHookSpecs());
+                specs: GetClaudeHookSpecs(),
+                cancellationToken: cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -310,8 +360,10 @@ public sealed class HookInstaller
         }
     }
 
-    public HookTargetResult InstallCodex(string emitterScriptPath)
+    public HookTargetResult InstallCodex(string emitterScriptPath, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         string codexDir = ResolveCodexHomeDirectory();
         string hooksPath = Path.Combine(codexDir, "hooks.json");
 
@@ -336,7 +388,12 @@ public sealed class HookInstaller
                 agentId: "codex",
                 emitterScriptPath: validatedEmitter,
                 specs: GetCodexHookSpecs(),
-                extraNote: CodexTrustNote);
+                extraNote: CodexTrustNote,
+                cancellationToken: cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -344,8 +401,10 @@ public sealed class HookInstaller
         }
     }
 
-    public HookTargetResult UninstallCodex(string? emitterScriptPath = null)
+    public HookTargetResult UninstallCodex(string? emitterScriptPath = null, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         string codexDir = ResolveCodexHomeDirectory();
         string hooksPath = Path.Combine(codexDir, "hooks.json");
 
@@ -358,7 +417,12 @@ public sealed class HookInstaller
                 hooksPath,
                 agentId: "codex",
                 emitterScriptPath: validatedEmitter,
-                specs: GetCodexHookSpecs());
+                specs: GetCodexHookSpecs(),
+                cancellationToken: cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -366,8 +430,10 @@ public sealed class HookInstaller
         }
     }
 
-    public HookTargetResult InstallOpenCode(string? unusedEmitterScriptPath = null)
+    public HookTargetResult InstallOpenCode(string? unusedEmitterScriptPath = null, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         string configDir = Path.Combine(_userProfileDir, ".config", "opencode");
         string legacyDir = Path.Combine(_userProfileDir, ".opencode");
         string pluginDir;
@@ -395,7 +461,7 @@ public sealed class HookInstaller
         {
             ValidateSafePathSyntax(pluginPath, "OpenCode plugin path");
 
-            if (!TryResolveOpenCodePluginApiVersion(out OpenCodePluginApiVersion apiVersion, out string? unsupportedReason))
+            if (!TryResolveOpenCodePluginApiVersion(out OpenCodePluginApiVersion apiVersion, out string? unsupportedReason, cancellationToken))
             {
                 return new HookTargetResult(
                     HookTargetKind.OpenCode,
@@ -404,6 +470,7 @@ public sealed class HookInstaller
                     unsupportedReason!);
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             EnsureDirectorySafe(pluginDir);
 
             return WithTargetLock(pluginPath, () =>
@@ -456,7 +523,11 @@ public sealed class HookInstaller
                         ? $"Installed standalone KageDesk OpenCode {apiVersion} plugin (backup saved to {Path.GetFileName(backupPath)}; opencode.json untouched)."
                         : $"Installed standalone KageDesk OpenCode {apiVersion} plugin (opencode.json untouched).",
                     backupPath);
-            });
+            }, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -470,7 +541,12 @@ public sealed class HookInstaller
         if (string.IsNullOrWhiteSpace(rawVersionOutput))
             return false;
 
-        Match m = OpenCodeSemVerRegex.Match(rawVersionOutput);
+        string trimmed = rawVersionOutput.Trim();
+        // Reject multi-line / ambiguous multi-version output strictly.
+        if (trimmed.IndexOfAny(new[] { '\r', '\n' }) >= 0)
+            return false;
+
+        Match m = OpenCodeSemVerRegex.Match(trimmed);
         if (!m.Success)
             return false;
 
@@ -535,15 +611,25 @@ public sealed class HookInstaller
         return ClassifyOpenCodeVersionOutput(rawVersion);
     }
 
-    private bool TryResolveOpenCodePluginApiVersion(out OpenCodePluginApiVersion apiVersion, out string? unsupportedReason)
+    private bool TryResolveOpenCodePluginApiVersion(
+        out OpenCodePluginApiVersion apiVersion,
+        out string? unsupportedReason,
+        CancellationToken cancellationToken)
     {
         apiVersion = default;
         unsupportedReason = null;
 
+        cancellationToken.ThrowIfCancellationRequested();
+
         OpenCodeVersionProbeResult probeResult;
         try
         {
-            probeResult = _openCodeVersionProbe();
+            var probe = OpenCodeProbeOverrideForTest ?? _openCodeVersionProbe;
+            probeResult = probe(cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -575,15 +661,16 @@ public sealed class HookInstaller
         }
     }
 
-    private static OpenCodeVersionProbeResult ProbeInstalledOpenCodeVersion()
-        => ProbeOpenCodeExecutableVersion("opencode", new[] { "--version" }, VersionProbeTimeout);
+    private static OpenCodeVersionProbeResult ProbeInstalledOpenCodeVersion(CancellationToken cancellationToken)
+        => ProbeOpenCodeExecutableVersion("opencode", new[] { "--version" }, VersionProbeTimeout, cancellationToken);
 
     internal static OpenCodeVersionProbeResult ProbeOpenCodeExecutableVersion(
         string executable,
         IReadOnlyList<string> arguments,
-        TimeSpan timeout)
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
     {
-        return ProbeOpenCodeExecutableVersionAsync(executable, arguments, timeout)
+        return ProbeOpenCodeExecutableVersionAsync(executable, arguments, timeout, cancellationToken)
             .GetAwaiter()
             .GetResult();
     }
@@ -591,8 +678,11 @@ public sealed class HookInstaller
     internal static async Task<OpenCodeVersionProbeResult> ProbeOpenCodeExecutableVersionAsync(
         string executable,
         IReadOnlyList<string> arguments,
-        TimeSpan timeout)
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (string.IsNullOrWhiteSpace(executable))
         {
             return new OpenCodeVersionProbeResult(
@@ -646,7 +736,8 @@ public sealed class HookInstaller
         }
 
         TimeSpan effectiveTimeout = timeout > TimeSpan.Zero ? timeout : TimeSpan.FromMilliseconds(1);
-        using var deadlineCts = new CancellationTokenSource(effectiveTimeout);
+        using var deadlineCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadlineCts.CancelAfter(effectiveTimeout);
         CancellationToken ct = deadlineCts.Token;
 
         Process? proc = null;
@@ -680,18 +771,19 @@ public sealed class HookInstaller
                     $"OpenCode CLI version probe exited with code {proc.ExitCode}; cannot verify v1/v2 plugin API version.");
             }
 
+            // Authoritative version MUST come strictly from stdout (stderr is drained only to prevent pipe deadlock).
             string stdout = await stdoutTask.ConfigureAwait(false);
-            string stderr = await stderrTask.ConfigureAwait(false);
-            string combined = !string.IsNullOrWhiteSpace(stdout) ? stdout.Trim() : stderr.Trim();
-            if (string.IsNullOrWhiteSpace(combined))
+            _ = await stderrTask.ConfigureAwait(false);
+            string trimmedStdout = stdout.Trim();
+            if (string.IsNullOrWhiteSpace(trimmedStdout))
             {
                 return new OpenCodeVersionProbeResult(
                     OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable,
                     null,
-                    "OpenCode CLI returned empty version output; cannot verify v1/v2 plugin API version.");
+                    "OpenCode CLI returned empty stdout version output; cannot verify v1/v2 plugin API version.");
             }
 
-            return ClassifyOpenCodeVersionOutput(combined);
+            return ClassifyOpenCodeVersionOutput(trimmedStdout);
         }
         catch (OperationCanceledException)
         {
@@ -702,6 +794,11 @@ public sealed class HookInstaller
             ObserveBackgroundProbeTask(stdoutTask);
             ObserveBackgroundProbeTask(stderrTask);
             ObserveBackgroundProbeTask(exitTask);
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
 
             return new OpenCodeVersionProbeResult(
                 OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable,
@@ -763,8 +860,10 @@ public sealed class HookInstaller
             TaskScheduler.Default);
     }
 
-    public HookTargetResult UninstallOpenCode()
+    public HookTargetResult UninstallOpenCode(CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         string primaryDir = Path.Combine(_userProfileDir, ".config", "opencode");
         string primaryPlugin = Path.Combine(primaryDir, "plugins", OpenCodePluginFileName);
         string legacyDir = Path.Combine(_userProfileDir, ".opencode");
@@ -843,7 +942,11 @@ public sealed class HookInstaller
                     targetPlugin,
                     HookActionStatus.Uninstalled,
                     "Removed standalone KageDesk OpenCode plugin (opencode.json untouched).");
-            });
+            }, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -894,7 +997,8 @@ public sealed class HookInstaller
         string agentId,
         string emitterScriptPath,
         HookEventSpec[] specs,
-        string? extraNote)
+        string? extraNote,
+        CancellationToken cancellationToken)
     {
         ValidateSafePathSyntax(configPath, "Target config path");
 
@@ -1183,7 +1287,7 @@ public sealed class HookInstaller
                 HookActionStatus.Installed,
                 installedMsg,
                 backupPath);
-        });
+        }, cancellationToken);
     }
 
     private HookTargetResult UninstallHookJsonFile(
@@ -1191,7 +1295,8 @@ public sealed class HookInstaller
         string configPath,
         string agentId,
         string emitterScriptPath,
-        HookEventSpec[] specs)
+        HookEventSpec[] specs,
+        CancellationToken cancellationToken)
     {
         ValidateSafePathSyntax(configPath, "Target config path");
 
@@ -1420,7 +1525,7 @@ public sealed class HookInstaller
                 HookActionStatus.Uninstalled,
                 $"Removed KageDesk hooks (backup saved to {Path.GetFileName(backupPath)}).",
                 backupPath);
-        });
+        }, cancellationToken);
     }
 
     internal string BuildHookCommand(string emitterScriptPath, string eventType, string agentId, string message)
@@ -3220,23 +3325,68 @@ export const KageDeskPlugin = async () => ({
         return expected.Sha256 != null && hash.AsSpan().SequenceEqual(expected.Sha256);
     }
 
-    private static T WithTargetLock<T>(string targetPath, Func<T> action)
+    internal static string ComputeTargetLockMutexName(string targetPath)
     {
         string canonical = Path.GetFullPath(targetPath).ToUpperInvariant();
         byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
-        string mutexName = $"Local\\KageDesk_HookLock_{Convert.ToHexString(hash)[..32]}";
+        return $"Local\\KageDesk_HookLock_{Convert.ToHexString(hash)[..32]}";
+    }
+
+    private T WithTargetLock<T>(string targetPath, Func<T> action, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        string mutexName = ComputeTargetLockMutexName(targetPath);
 
         using var mutex = new Mutex(initiallyOwned: false, name: mutexName);
         bool acquired = false;
         try
         {
-            try
+            BeforeAcquireLockHookForTest?.Invoke(targetPath);
+
+            if (!cancellationToken.CanBeCanceled)
             {
-                acquired = mutex.WaitOne(LockTimeout);
+                try
+                {
+                    acquired = mutex.WaitOne(LockTimeout);
+                }
+                catch (AbandonedMutexException)
+                {
+                    acquired = true;
+                }
             }
-            catch (AbandonedMutexException)
+            else
             {
-                acquired = true;
+                cancellationToken.ThrowIfCancellationRequested();
+                WaitHandle[] waitHandles = { mutex, cancellationToken.WaitHandle };
+                int signaledIndex;
+                try
+                {
+                    signaledIndex = WaitHandle.WaitAny(waitHandles, LockTimeout);
+                }
+                catch (AbandonedMutexException ex)
+                {
+                    if (ex.MutexIndex == 0)
+                    {
+                        acquired = true;
+                        signaledIndex = 0;
+                    }
+                    else
+                    {
+                        throw;
+                    }
+                }
+
+                if (signaledIndex == 0)
+                {
+                    acquired = true;
+                    // If canceled concurrently with acquisition, release mutex in finally before modifying anything.
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+                else if (signaledIndex == 1)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
             }
 
             if (!acquired)
@@ -3255,13 +3405,13 @@ export const KageDeskPlugin = async () => ({
         }
     }
 
-    private static void WithTargetLock(string targetPath, Action action)
+    private void WithTargetLock(string targetPath, Action action, CancellationToken cancellationToken = default)
     {
         WithTargetLock(targetPath, () =>
         {
             action();
             return 0;
-        });
+        }, cancellationToken);
     }
 
     private string BuildUniqueBackupPath(string targetPath)

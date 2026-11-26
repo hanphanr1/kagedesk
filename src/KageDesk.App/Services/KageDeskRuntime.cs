@@ -44,8 +44,12 @@ public class KageDeskRuntime : IDisposable
     private long _lastProcessedAudioRevision;
     private int _gifExportInProgress;
     private Task? _gifExportTask;
+    private readonly object _hookOpLock = new();
     private int _hookOpInProgress;
     private Task? _hookOpTask;
+    private CancellationTokenSource? _hookOpCts;
+    private bool _exitRequested;
+    private bool _exitDeferred;
 
     private readonly object _effectsLock = new();
     private readonly object _mediaSyncLock = new();
@@ -100,6 +104,14 @@ public class KageDeskRuntime : IDisposable
     public string WallpaperStatusReason => _wallpaperBridge.StatusReason;
     public string BridgeToken => _bridgeToken;
     public UiSnapshot? LatestSnapshot => _latestSnapshot;
+
+    internal Func<int, HookInstaller>? HookInstallerFactoryForTest { get; set; }
+    internal Action? ExitActionForTest { get; set; }
+    internal bool IsDisposedForTest => _disposed;
+    internal bool IsExitDeferredForTest { get { lock (_hookOpLock) return _exitDeferred; } }
+    internal Task? ActiveHookOperationTaskForTest { get { lock (_hookOpLock) return _hookOpTask; } }
+    internal void TriggerHookOperationForTest(bool install) => RunHookOperationAsync(install);
+    internal void TriggerTrayExitForTest() => ExitApplication();
 
     public KageDeskRuntime(ConfigStore? configStore = null, bool noWallpaper = false, IMediaPlaybackProbe? mediaProbe = null)
     {
@@ -1198,73 +1210,163 @@ public class KageDeskRuntime : IDisposable
 
     private void RunHookOperationAsync(bool install)
     {
-        if (_stopping || _disposed) return;
-        if (Interlocked.CompareExchange(ref _hookOpInProgress, 1, 0) != 0)
-        {
-            return;
-        }
-
         int bridgePort;
         lock (_configLock)
         {
             bridgePort = _config.LocalBridgePort;
         }
 
-        _hookOpTask = Task.Run(() =>
+        CancellationToken opToken;
+        lock (_hookOpLock)
         {
-            string title = "KageDesk CLI Hooks";
-            string message;
-            ToolTipIcon icon;
-
-            try
+            if (_stopping || _disposed || _exitRequested) return;
+            if (Interlocked.CompareExchange(ref _hookOpInProgress, 1, 0) != 0)
             {
-                var installer = new HookInstaller(bridgePort: bridgePort);
-                HookOperationSummary summary = install ? installer.InstallAll() : installer.UninstallAll();
-                string details = string.Join(", ", summary.Results.Select(r => $"{r.Target}: {r.Status}"));
-                message = summary.AllSucceeded
-                    ? (install ? $"Hooks configured ({details})." : $"Hooks removed ({details}).")
-                    : $"Hooks need attention ({details}).";
-                icon = summary.AllSucceeded ? ToolTipIcon.Info : ToolTipIcon.Warning;
-            }
-            catch (Exception ex)
-            {
-                title = "KageDesk CLI Hooks Error";
-                message = install ? $"Hook install failed: {ex.Message}" : $"Hook uninstall failed: {ex.Message}";
-                icon = ToolTipIcon.Error;
-            }
-            finally
-            {
-                Interlocked.Exchange(ref _hookOpInProgress, 0);
+                return;
             }
 
-            if (!_stopping && !_disposed && _dispatcherForm.IsHandleCreated)
+            _hookOpCts?.Dispose();
+            _hookOpCts = new CancellationTokenSource();
+            opToken = _hookOpCts.Token;
+
+            _hookOpTask = Task.Run(() =>
             {
+                string title = "KageDesk CLI Hooks";
+                string? message = null;
+                ToolTipIcon icon = ToolTipIcon.Info;
+
                 try
                 {
-                    _dispatcherForm.BeginInvoke(new Action(() =>
-                    {
-                        if (!_stopping && !_disposed)
-                        {
-                            _trayController?.ShowBalloon(title, message, icon, 4500);
-                        }
-                    }));
+                    var installer = HookInstallerFactoryForTest != null
+                        ? HookInstallerFactoryForTest(bridgePort)
+                        : new HookInstaller(bridgePort: bridgePort);
+                    HookOperationSummary summary = install
+                        ? installer.InstallAll(cancellationToken: opToken)
+                        : installer.UninstallAll(cancellationToken: opToken);
+                    string details = string.Join(", ", summary.Results.Select(r => $"{r.Target}: {r.Status}"));
+                    message = summary.AllSucceeded
+                        ? (install ? $"Hooks configured ({details})." : $"Hooks removed ({details}).")
+                        : $"Hooks need attention ({details}).";
+                    icon = summary.AllSucceeded ? ToolTipIcon.Info : ToolTipIcon.Warning;
                 }
-                catch { }
-            }
-        });
+                catch (OperationCanceledException)
+                {
+                    // Clean cooperative shutdown cancellation between targets or before acquiring target lock.
+                }
+                catch (Exception ex)
+                {
+                    title = "KageDesk CLI Hooks Error";
+                    message = install ? $"Hook install failed: {ex.Message}" : $"Hook uninstall failed: {ex.Message}";
+                    icon = ToolTipIcon.Error;
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _hookOpInProgress, 0);
+                }
+
+                if (message != null && !_stopping && !_disposed && _dispatcherForm.IsHandleCreated)
+                {
+                    try
+                    {
+                        _dispatcherForm.BeginInvoke(new Action(() =>
+                        {
+                            if (!_stopping && !_disposed)
+                            {
+                                _trayController?.ShowBalloon(title, message, icon, 4500);
+                            }
+                        }));
+                    }
+                    catch { }
+                }
+            });
+        }
     }
 
     private void ExitApplication()
     {
+        Task? activeHookTask = null;
+        lock (_hookOpLock)
+        {
+            if (_disposed) return;
+
+            _exitRequested = true;
+            _stopping = true;
+
+            if (_exitDeferred)
+            {
+                return;
+            }
+
+            // Signal cooperative between-target / lock-wait cancellation (NEVER aborts mid-commit!).
+            try { _hookOpCts?.Cancel(); } catch { }
+
+            if (_hookOpTask != null && !_hookOpTask.IsCompleted)
+            {
+                _exitDeferred = true;
+                activeHookTask = _hookOpTask;
+            }
+        }
+
+        if (activeHookTask != null)
+        {
+            // Defer explicit exit asynchronously until the active target finishes both config commit + provenance write cleanly.
+            _ = activeHookTask.ContinueWith(
+                _ => CompleteDeferredExit(),
+                CancellationToken.None,
+                TaskContinuationOptions.None,
+                TaskScheduler.Default);
+            return;
+        }
+
+        ExecuteExitNow();
+    }
+
+    private void CompleteDeferredExit()
+    {
+        if (_disposed) return;
+
+        if (_dispatcherForm.IsHandleCreated && !_dispatcherForm.IsDisposed)
+        {
+            try
+            {
+                _dispatcherForm.BeginInvoke(new Action(ExecuteExitNow));
+                return;
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        }
+
+        ExecuteExitNow();
+    }
+
+    private void ExecuteExitNow()
+    {
+        if (_disposed) return;
         Dispose();
-        Application.Exit();
+        (ExitActionForTest ?? Application.Exit)();
     }
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        _stopping = true;
+        Task? hookTaskToDrain;
+        CancellationTokenSource? hookCtsToDispose;
+        lock (_hookOpLock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _stopping = true;
+            _exitRequested = true;
+
+            try { _hookOpCts?.Cancel(); } catch { }
+            hookTaskToDrain = _hookOpTask;
+            hookCtsToDispose = _hookOpCts;
+            _hookOpCts = null;
+        }
 
         _cts.Cancel();
 
@@ -1314,16 +1416,20 @@ public class KageDeskRuntime : IDisposable
             }
         }
 
-        if (_hookOpTask != null)
+        if (hookTaskToDrain != null && !hookTaskToDrain.IsCompleted)
         {
             try
             {
-                _hookOpTask.Wait(TimeSpan.FromSeconds(3));
+                // Generously exceeds HookInstaller's 5s per-target mutex timeout so an in-flight
+                // config commit + provenance write finishes cleanly rather than being abandoned.
+                hookTaskToDrain.Wait(TimeSpan.FromSeconds(15));
             }
             catch (Exception)
             {
             }
         }
+
+        try { hookCtsToDispose?.Dispose(); } catch { }
 
         if (_localBridge != null)
         {

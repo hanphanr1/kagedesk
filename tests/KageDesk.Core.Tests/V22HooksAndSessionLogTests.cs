@@ -2099,4 +2099,222 @@ public class V22HooksAndSessionLogTests
             try { Directory.Delete(tempDir, recursive: true); } catch { }
         }
     }
+
+    [Fact]
+    public async Task HookInstaller_OpenCodeProbe_StrictAuthoritativeStdoutRejectsDiagnosticsMultiVersionAndStderrOnly()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), $"kagedesk-oc-strict-{Guid.NewGuid():N}");
+        string fakeHome = Path.Combine(tempRoot, "home");
+        string fakeAppData = Path.Combine(tempRoot, "appdata");
+        string openCodeDir = Path.Combine(fakeHome, ".config", "opencode");
+        string pluginDir = Path.Combine(openCodeDir, "plugins");
+        string pluginPath = Path.Combine(pluginDir, "kagedesk-plugin.js");
+        Directory.CreateDirectory(openCodeDir);
+
+        try
+        {
+            // 1. Diagnostic prose, ambiguous multi-line/multi-version stdout, and trailing commentary MUST all classify as ProbeFailedOrUnavailable
+            //    and return non-Installed with ZERO plugins/ directory or plugin file created!
+            string[] invalidOutputs =
+            {
+                "OpenCode version unavailable; plugin API 2.1.0 required",
+                "opencode 1.18.29\nopencode 2.1.0",
+                "1.18.29\r\n2.1.0",
+                "warning: plugin api deprecated\n2.1.0",
+                "opencode 2.1.0 (plugin API 1.0.0)",
+                "opencode\n2.1.0",
+                "v2.1"
+            };
+
+            foreach (string raw in invalidOutputs)
+            {
+                var classified = HookInstaller.ClassifyOpenCodeVersionOutput(raw);
+                Assert.Equal(OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable, classified.Outcome);
+                Assert.Null(classified.ApiVersion);
+
+                var installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319, openCodeVersionProbe: () => raw);
+                var res = installer.InstallOpenCode();
+                Assert.Equal(HookActionStatus.Unsupported, res.Status);
+                Assert.NotEqual(HookActionStatus.Installed, res.Status);
+                Assert.False(Directory.Exists(pluginDir), $"Invalid output '{raw}' must NOT create plugins/ directory.");
+                Assert.False(File.Exists(pluginPath), $"Invalid output '{raw}' must NOT write kagedesk-plugin.js.");
+            }
+
+            // 2. Real child process emitting diagnostic prose on stdout -> ProbeFailedOrUnavailable
+            var diagProcRes = await HookInstaller.ProbeOpenCodeExecutableVersionAsync(
+                "node",
+                new[] { "-e", "process.stdout.write('OpenCode version unavailable; plugin API 2.1.0 required\\n');" },
+                TimeSpan.FromSeconds(5));
+            Assert.Equal(OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable, diagProcRes.Outcome);
+
+            // 3. Real child process emitting ambiguous multi-version stdout -> ProbeFailedOrUnavailable
+            var multiProcRes = await HookInstaller.ProbeOpenCodeExecutableVersionAsync(
+                "node",
+                new[] { "-e", "process.stdout.write('opencode 1.18.29\\nopencode 2.1.0\\n');" },
+                TimeSpan.FromSeconds(5));
+            Assert.Equal(OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable, multiProcRes.Outcome);
+
+            // 4. Real child process emitting stderr-only "2.1.0" (empty stdout, exit 0) -> MUST classify as ProbeFailedOrUnavailable,
+            //    return non-Installed, and create ZERO plugins/ directory or plugin file!
+            var stderrOnlyRes = await HookInstaller.ProbeOpenCodeExecutableVersionAsync(
+                "node",
+                new[] { "-e", "process.stderr.write('2.1.0\\n');" },
+                TimeSpan.FromSeconds(5));
+            Assert.Equal(OpenCodeVersionProbeOutcome.ProbeFailedOrUnavailable, stderrOnlyRes.Outcome);
+            Assert.Null(stderrOnlyRes.ApiVersion);
+
+            var stderrInstaller = new HookInstaller(fakeHome, fakeAppData, bridgePort: 4319)
+            {
+                OpenCodeProbeOverrideForTest = ct => HookInstaller.ProbeOpenCodeExecutableVersion(
+                    "node",
+                    new[] { "-e", "process.stderr.write('2.1.0\\n');" },
+                    TimeSpan.FromSeconds(5),
+                    ct)
+            };
+            var stderrInstallResult = stderrInstaller.InstallOpenCode();
+            Assert.Equal(HookActionStatus.Unsupported, stderrInstallResult.Status);
+            Assert.NotEqual(HookActionStatus.Installed, stderrInstallResult.Status);
+            Assert.False(Directory.Exists(pluginDir), "Stderr-only OpenCode output must NOT create plugins/ directory.");
+            Assert.False(File.Exists(pluginPath), "Stderr-only OpenCode output must NOT write kagedesk-plugin.js.");
+
+            // 5. Positive sanity checks: strict anchored single-line CLI formats still parse cleanly
+            Assert.Equal(OpenCodeVersionProbeOutcome.DetectedV1, HookInstaller.ClassifyOpenCodeVersionOutput("opencode 1.18.29\n").Outcome);
+            Assert.Equal(OpenCodeVersionProbeOutcome.DetectedV2, HookInstaller.ClassifyOpenCodeVersionOutput("  v2.1.0-beta.1+build.7\r\n").Outcome);
+            Assert.Equal(OpenCodeVersionProbeOutcome.DetectedV2, HookInstaller.ClassifyOpenCodeVersionOutput("2.1.0").Outcome);
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void SessionLogActivityCollector_PartialIdentityFields_StrictlyVetoContradictingDonatedTuplesAndLateBackfill()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), $"kagedesk-partial-veto-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var baseTime = new DateTimeOffset(2026, 4, 10, 16, 30, 0, TimeSpan.Zero);
+            var procA = new AgentSnapshot("proc-claude-1001", "Claude A", AgentRole.External, "claude", AgentState.Idle, Source: "process", ProcessId: 1001, ProcessStartTicks: 111000L);
+            var procB = new AgentSnapshot("proc-claude-2002", "Claude B", AgentRole.External, "claude", AgentState.Idle, Source: "process", ProcessId: 2002, ProcessStartTicks: 222000L);
+
+            // (a) Cross-delta veto: Delta 1 records sole verified tuple (PID A=1001, start A=111000);
+            //     Delta 2 appends activity naming PID B=2002 (without start_ticks) ->
+            //     MUST veto (PID A, start A), NEVER update process A (or B), and stay on separate unverified session tile!
+            string crossDeltaLog = Path.Combine(tempDir, "cross-delta-partial-veto.jsonl");
+            File.WriteAllText(crossDeltaLog,
+                "{\"timestamp\":\"2026-04-10T16:30:10Z\",\"type\":\"session_meta\",\"pid\":1001,\"process_start_ticks\":111000}\n");
+
+            using var collectorA = new SessionLogActivityCollector(
+                watchRoots: new[] { new SessionWatchRoot("claude", "Claude", tempDir) },
+                clock: () => baseTime.AddSeconds(25));
+
+            _ = collectorA.ProcessFileDelta(crossDeltaLog, "claude", "Claude");
+
+            File.AppendAllText(crossDeltaLog,
+                "{\"timestamp\":\"2026-04-10T16:30:20Z\",\"pid\":2002,\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Edit\"}]}}\n");
+
+            var derivedCross = collectorA.ProcessFileDelta(crossDeltaLog, "claude", "Claude");
+            Assert.NotNull(derivedCross);
+            Assert.Equal(AgentState.Working, derivedCross!.State);
+            Assert.Equal("CODE", derivedCross.DerivedActionToken, ignoreCase: true);
+            Assert.Null(derivedCross.CorrelatedProcessId);
+            Assert.Null(derivedCross.CorrelatedProcessStartTicks);
+
+            var aggA = new HqStateAggregator(timeProvider: () => baseTime.AddSeconds(25));
+            aggA.UpdateProcessAgents(new[] { procA, procB });
+            aggA.UpdateSessionLogActivity(collectorA.GetCurrentSnapshots());
+
+            Assert.Equal(AgentState.Idle, aggA.CurrentState.Agents.Single(a => a.Id == "proc-claude-1001").State);
+            Assert.Equal(AgentState.Idle, aggA.CurrentState.Agents.Single(a => a.Id == "proc-claude-2002").State);
+            var separateTileA = Assert.Single(aggA.CurrentState.Agents, a => a.Source == "session-log");
+            Assert.Equal(AgentState.Working, separateTileA.State);
+            Assert.Equal("CODE", separateTileA.ToolName, ignoreCase: true);
+
+            // (b) Late metadata backfill contradicting partial PID:
+            //     Delta 1 appends activity naming PID B=2002 (without start_ticks);
+            //     Delta 2 appends late session_meta with verified (PID A=1001, start A=111000) ->
+            //     MUST veto late backfill of (PID A, start A), NEVER update process A, and keep separate session tile!
+            string lateBackfillLog = Path.Combine(tempDir, "late-backfill-partial-veto.jsonl");
+            File.WriteAllText(lateBackfillLog,
+                "{\"timestamp\":\"2026-04-10T16:30:20Z\",\"pid\":2002,\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"pytest\"}]}}\n");
+
+            using var collectorB = new SessionLogActivityCollector(
+                watchRoots: new[] { new SessionWatchRoot("claude", "Claude", tempDir) },
+                clock: () => baseTime.AddSeconds(25));
+
+            var derivedBeforeMeta = collectorB.ProcessFileDelta(lateBackfillLog, "claude", "Claude");
+            Assert.NotNull(derivedBeforeMeta);
+            Assert.Null(derivedBeforeMeta!.CorrelatedProcessId);
+            Assert.Null(derivedBeforeMeta.CorrelatedProcessStartTicks);
+
+            File.AppendAllText(lateBackfillLog,
+                "{\"timestamp\":\"2026-04-10T16:30:05Z\",\"type\":\"session_meta\",\"pid\":1001,\"process_start_ticks\":111000}\n");
+
+            var derivedAfterMeta = collectorB.ProcessFileDelta(lateBackfillLog, "claude", "Claude");
+            Assert.NotNull(derivedAfterMeta);
+            Assert.Equal(AgentState.Working, derivedAfterMeta!.State);
+            Assert.Equal("TEST", derivedAfterMeta.DerivedActionToken, ignoreCase: true);
+            Assert.Null(derivedAfterMeta.CorrelatedProcessId);
+            Assert.Null(derivedAfterMeta.CorrelatedProcessStartTicks);
+
+            var aggB = new HqStateAggregator(timeProvider: () => baseTime.AddSeconds(25));
+            aggB.UpdateProcessAgents(new[] { procA, procB });
+            aggB.UpdateSessionLogActivity(collectorB.GetCurrentSnapshots());
+
+            Assert.Equal(AgentState.Idle, aggB.CurrentState.Agents.Single(a => a.Id == "proc-claude-1001").State);
+            Assert.Equal(AgentState.Idle, aggB.CurrentState.Agents.Single(a => a.Id == "proc-claude-2002").State);
+            var separateTileB = Assert.Single(aggB.CurrentState.Agents, a => a.Source == "session-log");
+            Assert.Equal(AgentState.Working, separateTileB.State);
+            Assert.Equal("TEST", separateTileB.ToolName, ignoreCase: true);
+
+            // (c) Same-batch partial PID veto AND partial process_start_ticks veto
+            string sameBatchPidVeto =
+                "{\"timestamp\":\"2026-04-10T16:30:10Z\",\"type\":\"session_meta\",\"pid\":1001,\"process_start_ticks\":111000}\n" +
+                "{\"timestamp\":\"2026-04-10T16:30:20Z\",\"pid\":2002,\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Edit\"}]}}\n";
+            var sameBatchPidDerived = SessionLogActivityCollector.ParseDerivedActivityFromTail("claude", "Claude", Encoding.UTF8.GetBytes(sameBatchPidVeto), baseTime.AddSeconds(25));
+            Assert.NotNull(sameBatchPidDerived);
+            Assert.Null(sameBatchPidDerived!.CorrelatedProcessId);
+            Assert.Null(sameBatchPidDerived.CorrelatedProcessStartTicks);
+
+            string sameBatchTicksVeto =
+                "{\"timestamp\":\"2026-04-10T16:30:10Z\",\"type\":\"session_meta\",\"pid\":1001,\"process_start_ticks\":111000}\n" +
+                "{\"timestamp\":\"2026-04-10T16:30:20Z\",\"process_start_ticks\":222000,\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Edit\"}]}}\n";
+            var sameBatchTicksDerived = SessionLogActivityCollector.ParseDerivedActivityFromTail("claude", "Claude", Encoding.UTF8.GetBytes(sameBatchTicksVeto), baseTime.AddSeconds(25));
+            Assert.NotNull(sameBatchTicksDerived);
+            Assert.Null(sameBatchTicksDerived!.CorrelatedProcessId);
+            Assert.Null(sameBatchTicksDerived.CorrelatedProcessStartTicks);
+
+            // (d) HqStateAggregator also refuses partial start_ticks-only snapshots without falling through to Repo/WorktreeId
+            var aggC = new HqStateAggregator(timeProvider: () => baseTime.AddSeconds(25));
+            var procWithRepo = procA with { Repo = "kagedesk", WorktreeId = "wt-1" };
+            aggC.UpdateProcessAgents(new[] { procWithRepo });
+            aggC.UpdateSessionLogActivity(new[]
+            {
+                new AgentSnapshot(
+                    Id: "session:claude:partialticks",
+                    Name: "Claude",
+                    Role: AgentRole.External,
+                    SpriteKey: "generic",
+                    State: AgentState.Working,
+                    ToolName: "CODE",
+                    Repo: "kagedesk",
+                    WorktreeId: "wt-1",
+                    LastActivityAt: baseTime.AddSeconds(20),
+                    UpdatedAt: baseTime.AddSeconds(20),
+                    Source: "session-log",
+                    ProcessId: null,
+                    ProcessStartTicks: 222000L)
+            });
+
+            Assert.Equal(AgentState.Idle, aggC.CurrentState.Agents.Single(a => a.Id == "proc-claude-1001").State);
+            Assert.Single(aggC.CurrentState.Agents, a => a.Source == "session-log" && a.State == AgentState.Working);
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
+    }
 }

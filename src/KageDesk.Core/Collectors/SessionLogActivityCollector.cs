@@ -48,6 +48,24 @@ public sealed class SessionLogActivityCollector : IDisposable
         public bool IsValid => ProcessId > 0 && ProcessStartTicks > 0;
     }
 
+    private readonly record struct PartialProcessIdentity(int? PartialPid, long? PartialStartTicks)
+    {
+        public bool Contradicts(VerifiedProcessIdentity tuple)
+        {
+            if (PartialPid.HasValue && PartialPid.Value > 0 && PartialPid.Value != tuple.ProcessId)
+            {
+                return true;
+            }
+
+            if (PartialStartTicks.HasValue && PartialStartTicks.Value > 0 && PartialStartTicks.Value != tuple.ProcessStartTicks)
+            {
+                return true;
+            }
+
+            return false;
+        }
+    }
+
     private readonly record struct ObservedProcessIdentity(
         VerifiedProcessIdentity Identity,
         DateTimeOffset ObservedAt
@@ -68,6 +86,7 @@ public sealed class SessionLogActivityCollector : IDisposable
         public ObservedProcessIdentity? VerifiedIdentity;
         public bool IdentityAmbiguous;
         public bool LatestActivityHasOwnIdentity;
+        public PartialProcessIdentity LatestActivityPartialIdentity;
         public DerivedSessionActivity? LatestActivity;
     }
 
@@ -449,12 +468,14 @@ public sealed class SessionLogActivityCollector : IDisposable
     private readonly record struct ParsedLineResult(
         DerivedSessionActivity? Activity,
         VerifiedProcessIdentity? VerifiedIdentity,
+        PartialProcessIdentity PartialIdentity,
         DateTimeOffset? EventTimestamp
     );
 
     private readonly record struct ParsedDeltaBatch(
         DerivedSessionActivity? Activity,
         bool ActivityHasOwnIdentity,
+        PartialProcessIdentity ActivityPartialIdentity,
         ObservedProcessIdentity? UnambiguousIdentity,
         bool HasConflictingIdentities
     )
@@ -511,10 +532,13 @@ public sealed class SessionLogActivityCollector : IDisposable
         {
             // Precedence:
             // 1. If the selected freshest activity carries its own verified (pid, process_start_ticks), ALWAYS keep it!
-            // 2. Otherwise, attach the file's single unambiguous verified tuple, or decline correlation if ambiguous.
+            // 2. Otherwise, attach the file's single unambiguous verified tuple ONLY if neither partial identity field
+            //    (PartialPid / PartialStartTicks) on the selected activity contradicts it; decline correlation if ambiguous or vetoed.
             if (!batch.ActivityHasOwnIdentity)
             {
-                if (!st.IdentityAmbiguous && st.VerifiedIdentity is { Identity.IsValid: true } unambiguous)
+                if (!st.IdentityAmbiguous &&
+                    st.VerifiedIdentity is { Identity.IsValid: true } unambiguous &&
+                    !batch.ActivityPartialIdentity.Contradicts(unambiguous.Identity))
                 {
                     candidate = candidate with
                     {
@@ -537,13 +561,18 @@ public sealed class SessionLogActivityCollector : IDisposable
             {
                 st.LatestActivity = candidate;
                 st.LatestActivityHasOwnIdentity = batch.ActivityHasOwnIdentity;
+                st.LatestActivityPartialIdentity = batch.ActivityPartialIdentity;
             }
         }
 
         // Reconcile stored activity when identity-only records arrive for an activity that lacked its own tuple.
+        // Partial identity fields on the stored activity strictly veto contradicting late metadata backfill.
         if (st.LatestActivity != null && !st.LatestActivityHasOwnIdentity)
         {
-            if (st.IdentityAmbiguous)
+            bool vetoedByPartial = st.VerifiedIdentity is { Identity.IsValid: true } currentVerified &&
+                                   st.LatestActivityPartialIdentity.Contradicts(currentVerified.Identity);
+
+            if (st.IdentityAmbiguous || vetoedByPartial)
             {
                 if (st.LatestActivity.CorrelatedProcessId.HasValue || st.LatestActivity.CorrelatedProcessStartTicks.HasValue)
                 {
@@ -929,6 +958,7 @@ public sealed class SessionLogActivityCollector : IDisposable
                 st.VerifiedIdentity = null;
                 st.IdentityAmbiguous = false;
                 st.LatestActivityHasOwnIdentity = false;
+                st.LatestActivityPartialIdentity = default;
                 st.LatestActivity = null;
             }
 
@@ -987,6 +1017,7 @@ public sealed class SessionLogActivityCollector : IDisposable
             return default;
 
         DerivedSessionActivity? freshest = null;
+        PartialProcessIdentity freshestPartialIdentity = default;
         ObservedProcessIdentity? unambiguousBatchIdentity = null;
         bool hasConflictingIdentities = false;
         int pos = 0;
@@ -1044,20 +1075,23 @@ public sealed class SessionLogActivityCollector : IDisposable
                 if (freshest == null || parsed.Activity.ObservedAt >= freshest.ObservedAt)
                 {
                     freshest = parsed.Activity;
+                    freshestPartialIdentity = parsed.PartialIdentity;
                 }
             }
         }
 
         // Resolution precedence:
         // 1. If the selected freshest activity carries its own verified (pid, process_start_ticks), ALWAYS keep it!
-        // 2. Otherwise, attach the single unambiguous verified tuple if present; decline correlation if conflicting.
+        // 2. Otherwise, attach the single unambiguous verified tuple ONLY if neither partial identity field
+        //    (PartialPid / PartialStartTicks) on the selected activity contradicts it; decline correlation if conflicting or vetoed.
         bool freshestHasOwnIdentity = freshest != null &&
             freshest.CorrelatedProcessId.HasValue && freshest.CorrelatedProcessId.Value > 0 &&
             freshest.CorrelatedProcessStartTicks.HasValue && freshest.CorrelatedProcessStartTicks.Value > 0;
 
         if (freshest != null && !freshestHasOwnIdentity &&
             !hasConflictingIdentities &&
-            unambiguousBatchIdentity is { Identity.IsValid: true } unambiguous)
+            unambiguousBatchIdentity is { Identity.IsValid: true } unambiguous &&
+            !freshestPartialIdentity.Contradicts(unambiguous.Identity))
         {
             freshest = freshest with
             {
@@ -1069,6 +1103,7 @@ public sealed class SessionLogActivityCollector : IDisposable
         return new ParsedDeltaBatch(
             freshest,
             freshestHasOwnIdentity,
+            freshestPartialIdentity,
             unambiguousBatchIdentity,
             hasConflictingIdentities);
     }
@@ -1244,10 +1279,12 @@ public sealed class SessionLogActivityCollector : IDisposable
                 }
             }
 
-            // NEVER emit a bare JSON pid without verified start generation ticks!
+            // NEVER emit a bare JSON pid or bare start ticks as correlation proof!
+            // Retain partial identity fields strictly as internal vetoes against contradicting donated tuples.
             VerifiedProcessIdentity? verifiedIdentity = (parsedPid.HasValue && parsedStartTicks.HasValue)
                 ? new VerifiedProcessIdentity(parsedPid.Value, parsedStartTicks.Value)
                 : null;
+            var partialIdentity = new PartialProcessIdentity(parsedPid, parsedStartTicks);
             int? verifiedPid = verifiedIdentity?.ProcessId;
             long? verifiedStartTicks = verifiedIdentity?.ProcessStartTicks;
             DateTimeOffset eventTime = parsedTimestamp ?? observedAt;
@@ -1274,7 +1311,7 @@ public sealed class SessionLogActivityCollector : IDisposable
                 activity = new DerivedSessionActivity(provider, displayName, AgentState.Working, "think", eventTime, IsExplicitIdle: false, CorrelatedProcessId: verifiedPid, CorrelatedProcessStartTicks: verifiedStartTicks);
             }
 
-            return new ParsedLineResult(activity, verifiedIdentity, verifiedIdentity.HasValue ? eventTime : null);
+            return new ParsedLineResult(activity, verifiedIdentity, partialIdentity, verifiedIdentity.HasValue ? eventTime : null);
         }
         catch (JsonException)
         {
@@ -2244,6 +2281,8 @@ public sealed class SessionLogActivityCollector : IDisposable
                 if (st.LatestActivity != null && IsActivityExpired(st.LatestActivity, now))
                 {
                     st.LatestActivity = null;
+                    st.LatestActivityHasOwnIdentity = false;
+                    st.LatestActivityPartialIdentity = default;
                     changed = true;
                 }
 

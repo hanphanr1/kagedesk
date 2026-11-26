@@ -1226,11 +1226,12 @@ public class HqStateAggregator
         bool candidateHasStartTicks = candidate.ProcessStartTicks.HasValue && candidate.ProcessStartTicks.Value > 0;
 
         // Verified (Provider, ProcessId, ProcessStartTicks) tuple check.
-        // Whenever sessionAgent carries a PID, require verified start-generation ticks on both sides
-        // (NEVER guess by bare PID or fall through to weaker fields).
-        if (sessionHasPid)
+        // Whenever sessionAgent carries EITHER a PID or start-generation ticks, require verified
+        // (ProcessId, ProcessStartTicks) on both sides (NEVER guess by bare PID/start_ticks or fall through to weaker fields).
+        if (sessionHasPid || sessionHasStartTicks)
         {
-            return sessionHasStartTicks &&
+            return sessionHasPid &&
+                   sessionHasStartTicks &&
                    candidateHasPid &&
                    candidateHasStartTicks &&
                    sessionAgent.ProcessId!.Value == candidate.ProcessId!.Value &&

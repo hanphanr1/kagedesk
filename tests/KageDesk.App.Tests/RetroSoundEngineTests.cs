@@ -216,11 +216,11 @@ public class RetroSoundEngineTests
         var playTasks = new List<Task>();
         var exceptions = new ConcurrentBag<Exception>();
 
-        // 4 threads actively invoking Play in a loop
+        // 4 dedicated threads actively invoking Play in a loop (LongRunning avoids starving ThreadPool with Barrier(6))
         for (int i = 0; i < 4; i++)
         {
             int index = i;
-            playTasks.Add(Task.Run(() =>
+            playTasks.Add(Task.Factory.StartNew(() =>
             {
                 try
                 {
@@ -239,16 +239,16 @@ public class RetroSoundEngineTests
                 {
                     exceptions.Add(ex);
                 }
-            }));
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default));
         }
 
-        // 1 thread invoking Dispose mid-loop
-        var disposeTask = Task.Run(async () =>
+        // 1 dedicated thread invoking Dispose mid-loop
+        var disposeTask = Task.Factory.StartNew(() =>
         {
             try
             {
                 barrier.SignalAndWait(TimeSpan.FromSeconds(5));
-                await Task.Yield();
+                Thread.Yield();
                 engine.Dispose();
                 engine.Dispose(); // redundant dispose safety
             }
@@ -256,7 +256,7 @@ public class RetroSoundEngineTests
             {
                 exceptions.Add(ex);
             }
-        });
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
         barrier.SignalAndWait(TimeSpan.FromSeconds(5));
 
