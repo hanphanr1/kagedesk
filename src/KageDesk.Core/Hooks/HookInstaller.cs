@@ -1970,6 +1970,20 @@ import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
 const BRIDGE_PORT = {{port}};
+const DEFAULT_EMIT_TIMEOUT_MS = 2000;
+
+function resolveEmitTimeoutMs() {
+  try {
+    const raw = process.env.KAGEDESK_EMIT_TIMEOUT_MS;
+    if (raw && /^\d+$/.test(raw.trim())) {
+      const parsed = Number.parseInt(raw.trim(), 10);
+      if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+    }
+  } catch {
+    // Ignore environment access issues.
+  }
+  return DEFAULT_EMIT_TIMEOUT_MS;
+}
 
 function readBridgeToken() {
   try {
@@ -1984,19 +1998,45 @@ function readBridgeToken() {
 }
 
 function emitEvent(type, message) {
+  let timer = null;
   try {
     const headers = { "Content-Type": "application/json" };
     const token = readBridgeToken();
     if (token) headers["X-KageDesk-Token"] = token;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 1000);
-    fetch(`http://127.0.0.1:${BRIDGE_PORT}/api/event`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ type, agentId: "opencode", message }),
-      signal: controller.signal
-    }).catch(() => {}).finally(() => clearTimeout(timer));
+    timer = setTimeout(() => {
+      try {
+        controller.abort();
+      } catch {
+        // Ignore abort errors.
+      }
+    }, resolveEmitTimeoutMs());
+    timer.unref?.();
+    void Promise.resolve(
+      fetch(`http://127.0.0.1:${BRIDGE_PORT}/api/event`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ type, agentId: "opencode", message }),
+        signal: controller.signal
+      })
+    )
+      .then((res) => {
+        try {
+          const cancel = res?.body?.cancel;
+          if (typeof cancel === "function") {
+            return Promise.resolve(cancel.call(res.body)).catch(() => {});
+          }
+        } catch {
+          // Ignore body cancel errors.
+        }
+        return undefined;
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (timer !== null) clearTimeout(timer);
+      });
   } catch {
+    if (timer !== null) clearTimeout(timer);
     // Non-blocking: never interfere with OpenCode execution.
   }
 }
@@ -2051,6 +2091,20 @@ import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
 const BRIDGE_PORT = {{port}};
+const DEFAULT_EMIT_TIMEOUT_MS = 2000;
+
+function resolveEmitTimeoutMs() {
+  try {
+    const raw = process.env.KAGEDESK_EMIT_TIMEOUT_MS;
+    if (raw && /^\d+$/.test(raw.trim())) {
+      const parsed = Number.parseInt(raw.trim(), 10);
+      if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+    }
+  } catch {
+    // Ignore environment access issues.
+  }
+  return DEFAULT_EMIT_TIMEOUT_MS;
+}
 
 function readBridgeToken() {
   try {
@@ -2065,19 +2119,45 @@ function readBridgeToken() {
 }
 
 function emitEvent(type, message) {
+  let timer = null;
   try {
     const headers = { "Content-Type": "application/json" };
     const token = readBridgeToken();
     if (token) headers["X-KageDesk-Token"] = token;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 1000);
-    fetch(`http://127.0.0.1:${BRIDGE_PORT}/api/event`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ type, agentId: "opencode", message }),
-      signal: controller.signal
-    }).catch(() => {}).finally(() => clearTimeout(timer));
+    timer = setTimeout(() => {
+      try {
+        controller.abort();
+      } catch {
+        // Ignore abort errors.
+      }
+    }, resolveEmitTimeoutMs());
+    timer.unref?.();
+    void Promise.resolve(
+      fetch(`http://127.0.0.1:${BRIDGE_PORT}/api/event`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ type, agentId: "opencode", message }),
+        signal: controller.signal
+      })
+    )
+      .then((res) => {
+        try {
+          const cancel = res?.body?.cancel;
+          if (typeof cancel === "function") {
+            return Promise.resolve(cancel.call(res.body)).catch(() => {});
+          }
+        } catch {
+          // Ignore body cancel errors.
+        }
+        return undefined;
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (timer !== null) clearTimeout(timer);
+      });
   } catch {
+    if (timer !== null) clearTimeout(timer);
     // Non-blocking: never interfere with OpenCode execution.
   }
 }

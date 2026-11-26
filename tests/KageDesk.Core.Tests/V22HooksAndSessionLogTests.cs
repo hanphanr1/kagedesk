@@ -1527,149 +1527,192 @@ public class V22HooksAndSessionLogTests
             listener.Prefixes.Add($"http://127.0.0.1:{port}/");
             listener.Start();
 
+            // Arm the first GetContextAsync() BEFORE spawning Node so the listener is actively accepting requests.
+            Task<HttpListenerContext> initialContextTask = listener.GetContextAsync();
             using var serverCts = new CancellationTokenSource();
+            var inFlightHandlers = new System.Collections.Concurrent.ConcurrentBag<Task>();
             Task serverTask = Task.Run(async () =>
             {
-                while (!serverCts.IsCancellationRequested)
+                Task<HttpListenerContext>? pendingAccept = initialContextTask;
+                while (!serverCts.IsCancellationRequested && pendingAccept != null)
                 {
                     HttpListenerContext ctx;
                     try
                     {
-                        ctx = await listener.GetContextAsync().WaitAsync(serverCts.Token);
+                        ctx = await pendingAccept.WaitAsync(serverCts.Token);
                     }
                     catch
                     {
+                        _ = pendingAccept.ContinueWith(
+                            static t => _ = t.Exception,
+                            CancellationToken.None,
+                            TaskContinuationOptions.OnlyOnFaulted,
+                            TaskScheduler.Default);
                         break;
                     }
 
-                    using var sr = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
-                    string body = await sr.ReadToEndAsync(serverCts.Token);
-                    try
-                    {
-                        using var doc = JsonDocument.Parse(body);
-                        string t = doc.RootElement.GetProperty("type").GetString() ?? "";
-                        string a = doc.RootElement.GetProperty("agentId").GetString() ?? "";
-                        receivedTypes.Enqueue((t, a));
-                    }
-                    catch { }
+                    // Immediately re-arm next accept so concurrent/sequential requests never block on GetContextAsync().
+                    pendingAccept = listener.IsListening && !serverCts.IsCancellationRequested
+                        ? listener.GetContextAsync()
+                        : null;
 
-                    ctx.Response.StatusCode = 200;
-                    ctx.Response.Close();
+                    inFlightHandlers.Add(HandleOpenCodeBridgeRequestAsync(ctx, receivedTypes, serverCts.Token));
                 }
             });
 
-            // 2a. OpenCode V1 install & real Node.js ESM execution test
-            var v1Installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: port, openCodeVersionProbe: () => "opencode 1.18.29");
-            var v1Install = v1Installer.InstallOpenCode();
-            Assert.Equal(HookActionStatus.Installed, v1Install.Status);
-            Assert.True(File.Exists(pluginPath));
-            string v1Source = File.ReadAllText(pluginPath);
-            Assert.Contains("// kagedesk-managed-opencode-plugin:v1", v1Source, StringComparison.Ordinal);
-            Assert.Contains("export const KageDeskPlugin", v1Source, StringComparison.Ordinal);
-
-            string v1Harness = Path.Combine(tempRoot, "run-v1.mjs");
-            File.WriteAllText(v1Harness, """
-            import { pathToFileURL } from "node:url";
-            const origFetch = globalThis.fetch;
-            const pending = [];
-            globalThis.fetch = (...args) => {
-              const p = origFetch(...args);
-              pending.push(p);
-              return p;
+            var happyPathEnv = new Dictionary<string, string>
+            {
+                ["KAGEDESK_EMIT_TIMEOUT_MS"] = "5000"
             };
-            const mod = await import(pathToFileURL(process.argv[2]).href);
-            if (typeof mod.KageDeskPlugin !== "function") throw new Error("Missing V1 KageDeskPlugin export");
-            const hooks = await mod.KageDeskPlugin({});
-            await hooks["tool.execute.before"]();
-            await hooks["tool.execute.after"]();
-            await hooks.event({ event: { type: "session.idle" } });
-            await hooks.event({ event: { type: "permission.asked" } });
-            await hooks.event({ event: { type: "session.error" } });
-            await Promise.all(pending);
-            """);
 
-            RunNodeScriptOrFail(v1Harness, pluginPath);
-            var v1Events = DrainQueue(receivedTypes);
-            Assert.Equal(5, v1Events.Count);
-            Assert.Contains(("tool_start", "opencode"), v1Events);
-            Assert.Contains(("tool_complete", "opencode"), v1Events);
-            Assert.Contains(("turn_done", "opencode"), v1Events);
-            Assert.Contains(("approval", "opencode"), v1Events);
-            Assert.Contains(("fail", "opencode"), v1Events);
+            try
+            {
+                // 2a. OpenCode V1 install & real Node.js ESM execution test
+                var v1Installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: port, openCodeVersionProbe: () => "opencode 1.18.29");
+                var v1Install = v1Installer.InstallOpenCode();
+                Assert.Equal(HookActionStatus.Installed, v1Install.Status);
+                Assert.True(File.Exists(pluginPath));
+                string v1Source = File.ReadAllText(pluginPath);
+                Assert.Contains("// kagedesk-managed-opencode-plugin:v1", v1Source, StringComparison.Ordinal);
+                Assert.Contains("export const KageDeskPlugin", v1Source, StringComparison.Ordinal);
+                Assert.Contains("timer.unref?.()", v1Source, StringComparison.Ordinal);
+                Assert.Contains("KAGEDESK_EMIT_TIMEOUT_MS", v1Source, StringComparison.Ordinal);
 
-            // 2b. OpenCode V2 upgrade & real Node.js ESM execution test (default export + setup(ctx) + cleanup abort)
-            var v2Installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: port, openCodeVersionProbe: () => "opencode 2.1.0");
-            var v2Install = v2Installer.InstallOpenCode();
-            Assert.Equal(HookActionStatus.Installed, v2Install.Status);
-            string v2Source = File.ReadAllText(pluginPath);
-            Assert.Contains("// kagedesk-managed-opencode-plugin:v2", v2Source, StringComparison.Ordinal);
-            Assert.Contains("export default", v2Source, StringComparison.Ordinal);
-            Assert.Contains("ctx.tool.hook", v2Source, StringComparison.Ordinal);
-            Assert.Contains("ctx.event.subscribe", v2Source, StringComparison.Ordinal);
-
-            // V2 second install is strictly idempotent
-            Assert.Equal(HookActionStatus.AlreadyInstalled, v2Installer.InstallOpenCode().Status);
-
-            string v2Harness = Path.Combine(tempRoot, "run-v2.mjs");
-            File.WriteAllText(v2Harness, """
-            import { pathToFileURL } from "node:url";
-            const origFetch = globalThis.fetch;
-            const pending = [];
-            globalThis.fetch = (...args) => {
-              const p = origFetch(...args);
-              pending.push(p);
-              return p;
-            };
-            const mod = await import(pathToFileURL(process.argv[2]).href);
-            const plugin = mod.default;
-            if (!plugin || plugin.id !== "kagedesk" || typeof plugin.setup !== "function") {
-              throw new Error("Invalid V2 default plugin contract");
-            }
-            const toolHooks = new Map();
-            let subSignal = null;
-            let resolveEventsDone;
-            const eventsDone = new Promise(r => { resolveEventsDone = r; });
-            const ctx = {
-              tool: {
-                async hook(name, fn) { toolHooks.set(name, fn); }
-              },
-              event: {
-                async *subscribe({ signal }) {
-                  subSignal = signal;
-                  yield { type: "session.idle" };
-                  yield { type: "permission.asked" };
-                  yield { type: "session.error" };
-                  resolveEventsDone();
+                string v1Harness = Path.Combine(tempRoot, "run-v1.mjs");
+                File.WriteAllText(v1Harness, """
+                import { pathToFileURL } from "node:url";
+                process.on("unhandledRejection", (err) => {
+                  console.error("UNHANDLED_REJECTION:", err);
+                  process.exit(2);
+                });
+                process.on("uncaughtException", (err) => {
+                  console.error("UNCAUGHT_EXCEPTION:", err);
+                  process.exit(3);
+                });
+                const origFetch = globalThis.fetch;
+                const pending = [];
+                globalThis.fetch = (...args) => {
+                  const p = origFetch(...args);
+                  pending.push(p);
+                  return p;
+                };
+                const mod = await import(pathToFileURL(process.argv[2]).href);
+                if (typeof mod.KageDeskPlugin !== "function") throw new Error("Missing V1 KageDeskPlugin export");
+                const hooks = await mod.KageDeskPlugin({});
+                await hooks["tool.execute.before"]();
+                await hooks["tool.execute.after"]();
+                await hooks.event({ event: { type: "session.idle" } });
+                await hooks.event({ event: { type: "permission.asked" } });
+                await hooks.event({ event: { type: "session.error" } });
+                const settled = await Promise.allSettled(pending);
+                const rejected = settled.filter(r => r.status === "rejected");
+                if (rejected.length > 0) {
+                  throw new Error("V1 emit fetch failed: " + rejected.map(r => r.reason?.stack || String(r.reason)).join("; "));
                 }
-              }
-            };
-            const cleanup = await plugin.setup(ctx);
-            await toolHooks.get("execute.before")({}, {});
-            await toolHooks.get("execute.after")({}, {});
-            await eventsDone;
-            await new Promise(r => setTimeout(r, 20));
-            await Promise.all(pending);
-            if (typeof cleanup !== "function") throw new Error("V2 setup must return cleanup function");
-            cleanup();
-            if (!subSignal || !subSignal.aborted) throw new Error("V2 cleanup must abort event subscription signal");
-            """);
+                await new Promise(r => setTimeout(r, 20));
+                """);
 
-            RunNodeScriptOrFail(v2Harness, pluginPath);
-            var v2Events = DrainQueue(receivedTypes);
-            Assert.Equal(5, v2Events.Count);
-            Assert.Contains(("tool_start", "opencode"), v2Events);
-            Assert.Contains(("tool_complete", "opencode"), v2Events);
-            Assert.Contains(("turn_done", "opencode"), v2Events);
-            Assert.Contains(("approval", "opencode"), v2Events);
-            Assert.Contains(("fail", "opencode"), v2Events);
+                RunNodeScriptOrFail(v1Harness, pluginPath, environmentOverrides: happyPathEnv, requireEmptyStderr: true);
+                var v1Events = DrainQueue(receivedTypes);
+                Assert.Equal(5, v1Events.Count);
+                Assert.Contains(("tool_start", "opencode"), v1Events);
+                Assert.Contains(("tool_complete", "opencode"), v1Events);
+                Assert.Contains(("turn_done", "opencode"), v1Events);
+                Assert.Contains(("approval", "opencode"), v1Events);
+                Assert.Contains(("fail", "opencode"), v1Events);
 
-            // Uninstall removes V2 plugin cleanly
-            Assert.Equal(HookActionStatus.Uninstalled, v2Installer.UninstallOpenCode().Status);
-            Assert.False(File.Exists(pluginPath));
+                // 2b. OpenCode V2 upgrade & real Node.js ESM execution test (default export + setup(ctx) + cleanup abort)
+                var v2Installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: port, openCodeVersionProbe: () => "opencode 2.1.0");
+                var v2Install = v2Installer.InstallOpenCode();
+                Assert.Equal(HookActionStatus.Installed, v2Install.Status);
+                string v2Source = File.ReadAllText(pluginPath);
+                Assert.Contains("// kagedesk-managed-opencode-plugin:v2", v2Source, StringComparison.Ordinal);
+                Assert.Contains("export default", v2Source, StringComparison.Ordinal);
+                Assert.Contains("ctx.tool.hook", v2Source, StringComparison.Ordinal);
+                Assert.Contains("ctx.event.subscribe", v2Source, StringComparison.Ordinal);
+                Assert.Contains("timer.unref?.()", v2Source, StringComparison.Ordinal);
+                Assert.Contains("KAGEDESK_EMIT_TIMEOUT_MS", v2Source, StringComparison.Ordinal);
 
-            serverCts.Cancel();
-            listener.Stop();
-            try { await serverTask; } catch { }
+                // V2 second install is strictly idempotent
+                Assert.Equal(HookActionStatus.AlreadyInstalled, v2Installer.InstallOpenCode().Status);
+
+                string v2Harness = Path.Combine(tempRoot, "run-v2.mjs");
+                File.WriteAllText(v2Harness, """
+                import { pathToFileURL } from "node:url";
+                process.on("unhandledRejection", (err) => {
+                  console.error("UNHANDLED_REJECTION:", err);
+                  process.exit(2);
+                });
+                process.on("uncaughtException", (err) => {
+                  console.error("UNCAUGHT_EXCEPTION:", err);
+                  process.exit(3);
+                });
+                const origFetch = globalThis.fetch;
+                const pending = [];
+                globalThis.fetch = (...args) => {
+                  const p = origFetch(...args);
+                  pending.push(p);
+                  return p;
+                };
+                const mod = await import(pathToFileURL(process.argv[2]).href);
+                const plugin = mod.default;
+                if (!plugin || plugin.id !== "kagedesk" || typeof plugin.setup !== "function") {
+                  throw new Error("Invalid V2 default plugin contract");
+                }
+                const toolHooks = new Map();
+                let subSignal = null;
+                let resolveEventsDone;
+                const eventsDone = new Promise(r => { resolveEventsDone = r; });
+                const ctx = {
+                  tool: {
+                    async hook(name, fn) { toolHooks.set(name, fn); }
+                  },
+                  event: {
+                    async *subscribe({ signal }) {
+                      subSignal = signal;
+                      yield { type: "session.idle" };
+                      yield { type: "permission.asked" };
+                      yield { type: "session.error" };
+                      resolveEventsDone();
+                    }
+                  }
+                };
+                const cleanup = await plugin.setup(ctx);
+                await toolHooks.get("execute.before")({}, {});
+                await toolHooks.get("execute.after")({}, {});
+                await eventsDone;
+                await new Promise(r => setTimeout(r, 20));
+                const settled = await Promise.allSettled(pending);
+                const rejected = settled.filter(r => r.status === "rejected");
+                if (rejected.length > 0) {
+                  throw new Error("V2 emit fetch failed: " + rejected.map(r => r.reason?.stack || String(r.reason)).join("; "));
+                }
+                if (typeof cleanup !== "function") throw new Error("V2 setup must return cleanup function");
+                cleanup();
+                if (!subSignal || !subSignal.aborted) throw new Error("V2 cleanup must abort event subscription signal");
+                await new Promise(r => setTimeout(r, 20));
+                """);
+
+                RunNodeScriptOrFail(v2Harness, pluginPath, environmentOverrides: happyPathEnv, requireEmptyStderr: true);
+                var v2Events = DrainQueue(receivedTypes);
+                Assert.Equal(5, v2Events.Count);
+                Assert.Contains(("tool_start", "opencode"), v2Events);
+                Assert.Contains(("tool_complete", "opencode"), v2Events);
+                Assert.Contains(("turn_done", "opencode"), v2Events);
+                Assert.Contains(("approval", "opencode"), v2Events);
+                Assert.Contains(("fail", "opencode"), v2Events);
+
+                // Uninstall removes V2 plugin cleanly
+                Assert.Equal(HookActionStatus.Uninstalled, v2Installer.UninstallOpenCode().Status);
+                Assert.False(File.Exists(pluginPath));
+            }
+            finally
+            {
+                try { listener.Stop(); } catch { }
+                serverCts.Cancel();
+                try { await serverTask; } catch { }
+                try { await Task.WhenAll(inFlightHandlers); } catch { }
+            }
         }
         finally
         {
@@ -1677,7 +1720,227 @@ public class V22HooksAndSessionLogTests
         }
     }
 
-    private static void RunNodeScriptOrFail(string scriptPath, string pluginArg)
+    [Fact]
+    public async Task HookInstaller_OpenCodeV1AndV2Plugins_StalledMidBodyAndUnreachableEndpoints_NeverThrowUnhandledAbortError()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), $"kagedesk-oc-abort-{Guid.NewGuid():N}");
+        string fakeHome = Path.Combine(tempRoot, "home");
+        string fakeAppData = Path.Combine(tempRoot, "appdata");
+        string openCodeDir = Path.Combine(fakeHome, ".config", "opencode");
+        string pluginPath = Path.Combine(openCodeDir, "plugins", "kagedesk-plugin.js");
+        Directory.CreateDirectory(openCodeDir);
+
+        // 1. Stalled server: accepts TCP connection and never sends any HTTP response (forces real undici AbortError).
+        var stalledServer = new TcpListener(IPAddress.Loopback, 0);
+        stalledServer.Start();
+        int stalledPort = ((IPEndPoint)stalledServer.LocalEndpoint).Port;
+
+        // 2. Stalled mid-body server: sends HTTP 200 headers with Content-Length: 4096 then stalls forever.
+        var midBodyServer = new TcpListener(IPAddress.Loopback, 0);
+        midBodyServer.Start();
+        int midBodyPort = ((IPEndPoint)midBodyServer.LocalEndpoint).Port;
+
+        // 3. Unreachable port: bound and closed immediately (forces ECONNREFUSED).
+        int unreachablePort = GetAvailablePort();
+
+        using var cts = new CancellationTokenSource();
+        var acceptedSockets = new System.Collections.Concurrent.ConcurrentBag<TcpClient>();
+        int stalledConnections = 0;
+        int midBodyConnections = 0;
+
+        Task stalledAcceptTask = Task.Run(async () =>
+        {
+            while (!cts.IsCancellationRequested)
+            {
+                try
+                {
+                    TcpClient client = await stalledServer.AcceptTcpClientAsync(cts.Token);
+                    acceptedSockets.Add(client);
+                    Interlocked.Increment(ref stalledConnections);
+                }
+                catch
+                {
+                    break;
+                }
+            }
+        });
+
+        Task midBodyAcceptTask = Task.Run(async () =>
+        {
+            byte[] partialResponse = Encoding.ASCII.GetBytes(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4096\r\n\r\n");
+
+            while (!cts.IsCancellationRequested)
+            {
+                try
+                {
+                    TcpClient client = await midBodyServer.AcceptTcpClientAsync(cts.Token);
+                    acceptedSockets.Add(client);
+                    Interlocked.Increment(ref midBodyConnections);
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            NetworkStream stream = client.GetStream();
+                            byte[] buf = new byte[1024];
+                            _ = await stream.ReadAsync(buf, cts.Token);
+                            await stream.WriteAsync(partialResponse, cts.Token);
+                            await stream.FlushAsync(cts.Token);
+                        }
+                        catch
+                        {
+                        }
+                    });
+                }
+                catch
+                {
+                    break;
+                }
+            }
+        });
+
+        try
+        {
+            string v1FaultHarness = Path.Combine(tempRoot, "fault-v1.mjs");
+            File.WriteAllText(v1FaultHarness, """
+            import { pathToFileURL } from "node:url";
+            process.on("unhandledRejection", (err) => {
+              console.error("UNHANDLED_REJECTION:", err);
+              process.exit(2);
+            });
+            process.on("uncaughtException", (err) => {
+              console.error("UNCAUGHT_EXCEPTION:", err);
+              process.exit(3);
+            });
+            const mod = await import(pathToFileURL(process.argv[2]).href);
+            const hooks = await mod.KageDeskPlugin({});
+            await hooks["tool.execute.before"]();
+            await hooks.event({ event: { type: "session.idle" } });
+            await new Promise(r => setTimeout(r, 450));
+            """);
+
+            string v2FaultHarness = Path.Combine(tempRoot, "fault-v2.mjs");
+            File.WriteAllText(v2FaultHarness, """
+            import { pathToFileURL } from "node:url";
+            process.on("unhandledRejection", (err) => {
+              console.error("UNHANDLED_REJECTION:", err);
+              process.exit(2);
+            });
+            process.on("uncaughtException", (err) => {
+              console.error("UNCAUGHT_EXCEPTION:", err);
+              process.exit(3);
+            });
+            const mod = await import(pathToFileURL(process.argv[2]).href);
+            const toolHooks = new Map();
+            let resolveEventsDone;
+            const eventsDone = new Promise(r => { resolveEventsDone = r; });
+            const ctx = {
+              tool: {
+                async hook(name, fn) { toolHooks.set(name, fn); }
+              },
+              event: {
+                async *subscribe() {
+                  yield { type: "session.idle" };
+                  resolveEventsDone();
+                }
+              }
+            };
+            const cleanup = await mod.default.setup(ctx);
+            await toolHooks.get("execute.before")({}, {});
+            await eventsDone;
+            await new Promise(r => setTimeout(r, 450));
+            cleanup();
+            """);
+
+            var shortAbortEnv = new Dictionary<string, string>
+            {
+                ["KAGEDESK_EMIT_TIMEOUT_MS"] = "150"
+            };
+
+            foreach (int faultPort in new[] { stalledPort, midBodyPort, unreachablePort })
+            {
+                int stalledBeforeV1 = Volatile.Read(ref stalledConnections);
+                int midBodyBeforeV1 = Volatile.Read(ref midBodyConnections);
+
+                // V1 against stalled / mid-body-stalled / unreachable endpoint
+                var v1Installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: faultPort, openCodeVersionProbe: () => "opencode 1.18.29");
+                var v1Status = v1Installer.InstallOpenCode().Status;
+                Assert.True(v1Status is HookActionStatus.Installed or HookActionStatus.AlreadyInstalled);
+                RunNodeScriptOrFail(v1FaultHarness, pluginPath, environmentOverrides: shortAbortEnv, timeoutMs: 10_000, requireEmptyStderr: true);
+
+                if (faultPort == stalledPort)
+                    Assert.True(Volatile.Read(ref stalledConnections) > stalledBeforeV1, "Expected V1 plugin to connect to stalled endpoint.");
+                else if (faultPort == midBodyPort)
+                    Assert.True(Volatile.Read(ref midBodyConnections) > midBodyBeforeV1, "Expected V1 plugin to connect to mid-body stalled endpoint.");
+
+                int stalledBeforeV2 = Volatile.Read(ref stalledConnections);
+                int midBodyBeforeV2 = Volatile.Read(ref midBodyConnections);
+
+                // V2 against stalled / mid-body-stalled / unreachable endpoint
+                var v2Installer = new HookInstaller(fakeHome, fakeAppData, bridgePort: faultPort, openCodeVersionProbe: () => "opencode 2.1.0");
+                var v2Status = v2Installer.InstallOpenCode().Status;
+                Assert.True(v2Status is HookActionStatus.Installed or HookActionStatus.AlreadyInstalled);
+                RunNodeScriptOrFail(v2FaultHarness, pluginPath, environmentOverrides: shortAbortEnv, timeoutMs: 10_000, requireEmptyStderr: true);
+
+                if (faultPort == stalledPort)
+                    Assert.True(Volatile.Read(ref stalledConnections) > stalledBeforeV2, "Expected V2 plugin to connect to stalled endpoint.");
+                else if (faultPort == midBodyPort)
+                    Assert.True(Volatile.Read(ref midBodyConnections) > midBodyBeforeV2, "Expected V2 plugin to connect to mid-body stalled endpoint.");
+            }
+        }
+        finally
+        {
+            cts.Cancel();
+            try { stalledServer.Stop(); } catch { }
+            try { midBodyServer.Stop(); } catch { }
+            foreach (TcpClient client in acceptedSockets)
+            {
+                try { client.Dispose(); } catch { }
+            }
+            try { await stalledAcceptTask; } catch { }
+            try { await midBodyAcceptTask; } catch { }
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
+        }
+    }
+
+    private static async Task HandleOpenCodeBridgeRequestAsync(
+        HttpListenerContext ctx,
+        System.Collections.Concurrent.ConcurrentQueue<(string Type, string AgentId)> receivedTypes,
+        CancellationToken ct)
+    {
+        try
+        {
+            using var sr = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
+            string body = await sr.ReadToEndAsync(ct);
+            using var doc = JsonDocument.Parse(body);
+            string t = doc.RootElement.GetProperty("type").GetString() ?? "";
+            string a = doc.RootElement.GetProperty("agentId").GetString() ?? "";
+            receivedTypes.Enqueue((t, a));
+        }
+        catch
+        {
+        }
+        finally
+        {
+            try
+            {
+                ctx.Response.StatusCode = 200;
+                ctx.Response.ContentLength64 = 0;
+                ctx.Response.OutputStream.Close();
+                ctx.Response.Close();
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static void RunNodeScriptOrFail(
+        string scriptPath,
+        string pluginArg,
+        IReadOnlyDictionary<string, string>? environmentOverrides = null,
+        int timeoutMs = 15_000,
+        bool requireEmptyStderr = false)
     {
         var psi = new System.Diagnostics.ProcessStartInfo
         {
@@ -1690,12 +1953,32 @@ public class V22HooksAndSessionLogTests
         psi.ArgumentList.Add(scriptPath);
         psi.ArgumentList.Add(pluginArg);
 
+        if (environmentOverrides != null)
+        {
+            foreach (var kvp in environmentOverrides)
+            {
+                psi.Environment[kvp.Key] = kvp.Value;
+            }
+        }
+
         using var proc = System.Diagnostics.Process.Start(psi);
         Assert.NotNull(proc);
-        string stdout = proc!.StandardOutput.ReadToEnd();
-        string stderr = proc.StandardError.ReadToEnd();
-        Assert.True(proc.WaitForExit(10_000), $"Node harness timed out. stdout={stdout} stderr={stderr}");
+        Task<string> stdoutTask = proc!.StandardOutput.ReadToEndAsync();
+        Task<string> stderrTask = proc.StandardError.ReadToEndAsync();
+        bool exited = proc.WaitForExit(timeoutMs);
+        if (!exited)
+        {
+            try { proc.Kill(entireProcessTree: true); } catch { }
+        }
+
+        string stdout = stdoutTask.Wait(2_000) ? stdoutTask.Result : "<stdout-timeout>";
+        string stderr = stderrTask.Wait(2_000) ? stderrTask.Result : "<stderr-timeout>";
+        Assert.True(exited, $"Node harness timed out after {timeoutMs}ms. stdout={stdout} stderr={stderr}");
         Assert.True(proc.ExitCode == 0, $"Node harness failed (exit={proc.ExitCode}): stdout={stdout} stderr={stderr}");
+        if (requireEmptyStderr)
+        {
+            Assert.True(string.IsNullOrWhiteSpace(stderr), $"Expected empty stderr from Node harness, got: {stderr}");
+        }
     }
 
     private static List<(string Type, string AgentId)> DrainQueue(
