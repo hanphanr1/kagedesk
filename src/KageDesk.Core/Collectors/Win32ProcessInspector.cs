@@ -128,7 +128,26 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
     private readonly object _lock = new();
     private long _cacheGeneration;
 
-    public long CacheGeneration => Interlocked.Read(ref _cacheGeneration);
+    private readonly Func<long> _utcNowTicksProvider;
+    private readonly Func<IReadOnlyList<RawToolhelpEntry>?> _captureRawSnapshot;
+    private readonly Func<int, bool, Func<OpenedProcessHandleData, ProcessItem>, ProcessItem?> _withOpenedHandle;
+
+    public Win32ProcessInspector()
+        : this(null, null, null)
+    {
+    }
+
+    internal Win32ProcessInspector(
+        Func<long>? utcNowTicksProvider = null,
+        Func<IReadOnlyList<RawToolhelpEntry>?>? captureRawSnapshot = null,
+        Func<int, bool, Func<OpenedProcessHandleData, ProcessItem>, ProcessItem?>? withOpenedHandle = null)
+    {
+        _utcNowTicksProvider = utcNowTicksProvider ?? (static () => DateTime.UtcNow.Ticks);
+        _captureRawSnapshot = captureRawSnapshot ?? CaptureWin32RawSnapshot;
+        _withOpenedHandle = withOpenedHandle ?? WithWin32ProcessHandle;
+    }
+
+    public long CacheGeneration => Volatile.Read(ref _cacheGeneration);
 
     public int CacheCount
     {
@@ -185,7 +204,8 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
         var key = (pid, startTicks);
         lock (_lock)
         {
-            if (_classificationCache.TryGetValue(key, out var cached))
+            if (Volatile.Read(ref _cacheGeneration) == capturedGen &&
+                _classificationCache.TryGetValue(key, out var cached))
             {
                 return cached;
             }
@@ -203,7 +223,7 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
 
         lock (_lock)
         {
-            if (Interlocked.Read(ref _cacheGeneration) == capturedGen)
+            if (Volatile.Read(ref _cacheGeneration) == capturedGen)
             {
                 _classificationCache[key] = classification;
             }
@@ -271,13 +291,13 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
 
     public static bool VerifyProcessHandleIdentity(
         string? toolhelpExeName,
-        long snapshotCapturedUtcTicks,
+        long snapshotCutoffUtcTicks,
         long handleCreationTimeTicks,
         string? handleImagePath)
     {
         if (handleCreationTimeTicks <= 0 ||
-            snapshotCapturedUtcTicks <= 0 ||
-            handleCreationTimeTicks > snapshotCapturedUtcTicks)
+            snapshotCutoffUtcTicks <= 0 ||
+            handleCreationTimeTicks >= snapshotCutoffUtcTicks)
         {
             return false;
         }
@@ -342,16 +362,27 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
 
     public IReadOnlyList<ProcessItem> InspectProcesses()
     {
-        var rawEntries = new List<RawToolhelpEntry>(256);
+        long capturedGeneration = Volatile.Read(ref _cacheGeneration);
+        long snapshotCutoffUtcTicks = _utcNowTicksProvider();
 
-        IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1))
+        var rawEntries = _captureRawSnapshot();
+        if (rawEntries == null)
         {
             return Array.Empty<ProcessItem>();
         }
 
-        long snapshotCapturedUtcTicks = DateTime.UtcNow.Ticks;
+        return InspectFromRawSnapshot(rawEntries, snapshotCutoffUtcTicks, capturedGeneration, _withOpenedHandle);
+    }
 
+    private static IReadOnlyList<RawToolhelpEntry>? CaptureWin32RawSnapshot()
+    {
+        IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1))
+        {
+            return null;
+        }
+
+        var rawEntries = new List<RawToolhelpEntry>(256);
         try
         {
             var entry = new PROCESSENTRY32W();
@@ -379,7 +410,7 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
             CloseHandle(snapshot);
         }
 
-        return InspectFromRawSnapshot(rawEntries, snapshotCapturedUtcTicks, WithWin32ProcessHandle);
+        return rawEntries;
     }
 
     private static T? WithWin32ProcessHandle<T>(int pid, bool includeCpuTime, Func<OpenedProcessHandleData, T> onHandle)
@@ -433,11 +464,10 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
 
     internal IReadOnlyList<ProcessItem> InspectFromRawSnapshot(
         IReadOnlyList<RawToolhelpEntry> rawEntries,
-        long snapshotCapturedUtcTicks,
+        long snapshotCutoffUtcTicks,
+        long capturedGeneration,
         Func<int, bool, Func<OpenedProcessHandleData, ProcessItem>, ProcessItem?> withOpenedHandle)
     {
-        long capturedGen = Interlocked.Read(ref _cacheGeneration);
-
         var rawParentByPid = new Dictionary<int, int>(rawEntries.Count);
         var rawChildrenByPid = new Dictionary<int, List<int>>(rawEntries.Count);
         var relevantOrOrcaPids = new HashSet<int>();
@@ -520,10 +550,10 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
                 {
                     ancestryItem = withOpenedHandle(pid, false, data =>
                     {
-                        // Verify handle identity on the SAME opened handle (creationTime <= snapshot && basename matches szExeFile)
+                        // Verify handle identity on the SAME opened handle (creationTime < pre-call cutoff && basename matches szExeFile)
                         bool verified = VerifyProcessHandleIdentity(
                             exeName,
-                            snapshotCapturedUtcTicks,
+                            snapshotCutoffUtcTicks,
                             data.StartTimeTicks,
                             data.ImagePath);
 
@@ -539,7 +569,7 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
             ProcessItem? relevantItem = withOpenedHandle(pid, true, data =>
             {
                 // Verify handle identity on the SAME opened handle BEFORE trusting StartTimeTicks, metrics, or command line
-                if (!VerifyProcessHandleIdentity(exeName, snapshotCapturedUtcTicks, data.StartTimeTicks, data.ImagePath))
+                if (!VerifyProcessHandleIdentity(exeName, snapshotCutoffUtcTicks, data.StartTimeTicks, data.ImagePath))
                 {
                     // PID was reused or handle identity could not be verified: reject handle completely
                     return new ProcessItem(pid, parentPid, exeName, null, 0, 0, RejectedHandleClassification);
@@ -555,7 +585,7 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
                     startTicks,
                     exeName,
                     data.ReadCommandLine,
-                    capturedGen);
+                    capturedGeneration);
 
                 return new ProcessItem(
                     pid,
@@ -575,7 +605,7 @@ public sealed class Win32ProcessInspector : IProcessInspectionProvider
 
         lock (_lock)
         {
-            if (Interlocked.Read(ref _cacheGeneration) == capturedGen)
+            if (Volatile.Read(ref _cacheGeneration) == capturedGeneration)
             {
                 var staleKeys = new List<(int Pid, long StartTimeTicks)>();
                 foreach (var k in _classificationCache.Keys)
